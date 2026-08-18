@@ -405,6 +405,54 @@ class TestMarking:
         assert (0, 0) not in b.marked
 
 
+class TestAutoPlan:
+    """`--auto` picks keepers without a human in the loop, so the rules matter."""
+
+    def _group(self):
+        return DupGroup(100, [
+            FileRec("/deep/nested/old.txt", 100, 10.0, 1, 1),
+            FileRec("/new.txt", 100, 99.0, 1, 2),
+            FileRec("/mid/middle.txt", 100, 50.0, 1, 3),
+        ])
+
+    def test_keeps_the_oldest(self):
+        doomed = dedup.plan_auto([self._group()], "oldest")
+
+        assert len(doomed) == 2
+        assert "/deep/nested/old.txt" not in [r.path for r in doomed]
+
+    def test_keeps_the_newest(self):
+        doomed = dedup.plan_auto([self._group()], "newest")
+
+        assert "/new.txt" not in [r.path for r in doomed]
+
+    def test_keeps_the_shortest_path(self):
+        doomed = dedup.plan_auto([self._group()], "shortest")
+
+        assert "/new.txt" not in [r.path for r in doomed]
+        assert len(doomed) == 2
+
+    def test_always_leaves_one_copy_per_group(self):
+        groups = [self._group(), self._group()]
+
+        for rule in ("oldest", "newest", "shortest"):
+            doomed = dedup.plan_auto(groups, rule)
+            assert len(doomed) == 4          # 2 groups × (3 copies - 1 keeper)
+
+    def test_never_plans_to_delete_an_undeletable_record(self):
+        group = DupGroup(100, [
+            FileRec("/a.txt", 100, 1.0, 1, 1, nlink=1),
+            FileRec("/b.txt", 100, 2.0, 1, 2, nlink=9),   # links outside the scan
+        ])
+
+        doomed = dedup.plan_auto([group], "oldest")
+
+        assert doomed == []                  # keeper is /a.txt, and /b can't be freed
+
+    def test_every_documented_rule_exists(self):
+        assert set(dedup.KEEP_RULES) == {"oldest", "newest", "shortest"}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # formatting
 # ─────────────────────────────────────────────────────────────────────────────

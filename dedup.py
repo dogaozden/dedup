@@ -494,10 +494,17 @@ HELP_LINES = [
     ("q", "quit without deleting anything"),
 ]
 
+# Which copy survives. Each returns the index to keep.
+KEEP_RULES = {
+    "oldest": lambda fs: min(range(len(fs)), key=lambda i: fs[i].mtime),
+    "newest": lambda fs: max(range(len(fs)), key=lambda i: fs[i].mtime),
+    "shortest": lambda fs: min(range(len(fs)), key=lambda i: (len(fs[i].path), fs[i].path)),
+}
+
 BULK_ACTIONS = [
-    ("1", "Keep the oldest copy in every group", lambda fs: min(range(len(fs)), key=lambda i: fs[i].mtime)),
-    ("2", "Keep the newest copy in every group", lambda fs: max(range(len(fs)), key=lambda i: fs[i].mtime)),
-    ("3", "Keep the shortest path in every group", lambda fs: min(range(len(fs)), key=lambda i: len(fs[i].path))),
+    ("1", "Keep the oldest copy in every group", KEEP_RULES["oldest"]),
+    ("2", "Keep the newest copy in every group", KEEP_RULES["newest"]),
+    ("3", "Keep the shortest path in every group", KEEP_RULES["shortest"]),
 ]
 
 
@@ -840,6 +847,77 @@ def init_colors() -> None:
 # non-interactive output
 # ─────────────────────────────────────────────────────────────────────────────
 
+def plan_auto(groups: list[DupGroup], rule: str) -> list:
+    """Pick one keeper per group; return the records to remove."""
+    chooser = KEEP_RULES[rule]
+    doomed = []
+    for group in groups:
+        keep = chooser(group.files)
+        for i, rec in enumerate(group.files):
+            if i != keep and rec.deletable:
+                doomed.append(rec)
+    return doomed
+
+
+def run_auto(groups: list[DupGroup], rule: str, hard: bool, assume_yes: bool) -> int:
+    """Non-interactive cleanup: keep one copy per group by `rule`, remove the rest."""
+    doomed = plan_auto(groups, rule)
+    if not doomed:
+        print("\n  Nothing to remove.\n")
+        return 0
+
+    total = sum(r.size for r in doomed)
+    verb = "Delete permanently" if hard else "Move to Trash"
+    print(f"\n  Keeping the {rule} copy in each of "
+          f"{human_count(len(groups))} groups.")
+    print(f"  {verb}: {human_count(len(doomed))} files · "
+          f"{human_size(total)} reclaimed\n")
+
+    preview = 15
+    for rec in doomed[:preview]:
+        print(f"      {rec.display}")
+    if len(doomed) > preview:
+        print(f"      … and {human_count(len(doomed) - preview)} more")
+    print()
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            sys.stdout.flush()      # keep the plan above the refusal
+            print("  Refusing to delete without confirmation. "
+                  "Re-run with -y to proceed.", file=sys.stderr)
+            return 1
+        try:
+            answer = input("  Type 'yes' to proceed: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Aborted.")
+            return 1
+        if answer != "yes":
+            print("  Aborted. Nothing deleted.")
+            return 1
+
+    remover = delete_permanently if hard else send_to_trash
+    done = failed = 0
+    freed = 0
+    failures = []
+    for rec in doomed:
+        ok, err = remove_record(rec, remover)
+        if ok:
+            done += len(rec.all_names)
+            freed += rec.size
+        else:
+            failed += 1
+            failures.append(err)
+
+    where = "deleted" if hard else "moved to Trash"
+    print(f"\n  {human_count(done)} files {where} · {human_size(freed)} reclaimed")
+    if failures:
+        print(f"  {human_count(failed)} could not be removed:", file=sys.stderr)
+        for line in failures[:10]:
+            print(f"    {line}", file=sys.stderr)
+    print()
+    return 0
+
+
 def print_report(groups: list[DupGroup], limit: int | None = None) -> None:
     total = sum(g.reclaimable for g in groups)
     print(f"\n  {human_count(len(groups))} duplicate groups · "
@@ -875,6 +953,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="directories to scan (default: current directory)")
     p.add_argument("-l", "--list", action="store_true",
                    help="print a report instead of opening the browser")
+    p.add_argument("--auto", nargs="?", const="shortest", metavar="RULE",
+                   choices=list(KEEP_RULES),
+                   help="skip the browser: keep one copy per group "
+                        "(shortest|oldest|newest, default shortest) and remove "
+                        "the rest after one confirmation")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="with --auto, don't ask for confirmation")
     p.add_argument("-j", "--jobs", type=int, default=min(8, (os.cpu_count() or 4)),
                    help="parallel readers (use 2 on a spinning external drive)")
     p.add_argument("--min-size", type=int, default=1, metavar="BYTES",
@@ -932,6 +1017,9 @@ def main(argv: list[str] | None = None) -> int:
     if not groups:
         print("\n  No duplicates found.\n")
         return 0
+
+    if args.auto:
+        return run_auto(groups, args.auto, args.hard, args.yes)
 
     if args.list or not sys.stdout.isatty():
         print_report(groups)

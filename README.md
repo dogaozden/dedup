@@ -68,16 +68,39 @@ mark them all.
 
 ## Deletion
 
+**Nothing is ever deleted on its own.** By default you highlight files, mark
+them, press ENTER, and confirm on a screen showing the exact count and size —
+four deliberate steps. Bulk actions only *mark*; they don't remove anything.
+
 Files go to the Trash, on the correct volume — a file on an external drive
 lands in that drive's `.Trashes`, not your home folder, so emptying the Trash
 doesn't mean dragging gigabytes back across a USB cable first.
 
 Pass `--hard` to delete permanently instead.
 
+## --auto
+
+For a fast pass with no browsing, `--auto` keeps one copy per group and removes
+the rest:
+
+```
+dedup --auto              # keep the shortest path (default)
+dedup --auto oldest       # keep the copy with the earliest mtime
+dedup --auto newest       # keep the most recent
+dedup --auto -y           # skip the confirmation prompt
+```
+
+It prints the full plan — how many files, how much space, and a sample of what
+goes — then asks once before doing anything. Without a terminal to prompt on it
+refuses outright rather than guessing, so a piped or scripted run can't delete
+anything unless you passed `-y`.
+
 ## Options
 
 ```
 -l, --list          print a report instead of opening the browser
+    --auto RULE     keep one copy per group (shortest|oldest|newest), remove rest
+-y, --yes           with --auto, don't ask for confirmation
 -j, --jobs N        parallel readers (default: CPU count, capped at 8)
     --min-size N    ignore files smaller than N bytes (default 1, skips empty)
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
