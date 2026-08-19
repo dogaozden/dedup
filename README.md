@@ -15,6 +15,9 @@ extensions are ignored, so `photo.jpg`, `photo.jpeg`, and `photo.backup` all
 match if the bytes are the same — which is what you want for folders full of
 rescued or re-downloaded files.
 
+Files under 10 MB are ignored, because they're rarely worth the screen space.
+Lower the floor with `--min-size` if you want them.
+
 ## Speed
 
 The scan avoids reading files it doesn't have to:
@@ -57,7 +60,7 @@ ENTER           review and apply
 q               quit without deleting
 ```
 
-Groups are sorted by reclaimable space, so the biggest wins come first.
+Groups are sorted by file size, largest first.
 
 Bulk actions (`b`) mark every group at once — keep the oldest, the newest, or
 the shortest path — which is how you deal with hundreds of groups without
@@ -102,7 +105,7 @@ anything unless you passed `-y`.
     --auto RULE     keep one copy per group (shortest|oldest|newest), remove rest
 -y, --yes           with --auto, don't ask for confirmation
 -j, --jobs N        parallel readers (default: CPU count, capped at 8)
-    --min-size N    ignore files smaller than N bytes (default 1, skips empty)
+    --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
     --verify        byte-compare matches before reporting them
     --hard          delete permanently instead of using the Trash

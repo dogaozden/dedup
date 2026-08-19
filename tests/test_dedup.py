@@ -117,6 +117,36 @@ class TestDetection:
 
         assert scan(tmp_path, min_size=1000) == []
 
+    def test_default_min_size_is_10mb(self):
+        args = dedup.build_parser().parse_args([])
+
+        assert args.min_size == 10 * 1024 * 1024
+
+    def test_groups_sorted_by_size_largest_first(self, tmp_path):
+        write(tmp_path / "small_a", b"s" * 100)
+        write(tmp_path / "small_b", b"s" * 100)
+        write(tmp_path / "big_a", b"b" * 5000)
+        write(tmp_path / "big_b", b"b" * 5000)
+        write(tmp_path / "mid_a", b"m" * 900)
+        write(tmp_path / "mid_b", b"m" * 900)
+
+        groups = scan(tmp_path)
+
+        assert [g.size for g in groups] == [5000, 900, 100]
+
+    def test_size_beats_reclaimable_in_ordering(self, tmp_path):
+        # Five copies of a small file reclaim 1600 bytes; two copies of a
+        # larger one reclaim only 1000. The larger file must still sort first.
+        for name in ("many_a", "many_b", "many_c", "many_d", "many_e"):
+            write(tmp_path / name, b"s" * 400)
+        write(tmp_path / "few_a", b"b" * 1000)
+        write(tmp_path / "few_b", b"b" * 1000)
+
+        groups = scan(tmp_path)
+
+        assert groups[0].size == 1000
+        assert groups[0].reclaimable < groups[1].reclaimable
+
     def test_exclude_pattern_skips_matching_names(self, tmp_path):
         write(tmp_path / "keep.txt", b"same content here")
         write(tmp_path / "sub" / "keep.txt", b"same content here")
@@ -145,17 +175,6 @@ class TestDetection:
         write(tmp_path / "shallow.txt", b"buried treasure")
 
         assert len(scan(tmp_path)) == 1
-
-    def test_groups_sorted_by_reclaimable_space(self, tmp_path):
-        write(tmp_path / "small_a.txt", b"s" * 100)
-        write(tmp_path / "small_b.txt", b"s" * 100)
-        write(tmp_path / "big_a.txt", b"b" * 5000)
-        write(tmp_path / "big_b.txt", b"b" * 5000)
-
-        groups = scan(tmp_path)
-
-        assert len(groups) == 2
-        assert groups[0].reclaimable > groups[1].reclaimable
 
     def test_verify_mode_still_finds_real_duplicates(self, tmp_path):
         write(tmp_path / "a.txt", b"verified content")
@@ -495,3 +514,24 @@ class TestGroupModel:
                  FileRec("/other/copy.pdf", 10, 0.0, 1, 2)]
 
         assert DupGroup(10, files).name == "report.pdf"
+
+
+class TestDisplayPath:
+    def test_relative_when_inside_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        rec = FileRec(path=str(tmp_path / "sub" / "a.bin"), size=1,
+                      mtime=0.0, dev=1, ino=1)
+
+        assert rec.display == os.path.join("sub", "a.bin")
+
+    def test_absolute_when_outside_cwd(self, tmp_path, monkeypatch):
+        outside = tmp_path / "scan"
+        outside.mkdir()
+        here = tmp_path / "elsewhere"
+        here.mkdir()
+        monkeypatch.chdir(here)
+        rec = FileRec(path=str(outside / "a.bin"), size=1,
+                      mtime=0.0, dev=1, ino=1)
+
+        assert rec.display == str(outside / "a.bin")
+        assert not rec.display.startswith("..")

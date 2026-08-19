@@ -83,10 +83,16 @@ class FileRec:
 
     @property
     def display(self) -> str:
+        """Relative to the working directory, but only when that's an
+        improvement — a path outside it reads better absolute than as a
+        pile of '..' segments."""
         try:
-            return os.path.relpath(self.path)
+            rel = os.path.relpath(self.path)
         except ValueError:
             return self.path
+        if rel.startswith(".."):
+            return self.path
+        return rel
 
     @property
     def date(self) -> str:
@@ -335,7 +341,7 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
         members.sort(key=lambda f: (len(f.path), f.path))
         groups.append(DupGroup(members[0].size, members))
 
-    groups.sort(key=lambda g: (-g.reclaimable, g.name))
+    groups.sort(key=lambda g: (-g.size, g.name))
     return groups
 
 
@@ -962,8 +968,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --auto, don't ask for confirmation")
     p.add_argument("-j", "--jobs", type=int, default=min(8, (os.cpu_count() or 4)),
                    help="parallel readers (use 2 on a spinning external drive)")
-    p.add_argument("--min-size", type=int, default=1, metavar="BYTES",
-                   help="ignore files smaller than this (default: 1, skips empty files)")
+    p.add_argument("--min-size", type=int, default=10 * 1024 * 1024, metavar="BYTES",
+                   help="ignore files smaller than this (default: 10485760, 10 MB)")
     p.add_argument("-x", "--exclude", action="append", default=[], metavar="GLOB",
                    help="skip names matching GLOB (repeatable)")
     p.add_argument("--verify", action="store_true",
