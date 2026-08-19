@@ -7,7 +7,7 @@ copies to keep.
 
 Speed comes from never reading a file it doesn't have to:
 
-  1. stat() everything             — no reads at all
+  1. list every file's size    — one bulk syscall per directory, no reads
   2. discard unique sizes          — a file with a unique size cannot have a twin
   3. hash the first 64 KiB         — cheap, kills most remaining candidates
   4. hash in full                  — only for files that survived stages 2 and 3
@@ -144,7 +144,20 @@ class ScanStats:
 
 def walk_files(roots: list[str], excludes: list[str], min_size: int,
                stats: ScanStats, on_progress=None) -> list[FileRec]:
-    """Collect every regular file under `roots`. Symlinks are never followed."""
+    """Collect every regular file under `roots`. Symlinks are never followed.
+
+    Uses the bulk directory-metadata syscall where it's available, which is
+    roughly twice as fast as stat()ing each file, and falls back to a plain
+    scandir walk everywhere else.
+    """
+    if bulk_available():
+        return _walk_bulk(roots, excludes, min_size, stats, on_progress)
+    return _walk_scandir(roots, excludes, min_size, stats, on_progress)
+
+
+def _walk_scandir(roots: list[str], excludes: list[str], min_size: int,
+                  stats: ScanStats, on_progress=None) -> list[FileRec]:
+    """Portable walk: one stat() per file."""
     out: list[FileRec] = []
     stack = [os.path.abspath(r) for r in roots]
     last_tick = 0.0
@@ -180,6 +193,158 @@ def walk_files(roots: list[str], excludes: list[str], min_size: int,
                 continue
             out.append(FileRec(entry.path, st.st_size, st.st_mtime,
                                st.st_dev, st.st_ino, st.st_nlink))
+
+        if on_progress:
+            now = time.monotonic()
+            if now - last_tick > 0.1:
+                on_progress(stats)
+                last_tick = now
+
+    return out
+
+
+# ── bulk directory metadata (macOS) ──────────────────────────────────────────
+#
+# getattrlistbulk() returns metadata for a whole batch of directory entries in
+# one syscall, where scandir+stat costs one syscall per file. On a 284k-file
+# tree that's 33k syscalls instead of 284k, and about twice as fast.
+#
+# Only the fields needed to *filter* are read in bulk — name, type, size. The
+# few files that clear min_size then get an ordinary lstat() for mtime, inode
+# and link count, which keeps the struct parsing simple and the numbers exact.
+
+ATTR_BIT_MAP_COUNT = 5
+ATTR_CMN_NAME = 0x00000001
+ATTR_CMN_OBJTYPE = 0x00000008
+ATTR_CMN_RETURNED_ATTRS = 0x80000000
+ATTR_FILE_DATALENGTH = 0x00000200
+VREG, VDIR = 1, 2                 # vnode types we care about
+O_DIRECTORY = 0x00100000          # macOS value
+BULK_BUF = 128 * 1024
+
+_libc = None
+
+
+def bulk_available() -> bool:
+    """True when getattrlistbulk() can be used on this platform."""
+    global _libc
+    if sys.platform != "darwin":
+        return False
+    if _libc is None:
+        import ctypes
+        import ctypes.util
+        try:
+            lib = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            lib.getattrlistbulk.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                            ctypes.c_void_p, ctypes.c_size_t,
+                                            ctypes.c_uint64]
+            lib.getattrlistbulk.restype = ctypes.c_int
+            _libc = lib
+        except (OSError, AttributeError):
+            _libc = False
+    return bool(_libc)
+
+
+def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
+               stats: ScanStats, on_progress=None) -> list[FileRec]:
+    if not bulk_available():
+        return _walk_scandir(roots, excludes, min_size, stats, on_progress)
+
+    import ctypes
+    import struct
+
+    class attrlist(ctypes.Structure):
+        _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16),
+                    ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
+                    ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                    ("forkattr", ctypes.c_uint32)]
+
+    al = attrlist(ATTR_BIT_MAP_COUNT, 0,
+                  ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
+                  0, 0, ATTR_FILE_DATALENGTH, 0)
+    buf = ctypes.create_string_buffer(BULK_BUF)
+    view = memoryview(buf).cast("B")
+    u32 = struct.Struct("<I").unpack_from
+    i64 = struct.Struct("<q").unpack_from
+
+    out: list[FileRec] = []
+    stack = [os.path.abspath(r) for r in roots]
+    last_tick = 0.0
+
+    while stack:
+        current = stack.pop()
+        try:
+            fd = os.open(current, os.O_RDONLY | O_DIRECTORY)
+        except OSError as e:
+            stats.unreadable.append(f"{current}: {e}")
+            continue
+        try:
+            while True:
+                count = _libc.getattrlistbulk(fd, ctypes.byref(al), buf, BULK_BUF, 0)
+                if count <= 0:
+                    break
+                offset = 0
+                for _ in range(count):
+                    start = offset
+                    entry_len = u32(buf, start)[0]
+                    offset = start + entry_len
+                    p = start + 4
+                    returned_common = u32(buf, p)[0]
+                    returned_file = u32(buf, p + 12)[0]
+                    p += 20                       # attribute_set_t is 5 x uint32
+
+                    if not returned_common & ATTR_CMN_NAME:
+                        continue
+                    rel, nlen = u32(buf, p)[0], u32(buf, p + 4)[0]
+                    name = bytes(view[p + rel:p + rel + nlen - 1])
+                    p += 8
+
+                    objtype = 0
+                    if returned_common & ATTR_CMN_OBJTYPE:
+                        objtype = u32(buf, p)[0]
+                        p += 4
+                    size = 0
+                    if returned_file & ATTR_FILE_DATALENGTH:
+                        size = i64(buf, p)[0]
+
+                    if objtype != VDIR and objtype != VREG:
+                        continue
+
+                    # Decoding the name and building the path costs more than
+                    # everything else here, so the files that can't qualify are
+                    # dropped on the raw bytes first.
+                    if excludes:
+                        name_str = name.decode("utf-8", "surrogateescape")
+                        if any(fnmatch.fnmatch(name_str, pat) for pat in excludes):
+                            continue
+                    else:
+                        name_str = None
+
+                    if objtype == VREG:
+                        stats.files_seen += 1
+                        stats.bytes_seen += size
+                        if size < min_size:
+                            continue
+
+                    if name_str is None:
+                        name_str = name.decode("utf-8", "surrogateescape")
+                    path = os.path.join(current, name_str)
+                    if objtype == VDIR:
+                        stack.append(path)
+                        continue
+                    # Only survivors pay for a stat, and it keeps inode,
+                    # link count and mtime exactly as the portable walk sees them.
+                    try:
+                        st = os.lstat(path)
+                    except OSError as e:
+                        stats.unreadable.append(f"{path}: {e}")
+                        continue
+                    out.append(FileRec(path, st.st_size, st.st_mtime,
+                                       st.st_dev, st.st_ino, st.st_nlink))
+        except OSError as e:
+            stats.unreadable.append(f"{current}: {e}")
+        finally:
+            os.close(fd)
 
         if on_progress:
             now = time.monotonic()

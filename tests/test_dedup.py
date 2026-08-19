@@ -535,3 +535,65 @@ class TestDisplayPath:
 
         assert rec.display == str(outside / "a.bin")
         assert not rec.display.startswith("..")
+
+
+class TestBulkWalker:
+    """The fast macOS walk must agree with the portable one exactly — it
+    decides what gets deleted, so a parsing slip would be data loss."""
+
+    def _tree(self, root):
+        write(root / "big_a.bin", b"A" * 3000)
+        write(root / "big_b.bin", b"A" * 3000)
+        write(root / "small.bin", b"s" * 10)
+        write(root / "sub" / "nested.bin", b"n" * 2000)
+        write(root / "sub" / "deep" / "deeper.bin", b"d" * 4000)
+        write(root / "sub" / ".DS_Store", b"noise")
+        write(root / "unicode ✓ name.bin", b"u" * 1500)
+        (root / "link.bin").symlink_to(root / "big_a.bin")
+        os.link(str(root / "big_a.bin"), str(root / "hardlink.bin"))
+
+    def _keys(self, recs):
+        return {(r.path, r.size, r.dev, r.ino, r.nlink) for r in recs}
+
+    @pytest.mark.parametrize("min_size,excludes", [
+        (1, []),
+        (2000, []),
+        (1, [".DS_Store"]),
+        (1, ["*.bin"]),
+    ])
+    def test_matches_portable_walk(self, tmp_path, min_size, excludes):
+        self._tree(tmp_path)
+        sa, sb = ScanStats(), ScanStats()
+
+        a = dedup._walk_scandir([str(tmp_path)], excludes, min_size, sa)
+        b = dedup._walk_bulk([str(tmp_path)], excludes, min_size, sb)
+
+        assert self._keys(a) == self._keys(b)
+        assert sa.files_seen == sb.files_seen
+        assert sa.bytes_seen == sb.bytes_seen
+
+    def test_symlinks_not_followed(self, tmp_path):
+        self._tree(tmp_path)
+
+        recs = dedup._walk_bulk([str(tmp_path)], [], 1, ScanStats())
+
+        names = {os.path.basename(r.path) for r in recs}
+        assert "link.bin" not in names          # the symlink is skipped
+        assert "hardlink.bin" in names          # a hardlink is a real file
+
+    def test_falls_back_when_unavailable(self, tmp_path, monkeypatch):
+        write(tmp_path / "a.bin", b"x" * 100)
+        write(tmp_path / "b.bin", b"x" * 100)
+        monkeypatch.setattr(dedup, "bulk_available", lambda: False)
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+
+    def test_walk_files_dispatches_to_a_working_walker(self, tmp_path):
+        self._tree(tmp_path)
+
+        recs = dedup.walk_files([str(tmp_path)], [], 1, ScanStats())
+
+        assert self._keys(recs) == self._keys(
+            dedup._walk_scandir([str(tmp_path)], [], 1, ScanStats()))
