@@ -7,10 +7,10 @@ copies to keep.
 
 Speed comes from never reading a file it doesn't have to:
 
-  1. list every file's size    — one bulk syscall per directory, no reads
-  2. discard unique sizes          — a file with a unique size cannot have a twin
-  3. hash the first 64 KiB         — cheap, kills most remaining candidates
-  4. hash in full                  — only for files that survived stages 2 and 3
+  1. list every file's size   — one bulk syscall per directory, no reads
+  2. discard unique sizes     — a file with a unique size cannot have a twin
+  3. hash the first 64 KiB    — cheap, kills most remaining candidates
+  4. hash in full             — only for files that survived stages 2 and 3
 
 On a typical tree this reads a low single-digit percentage of the bytes on disk.
 

@@ -24,13 +24,18 @@ The scan avoids reading files it doesn't have to:
 
 | Stage | Work | Effect |
 |-------|------|--------|
-| 1 | `stat()` every file | no reads at all |
+| 1 | list every file's size | one bulk syscall per directory, no reads |
 | 2 | discard unique sizes | a file with a unique size can't have a twin |
 | 3 | hash the first 64 KiB | cheap, eliminates most survivors |
 | 4 | hash in full | only for files that got this far |
 
 On a typical tree this reads a low single-digit percentage of the bytes on
 disk. The summary line tells you exactly how much it read.
+
+Stage 1 uses `getattrlistbulk()` on macOS, which returns metadata for a whole
+batch of directory entries in one syscall instead of one `stat()` per file —
+33k syscalls instead of 284k on a /Applications-sized tree. Elsewhere it falls
+back to a plain `scandir` walk.
 
 Hashing is BLAKE2b-256. A collision is far less likely than a disk returning
 the wrong bytes, but `--verify` adds a byte-for-byte comparison if you want it.
