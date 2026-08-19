@@ -664,3 +664,101 @@ class TestParallelWalk:
     def test_parallel_flag_defaults_to_auto(self):
         assert dedup.build_parser().parse_args([]).parallel is None
         assert dedup.build_parser().parse_args(["-p", "3"]).parallel == 3
+
+
+class TestWalkRobustness:
+    """Failures here must produce an error, never a hang."""
+
+    def _with_timeout(self, fn, seconds=20):
+        import threading
+        box = {}
+        t = threading.Thread(target=lambda: box.update(r=fn()), daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), "walk hung instead of returning"
+        return box.get("r")
+
+    def test_empty_roots_returns_instead_of_hanging(self):
+        result = self._with_timeout(
+            lambda: dedup._walk_bulk([], [], 1, ScanStats(), None, 4))
+
+        assert result == []
+
+    def test_reader_exception_does_not_hang(self, tmp_path, monkeypatch):
+        write(tmp_path / "a.bin", b"x" * 100)
+        monkeypatch.setattr(dedup.DirReader, "read",
+                            lambda self, d: (_ for _ in ()).throw(ValueError("boom")))
+        stats = ScanStats()
+
+        result = self._with_timeout(
+            lambda: dedup._walk_bulk([str(tmp_path)], [], 1, stats, None, 4))
+
+        assert result == []
+        assert stats.unreadable                    # reported, not swallowed
+
+
+class TestOverlappingRoots:
+    """The same file reachable twice must not be treated as two files."""
+
+    def test_same_name_is_not_counted_twice(self):
+        rec = FileRec(path="/x/a", size=10, mtime=0.0, dev=1, ino=1, nlink=1)
+        dup = FileRec(path="/x/a", size=10, mtime=0.0, dev=1, ino=1, nlink=1)
+
+        merged = drop_hardlinks([rec, dup])
+
+        assert len(merged) == 1
+        assert merged[0].all_names == ["/x/a"]
+
+    def test_duplicate_root_does_not_invent_duplicates(self, tmp_path):
+        write(tmp_path / "only.bin", b"u" * 4000)
+
+        groups = find_duplicates([str(tmp_path), str(tmp_path)], excludes=[],
+                                 min_size=1, jobs=2, verify=False,
+                                 stats=ScanStats(), reporter=None)
+
+        assert groups == []
+
+    def test_duplicate_root_keeps_one_copy_and_reports_truthfully(self, tmp_path):
+        write(tmp_path / "a.bin", b"A" * 4000)
+        write(tmp_path / "sub" / "copy.bin", b"A" * 4000)
+        groups = find_duplicates([str(tmp_path), str(tmp_path)], excludes=[],
+                                 min_size=1, jobs=2, verify=False,
+                                 stats=ScanStats(), reporter=None)
+        assert len(groups) == 1
+        victim = [f for f in groups[0].files if f.path.endswith("copy.bin")][0]
+
+        removed = []
+        ok, err = dedup.remove_record(
+            victim, lambda p: (removed.append(p), (True, ""))[1])
+
+        assert ok and err == ""
+        assert removed == [victim.path]             # exactly once
+
+    def test_symlinked_root_collapses_to_one_name(self, tmp_path):
+        """Two spellings of one directory entry must not be deleted twice."""
+        real = tmp_path / "real"
+        real.mkdir()
+        write(real / "a.bin", b"A" * 100)
+        (tmp_path / "link").symlink_to(real)
+        st = os.stat(real / "a.bin")
+        recs = [FileRec(str(real / "a.bin"), 100, 0.0, st.st_dev, st.st_ino, 1),
+                FileRec(str(tmp_path / "link" / "a.bin"), 100, 0.0,
+                        st.st_dev, st.st_ino, 1)]
+
+        merged = drop_hardlinks(recs)
+
+        assert len(merged) == 1
+        assert len(merged[0].all_names) == 1
+
+    def test_real_hardlinks_are_still_kept_separate(self, tmp_path):
+        """Hardlinks are distinct entries and all of them must be removed."""
+        first = write(tmp_path / "one.bin", b"H" * 100)
+        os.link(first, tmp_path / "two.bin")
+        a, b = os.stat(first), os.stat(tmp_path / "two.bin")
+        recs = [FileRec(str(first), 100, 0.0, a.st_dev, a.st_ino, 2),
+                FileRec(str(tmp_path / "two.bin"), 100, 0.0, b.st_dev, b.st_ino, 2)]
+
+        merged = drop_hardlinks(recs)
+
+        assert len(merged) == 1
+        assert len(merged[0].all_names) == 2

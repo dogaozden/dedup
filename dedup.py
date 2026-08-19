@@ -477,6 +477,9 @@ def _walk_bulk_threaded(roots: list[str], excludes: list[str], min_size: int,
     pending = queue.Queue()
     for r in roots:
         pending.put(os.path.abspath(r))
+    if pending.empty():
+        return []                     # nothing queued, so nothing would ever
+                                      # retire the counter that stops the threads
 
     out: list[FileRec] = []
     lock = threading.Lock()
@@ -499,7 +502,14 @@ def _walk_bulk_threaded(roots: list[str], excludes: list[str], min_size: int,
             except queue.Empty:
                 continue
 
-            files, subdirs, seen, nbytes, errors = reader.read(directory)
+            # Whatever happens, this directory has to be retired below, or the
+            # counter never reaches zero and every thread spins forever. A
+            # failed directory is worth reporting; a hung scan is not.
+            try:
+                files, subdirs, seen, nbytes, errors = reader.read(directory)
+            except Exception as e:                       # noqa: BLE001
+                files, subdirs, seen, nbytes = [], [], 0, 0
+                errors = [f"{directory}: {e}"]
             mine.extend(files)
             if errors:
                 my_errors.extend(errors)
@@ -540,12 +550,31 @@ def drop_hardlinks(files: list[FileRec]) -> list[FileRec]:
     order: list = []
     for f in files:
         key = (f.dev, f.ino)
-        if key not in by_inode:
-            by_inode[key] = f
+        rec = by_inode.get(key)
+        if rec is None:
+            by_inode[key] = rec = f
             order.append(key)
-        by_inode[key].links.append(f.path)
-    # shortest name first, so the record displays the tidiest path
+        # Overlapping roots ("dedup . ." or a parent and its child) hand us the
+        # same name twice. Keeping both would overstate the link count and make
+        # the removal try to delete one file two times.
+        if f.path not in rec.links:
+            rec.links.append(f.path)
     for rec in by_inode.values():
+        # Several names for one inode is normally a hardlink, and those are
+        # genuinely separate directory entries that all have to go. But a
+        # symlinked root can hand us two spellings of a single entry, and
+        # deleting it twice would report a failure for work already done.
+        # Only multi-name records pay for resolving this.
+        if len(rec.links) > 1:
+            distinct: dict = {}
+            for p in rec.links:
+                try:
+                    real = os.path.realpath(p)
+                except OSError:
+                    real = p
+                distinct.setdefault(real, p)
+            rec.links = list(distinct.values())
+        # shortest name first, so the record displays the tidiest path
         rec.links.sort(key=lambda p: (len(p), p))
         rec.path = rec.links[0]
     return [by_inode[k] for k in order]
