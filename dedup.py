@@ -142,16 +142,90 @@ class ScanStats:
 # scanning
 # ─────────────────────────────────────────────────────────────────────────────
 
+_solid_state_cache: dict = {}
+
+
+def mount_point(path: str):
+    """The volume root `path` sits on — diskutil only accepts these, not
+    arbitrary paths inside a volume."""
+    try:
+        path = os.path.realpath(path)
+        dev = os.stat(path).st_dev
+    except OSError:
+        return None
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            return path
+        try:
+            if os.stat(parent).st_dev != dev:
+                return path
+        except OSError:
+            return path
+        path = parent
+
+
+def is_solid_state(path: str):
+    """True for flash, False for a spinning disk, None when it can't be told.
+
+    USB enclosures, network shares and disk images generally don't report it.
+    'Unknown' is treated as 'don't parallelise' — guessing wrong on a spinning
+    disk costs more than the parallelism was ever going to win.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        key = os.stat(path).st_dev
+    except OSError:
+        return None
+    if key in _solid_state_cache:
+        return _solid_state_cache[key]
+
+    answer = None
+    root = mount_point(path)
+    if root:
+        try:
+            import plistlib
+            import subprocess
+            out = subprocess.run(["diskutil", "info", "-plist", root],
+                                 capture_output=True, timeout=5)
+            if out.returncode == 0:
+                value = plistlib.loads(out.stdout).get("SolidState")
+                if isinstance(value, bool):
+                    answer = value
+        except Exception:
+            answer = None
+
+    _solid_state_cache[key] = answer
+    return answer
+
+
+def walk_workers(roots: list[str], requested) -> int:
+    """How many directories to read at once: explicit setting, or by device."""
+    if requested is not None:
+        return max(1, requested)
+    if not bulk_available():
+        return 1
+    # Every root has to be flash before reading several at a time. Four is
+    # measurably the best point: past it the threads spend more time waiting
+    # on each other to parse than they save on the syscalls.
+    if roots and all(is_solid_state(r) is True for r in roots):
+        return min(4, (os.cpu_count() or 4))
+    return 1
+
+
 def walk_files(roots: list[str], excludes: list[str], min_size: int,
-               stats: ScanStats, on_progress=None) -> list[FileRec]:
+               stats: ScanStats, on_progress=None, workers=None) -> list[FileRec]:
     """Collect every regular file under `roots`. Symlinks are never followed.
 
     Uses the bulk directory-metadata syscall where it's available, which is
     roughly twice as fast as stat()ing each file, and falls back to a plain
-    scandir walk everywhere else.
+    scandir walk everywhere else. `workers` defaults to reading several
+    directories at once on flash and one at a time on a spinning disk.
     """
     if bulk_available():
-        return _walk_bulk(roots, excludes, min_size, stats, on_progress)
+        return _walk_bulk(roots, excludes, min_size, stats, on_progress,
+                          walk_workers(roots, workers))
     return _walk_scandir(roots, excludes, min_size, stats, on_progress)
 
 
@@ -245,42 +319,53 @@ def bulk_available() -> bool:
     return bool(_libc)
 
 
-def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
-               stats: ScanStats, on_progress=None) -> list[FileRec]:
-    if not bulk_available():
-        return _walk_scandir(roots, excludes, min_size, stats, on_progress)
+class DirReader:
+    """Reads one directory per call with getattrlistbulk.
 
-    import ctypes
-    import struct
+    Holds its own buffer, so each thread needs its own reader.
+    """
 
-    class attrlist(ctypes.Structure):
-        _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16),
-                    ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
-                    ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
-                    ("forkattr", ctypes.c_uint32)]
+    def __init__(self, excludes: list[str], min_size: int):
+        import ctypes
+        import struct
 
-    al = attrlist(ATTR_BIT_MAP_COUNT, 0,
-                  ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
-                  0, 0, ATTR_FILE_DATALENGTH, 0)
-    buf = ctypes.create_string_buffer(BULK_BUF)
-    view = memoryview(buf).cast("B")
-    u32 = struct.Struct("<I").unpack_from
-    i64 = struct.Struct("<q").unpack_from
+        class attrlist(ctypes.Structure):
+            _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16),
+                        ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
+                        ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                        ("forkattr", ctypes.c_uint32)]
 
-    out: list[FileRec] = []
-    stack = [os.path.abspath(r) for r in roots]
-    last_tick = 0.0
+        self._ctypes = ctypes
+        self.excludes = excludes
+        self.min_size = min_size
+        self.attrs = attrlist(ATTR_BIT_MAP_COUNT, 0,
+                              ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
+                              0, 0, ATTR_FILE_DATALENGTH, 0)
+        self.buf = ctypes.create_string_buffer(BULK_BUF)
+        self.view = memoryview(self.buf).cast("B")
+        self.u32 = struct.Struct("<I").unpack_from
+        self.i64 = struct.Struct("<q").unpack_from
 
-    while stack:
-        current = stack.pop()
+    def read(self, directory: str):
+        """-> (files, subdirs, files_seen, bytes_seen, errors) for one directory."""
+        ctypes = self._ctypes
+        buf, view, u32, i64 = self.buf, self.view, self.u32, self.i64
+        excludes, min_size = self.excludes, self.min_size
+
+        files: list[FileRec] = []
+        subdirs: list[str] = []
+        errors: list[str] = []
+        seen = nbytes = 0
+
         try:
-            fd = os.open(current, os.O_RDONLY | O_DIRECTORY)
+            fd = os.open(directory, os.O_RDONLY | O_DIRECTORY)
         except OSError as e:
-            stats.unreadable.append(f"{current}: {e}")
-            continue
+            return files, subdirs, seen, nbytes, [f"{directory}: {e}"]
+
         try:
             while True:
-                count = _libc.getattrlistbulk(fd, ctypes.byref(al), buf, BULK_BUF, 0)
+                count = _libc.getattrlistbulk(fd, ctypes.byref(self.attrs),
+                                              buf, BULK_BUF, 0)
                 if count <= 0:
                     break
                 offset = 0
@@ -311,7 +396,7 @@ def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
                         continue
 
                     # Decoding the name and building the path costs more than
-                    # everything else here, so the files that can't qualify are
+                    # everything else here, so files that can't qualify are
                     # dropped on the raw bytes first.
                     if excludes:
                         name_str = name.decode("utf-8", "surrogateescape")
@@ -321,30 +406,54 @@ def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
                         name_str = None
 
                     if objtype == VREG:
-                        stats.files_seen += 1
-                        stats.bytes_seen += size
+                        seen += 1
+                        nbytes += size
                         if size < min_size:
                             continue
 
                     if name_str is None:
                         name_str = name.decode("utf-8", "surrogateescape")
-                    path = os.path.join(current, name_str)
+                    path = os.path.join(directory, name_str)
                     if objtype == VDIR:
-                        stack.append(path)
+                        subdirs.append(path)
                         continue
-                    # Only survivors pay for a stat, and it keeps inode,
-                    # link count and mtime exactly as the portable walk sees them.
+                    # Only survivors pay for a stat, and it keeps inode, link
+                    # count and mtime exactly as the portable walk sees them.
                     try:
                         st = os.lstat(path)
                     except OSError as e:
-                        stats.unreadable.append(f"{path}: {e}")
+                        errors.append(f"{path}: {e}")
                         continue
-                    out.append(FileRec(path, st.st_size, st.st_mtime,
-                                       st.st_dev, st.st_ino, st.st_nlink))
+                    files.append(FileRec(path, st.st_size, st.st_mtime,
+                                         st.st_dev, st.st_ino, st.st_nlink))
         except OSError as e:
-            stats.unreadable.append(f"{current}: {e}")
+            errors.append(f"{directory}: {e}")
         finally:
             os.close(fd)
+
+        return files, subdirs, seen, nbytes, errors
+
+
+def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
+               stats: ScanStats, on_progress=None, workers: int = 1) -> list[FileRec]:
+    if not bulk_available():
+        return _walk_scandir(roots, excludes, min_size, stats, on_progress)
+    if workers > 1:
+        return _walk_bulk_threaded(roots, excludes, min_size, stats,
+                                   on_progress, workers)
+
+    reader = DirReader(excludes, min_size)
+    out: list[FileRec] = []
+    stack = [os.path.abspath(r) for r in roots]
+    last_tick = 0.0
+
+    while stack:
+        files, subdirs, seen, nbytes, errors = reader.read(stack.pop())
+        out.extend(files)
+        stack.extend(subdirs)
+        stats.files_seen += seen
+        stats.bytes_seen += nbytes
+        stats.unreadable.extend(errors)
 
         if on_progress:
             now = time.monotonic()
@@ -352,6 +461,71 @@ def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
                 on_progress(stats)
                 last_tick = now
 
+    return out
+
+
+def _walk_bulk_threaded(roots: list[str], excludes: list[str], min_size: int,
+                        stats: ScanStats, on_progress, workers: int) -> list[FileRec]:
+    """Same walk, several directories at a time.
+
+    Worth it on flash, where the queue depth is free. On a spinning disk the
+    heads have to seek between the directories, so the caller decides.
+    """
+    import queue
+    import threading
+
+    pending = queue.Queue()
+    for r in roots:
+        pending.put(os.path.abspath(r))
+
+    out: list[FileRec] = []
+    lock = threading.Lock()
+    finished = threading.Event()
+    last_tick = [0.0]
+    # Directories queued but not yet processed. Every directory that will ever
+    # exist is counted here before its parent is retired, so reaching zero
+    # means the tree is genuinely exhausted — not merely momentarily idle.
+    outstanding = [pending.qsize()]
+
+    def work():
+        reader = DirReader(excludes, min_size)
+        # Results accumulate per thread and are merged once at the end; taking
+        # the lock for every directory costs more than the parallelism wins.
+        mine: list[FileRec] = []
+        my_errors: list[str] = []
+        while not finished.is_set():
+            try:
+                directory = pending.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            files, subdirs, seen, nbytes, errors = reader.read(directory)
+            mine.extend(files)
+            if errors:
+                my_errors.extend(errors)
+            with lock:
+                stats.files_seen += seen
+                stats.bytes_seen += nbytes
+                outstanding[0] += len(subdirs) - 1
+                done = outstanding[0] == 0
+                if on_progress:
+                    now = time.monotonic()
+                    if now - last_tick[0] > 0.1:
+                        on_progress(stats)
+                        last_tick[0] = now
+            for d in subdirs:
+                pending.put(d)
+            if done:
+                finished.set()
+        with lock:
+            out.extend(mine)
+            stats.unreadable.extend(my_errors)
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     return out
 
 
@@ -451,7 +625,7 @@ def bytes_identical(paths: list[str]) -> bool:
 
 def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
                     jobs: int, verify: bool, stats: ScanStats,
-                    reporter=None) -> list[DupGroup]:
+                    reporter=None, walkers=None) -> list[DupGroup]:
     """Run the four-stage narrowing described in the module docstring."""
     def say(key: str, total: int = 0) -> None:
         if reporter:
@@ -460,7 +634,7 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     tick = reporter.tick if reporter else None
 
     say("scan")
-    files = walk_files(roots, excludes, min_size, stats, tick)
+    files = walk_files(roots, excludes, min_size, stats, tick, walkers)
     if reporter:
         reporter.finish_stage()
 
@@ -1133,6 +1307,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --auto, don't ask for confirmation")
     p.add_argument("-j", "--jobs", type=int, default=min(8, (os.cpu_count() or 4)),
                    help="parallel readers (use 2 on a spinning external drive)")
+    p.add_argument("-p", "--parallel", type=int, default=None, metavar="N",
+                   help="directories to scan at once (default: several on an "
+                        "SSD, one on a spinning disk; -p 1 forces one)")
     p.add_argument("--min-size", type=int, default=10 * 1024 * 1024, metavar="BYTES",
                    help="ignore files smaller than this (default: 10485760, 10 MB)")
     p.add_argument("-x", "--exclude", action="append", default=[], metavar="GLOB",
@@ -1167,6 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
             verify=args.verify,
             stats=stats,
             reporter=reporter,
+            walkers=args.parallel,
         )
     except KeyboardInterrupt:
         reporter.finish_stage()

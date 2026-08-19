@@ -597,3 +597,70 @@ class TestBulkWalker:
 
         assert self._keys(recs) == self._keys(
             dedup._walk_scandir([str(tmp_path)], [], 1, ScanStats()))
+
+
+class TestParallelWalk:
+    """Threading here decides which files exist, so it must never lose one."""
+
+    def _tree(self, root, dirs=12, per_dir=8):
+        for d in range(dirs):
+            for f in range(per_dir):
+                write(root / f"d{d}" / f"sub{d}" / f"f{f}.bin", bytes([d]) * (100 + f))
+        write(root / "top.bin", b"t" * 500)
+
+    def _keys(self, recs):
+        return {(r.path, r.size, r.dev, r.ino, r.nlink) for r in recs}
+
+    @pytest.mark.parametrize("workers", [1, 2, 4, 8])
+    def test_threaded_matches_serial(self, tmp_path, workers):
+        self._tree(tmp_path)
+        serial_stats, threaded_stats = ScanStats(), ScanStats()
+
+        serial = dedup._walk_scandir([str(tmp_path)], [], 1, serial_stats)
+        threaded = dedup._walk_bulk([str(tmp_path)], [], 1, threaded_stats,
+                                    None, workers)
+
+        assert self._keys(threaded) == self._keys(serial)
+        assert len(threaded) == len(serial)          # no duplicated entries
+        assert threaded_stats.files_seen == serial_stats.files_seen
+        assert threaded_stats.bytes_seen == serial_stats.bytes_seen
+
+    def test_no_files_lost_across_repeated_runs(self, tmp_path):
+        """A racy exit condition shows up as an occasional short result."""
+        self._tree(tmp_path)
+        expected = len(dedup._walk_scandir([str(tmp_path)], [], 1, ScanStats()))
+
+        counts = {len(dedup._walk_bulk([str(tmp_path)], [], 1, ScanStats(), None, 8))
+                  for _ in range(15)}
+
+        assert counts == {expected}
+
+    def test_spinning_disk_stays_serial(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: False)
+        assert dedup.walk_workers(["/somewhere"], None) == 1
+
+    def test_unknown_device_stays_serial(self, monkeypatch):
+        """USB enclosures often don't report it — don't gamble on a guess."""
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: None)
+        assert dedup.walk_workers(["/somewhere"], None) == 1
+
+    def test_ssd_goes_parallel(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: True)
+        monkeypatch.setattr(dedup, "bulk_available", lambda: True)
+        assert dedup.walk_workers(["/somewhere"], None) > 1
+
+    def test_mixed_roots_stay_serial(self, monkeypatch):
+        """One spinning root in the set is enough to keep it serial."""
+        monkeypatch.setattr(dedup, "bulk_available", lambda: True)
+        monkeypatch.setattr(dedup, "is_solid_state",
+                            lambda p: p != "/spin")
+        assert dedup.walk_workers(["/ssd", "/spin"], None) == 1
+
+    def test_explicit_setting_overrides_detection(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: False)
+        assert dedup.walk_workers(["/somewhere"], 6) == 6
+        assert dedup.walk_workers(["/somewhere"], 0) == 1     # never zero
+
+    def test_parallel_flag_defaults_to_auto(self):
+        assert dedup.build_parser().parse_args([]).parallel is None
+        assert dedup.build_parser().parse_args(["-p", "3"]).parallel == 3

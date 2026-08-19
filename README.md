@@ -37,6 +37,12 @@ batch of directory entries in one syscall instead of one `stat()` per file —
 33k syscalls instead of 284k on a /Applications-sized tree. Elsewhere it falls
 back to a plain `scandir` walk.
 
+On an SSD it reads several directories at once; on a spinning disk it reads one
+at a time, because the heads would otherwise seek between them. dedup asks the
+volume which it is and picks for itself. `-p N` overrides that — `-p 1` forces
+one at a time, which is also what happens on any volume that won't say what it
+is (USB enclosures usually won't).
+
 Hashing is BLAKE2b-256. A collision is far less likely than a disk returning
 the wrong bytes, but `--verify` adds a byte-for-byte comparison if you want it.
 
@@ -110,6 +116,8 @@ anything unless you passed `-y`.
     --auto RULE     keep one copy per group (shortest|oldest|newest), remove rest
 -y, --yes           with --auto, don't ask for confirmation
 -j, --jobs N        parallel readers (default: CPU count, capped at 8)
+-p, --parallel N    directories to scan at once (default: 4 on an SSD, 1 on a
+                    spinning disk)
     --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
     --verify        byte-compare matches before reporting them
