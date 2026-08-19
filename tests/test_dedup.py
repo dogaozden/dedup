@@ -762,3 +762,34 @@ class TestOverlappingRoots:
 
         assert len(merged) == 1
         assert len(merged[0].all_names) == 2
+
+
+class TestNoDuplicatesScreen:
+    """An empty result after a long scan must not look like a crash."""
+
+    def test_interactive_screen_explains_itself(self, capsys):
+        stats = ScanStats(files_seen=1200, bytes_seen=5 * 1024**3)
+
+        dedup.print_no_duplicates(stats, 10 * 1024 * 1024, plain=False)
+
+        out = capsys.readouterr().out
+        assert "No duplicates found" in out
+        assert "1,200" in out                  # what was actually checked
+        assert "--min-size 1" in out           # why it might be empty
+
+    def test_min_size_hint_only_when_a_floor_is_set(self, capsys):
+        stats = ScanStats(files_seen=10, bytes_seen=100)
+
+        dedup.print_no_duplicates(stats, 1, plain=False)
+
+        out = capsys.readouterr().out
+        assert "No duplicates found" in out
+        assert "--min-size" not in out
+
+    def test_plain_mode_stays_terse_for_scripts(self, capsys):
+        stats = ScanStats(files_seen=10, bytes_seen=100)
+
+        dedup.print_no_duplicates(stats, 10 * 1024 * 1024, plain=True)
+
+        out = capsys.readouterr().out
+        assert out.strip() == "No duplicates found."

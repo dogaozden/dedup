@@ -1292,6 +1292,28 @@ def run_auto(groups: list[DupGroup], rule: str, hard: bool, assume_yes: bool) ->
     return 0
 
 
+def print_no_duplicates(stats: ScanStats, min_size: int, plain: bool = False) -> None:
+    """Say so properly.
+
+    After a long scan a single quiet line reads like the program died, and
+    the usual reason for an empty result — the size floor — is invisible.
+    """
+    if plain:
+        print("\n  No duplicates found.\n")
+        return
+
+    rule = "─" * 58
+    print(f"\n  {rule}")
+    print("   ✓  No duplicates found")
+    print(f"  {rule}")
+    print(f"\n     Checked {human_count(stats.files_seen)} files "
+          f"({human_size(stats.bytes_seen)}).")
+    print("     Every one of them is unique.\n")
+    if min_size > 1:
+        print(f"     Files under {human_size(min_size)} were skipped.")
+        print("     Run with  --min-size 1  to include them.\n")
+
+
 def print_report(groups: list[DupGroup], limit: int | None = None) -> None:
     total = sum(g.reclaimable for g in groups)
     print(f"\n  {human_count(len(groups))} duplicate groups · "
@@ -1393,7 +1415,7 @@ def main(argv: list[str] | None = None) -> int:
               f"(permissions or I/O errors)", file=sys.stderr)
 
     if not groups:
-        print("\n  No duplicates found.\n")
+        print_no_duplicates(stats, args.min_size, plain=args.list or not sys.stdout.isatty())
         return 0
 
     if args.auto:
