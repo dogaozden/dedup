@@ -793,3 +793,79 @@ class TestNoDuplicatesScreen:
 
         out = capsys.readouterr().out
         assert out.strip() == "No duplicates found."
+
+
+class TestSampledHashing:
+    """Sampling may never lose a real duplicate — that would be data loss
+    in reverse: a copy the user keeps paying for and never sees."""
+
+    def _big(self, path, filler, tail=b"", mid=None):
+        size = dedup.SAMPLE_SPAN * 2
+        body = bytearray(filler * size)
+        if mid is not None:
+            body[size // 2:size // 2 + len(mid)] = mid
+        if tail:
+            body[-len(tail):] = tail
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(bytes(body))
+        return path
+
+    def test_identical_large_files_are_still_found(self, tmp_path):
+        self._big(tmp_path / "a.bin", b"A")
+        self._big(tmp_path / "b.bin", b"A")
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+        assert len(groups[0].files) == 2
+
+    def test_difference_outside_the_samples_is_still_caught(self, tmp_path):
+        """The samples can agree while the files differ. The full hash is what
+        makes the default byte-exact, so this must NOT report a duplicate."""
+        self._big(tmp_path / "a.bin", b"A", tail=b"")
+        b = self._big(tmp_path / "b.bin", b"A")
+        data = bytearray(b.read_bytes())
+        data[dedup.SAMPLE_BYTES + 7] ^= 0xFF          # between sample points
+        b.write_bytes(bytes(data))
+
+        assert scan(tmp_path) == []
+
+    def test_sample_reads_far_less_than_the_file(self, tmp_path):
+        f = self._big(tmp_path / "a.bin", b"A")
+
+        assert dedup.sampled_bytes(f.stat().st_size) < f.stat().st_size // 3
+
+    def test_small_files_are_read_whole(self, tmp_path):
+        f = tmp_path / "small.bin"
+        f.write_bytes(b"x" * 1000)
+
+        assert dedup.hash_sample(str(f), 1000) == dedup.hash_full(str(f), 1000)
+        assert dedup.sampled_bytes(1000) == 1000
+
+    def test_same_samples_different_size_do_not_collide(self, tmp_path):
+        a = self._big(tmp_path / "a.bin", b"A")
+        b = self._big(tmp_path / "b.bin", b"A")
+        b.write_bytes(b.read_bytes() + b"extra")
+
+        da = dedup.hash_sample(str(a), a.stat().st_size)
+        db = dedup.hash_sample(str(b), b.stat().st_size)
+        assert da != db
+
+
+class TestDeviceAwareJobs:
+    def test_spinning_disk_limits_concurrent_readers(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: False)
+        assert dedup.read_jobs(["/x"], None) == 2
+
+    def test_unknown_device_limits_concurrent_readers(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: None)
+        assert dedup.read_jobs(["/x"], None) == 2
+
+    def test_ssd_gets_queue_depth(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: True)
+        assert dedup.read_jobs(["/x"], None) > 2
+
+    def test_explicit_jobs_wins(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: True)
+        assert dedup.read_jobs(["/x"], 3) == 3
+        assert dedup.read_jobs(["/x"], 0) == 1

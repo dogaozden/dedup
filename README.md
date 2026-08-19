@@ -27,7 +27,17 @@ The scan avoids reading files it doesn't have to:
 | 1 | list every file's size | one bulk syscall per directory, no reads |
 | 2 | discard unique sizes | a file with a unique size can't have a twin |
 | 3 | hash the first 64 KiB | cheap, eliminates most survivors |
-| 4 | hash in full | only for files that got this far |
+| 4 | hash 4 MB spread through the file | settles files that share a header |
+| 5 | hash in full | only for what's left, so the answer stays exact |
+
+Stage 4 matters on big files that begin identically — disk images, backups,
+container formats. Reading four megabytes from across the file settles them
+without reading all of it. On a set of 300 MB images sharing a 100 MB header
+it cut reads from 3.15 GB to 0.67 GB, 79% less, for the same answer.
+
+There is deliberately no "fast mode" that stops at stage 4. Sampled agreement
+is not proof: two files can match at every sampled point and still differ in
+between. A tool that deletes files should not guess.
 
 On a typical tree this reads a low single-digit percentage of the bytes on
 disk. The summary line tells you exactly how much it read.
@@ -115,7 +125,8 @@ anything unless you passed `-y`.
 -l, --list          print a report instead of opening the browser
     --auto RULE     keep one copy per group (shortest|oldest|newest), remove rest
 -y, --yes           with --auto, don't ask for confirmation
--j, --jobs N        parallel readers (default: CPU count, capped at 8)
+-j, --jobs N        concurrent readers (default: 8 on an SSD, 2 on a
+                    spinning disk)
 -p, --parallel N    directories to scan at once (default: 4 on an SSD, 1 on a
                     spinning disk)
     --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
@@ -125,8 +136,9 @@ anything unless you passed `-y`.
 -q, --quiet         no progress output
 ```
 
-**On a spinning external drive, use `-j 2`.** Parallel reads make an SSD
-faster but cause a mechanical disk to thrash between seek positions.
+dedup asks the volume whether it is flash and picks the reader count itself:
+8 on an SSD, 2 on a spinning disk, where parallel reads only make the heads
+seek. `-j N` overrides it.
 
 Useful exclusions:
 

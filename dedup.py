@@ -10,7 +10,8 @@ Speed comes from never reading a file it doesn't have to:
   1. list every file's size   — one bulk syscall per directory, no reads
   2. discard unique sizes     — a file with a unique size cannot have a twin
   3. hash the first 64 KiB    — cheap, kills most remaining candidates
-  4. hash in full             — only for files that survived stages 2 and 3
+  4. hash 4 MB spread through — settles files that share a header but diverge
+  5. hash in full             — only for what survived, so the answer is exact
 
 On a typical tree this reads a low single-digit percentage of the bytes on disk.
 
@@ -35,6 +36,9 @@ from pathlib import Path
 __version__ = "1.0.0"
 
 HEAD_BYTES = 64 * 1024          # stage-3 sample size
+SAMPLE_BYTES = 1024 * 1024      # per sample point in stage 4
+SAMPLE_POINTS = 4               # head, two middles, tail
+SAMPLE_SPAN = SAMPLE_BYTES * SAMPLE_POINTS * 2   # below this, just read it all
 CHUNK = 4 * 1024 * 1024         # streaming read size for full hashes
 DIGEST_SIZE = 32                # blake2b-256; collision risk is not a practical concern
 
@@ -212,6 +216,16 @@ def walk_workers(roots: list[str], requested) -> int:
     if roots and all(is_solid_state(r) is True for r in roots):
         return min(4, (os.cpu_count() or 4))
     return 1
+
+
+def read_jobs(roots: list[str], requested) -> int:
+    """Concurrent readers. Flash likes queue depth; a spinning disk does not —
+    parallel reads there just make the heads seek between files."""
+    if requested is not None:
+        return max(1, requested)
+    if roots and all(is_solid_state(r) is True for r in roots):
+        return min(8, (os.cpu_count() or 4))
+    return 2
 
 
 def walk_files(roots: list[str], excludes: list[str], min_size: int,
@@ -592,6 +606,37 @@ def hash_head(path: str, size: int) -> bytes | None:
         return None
 
 
+def hash_sample(path: str, size: int) -> bytes | None:
+    """Hash a few chunks spread through the file instead of all of it.
+
+    On a slow disk the full read is the whole cost of a scan, and most
+    same-size files are not duplicates. Sampling settles those after a few
+    MB rather than after gigabytes. Survivors still get read in full, so
+    the result stays byte-exact.
+    """
+    if size <= SAMPLE_SPAN:
+        return hash_full(path, size)
+    h = hashlib.blake2b(digest_size=DIGEST_SIZE)
+    h.update(str(size).encode())          # same samples, different length
+    step = (size - SAMPLE_BYTES) // (SAMPLE_POINTS - 1)
+    try:
+        with open(path, "rb", buffering=0) as fh:
+            for i in range(SAMPLE_POINTS):
+                fh.seek(i * step)
+                block = fh.read(SAMPLE_BYTES)
+                if not block:
+                    break
+                h.update(block)
+        return h.digest()
+    except (PermissionError, OSError):
+        return None
+
+
+def sampled_bytes(size: int) -> int:
+    """How much hash_sample actually reads — for honest progress accounting."""
+    return size if size <= SAMPLE_SPAN else SAMPLE_BYTES * SAMPLE_POINTS
+
+
 def hash_full(path: str, size: int) -> bytes | None:
     h = hashlib.blake2b(digest_size=DIGEST_SIZE)
     try:
@@ -619,7 +664,12 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
                 continue
             buckets[digest].append(rec)
             stats.hashed_files += 1
-            stats.hashed_bytes += min(rec.size, HEAD_BYTES) if fn is hash_head else rec.size
+            if fn is hash_head:
+                stats.hashed_bytes += min(rec.size, HEAD_BYTES)
+            elif fn is hash_sample:
+                stats.hashed_bytes += sampled_bytes(rec.size)
+            else:
+                stats.hashed_bytes += rec.size
             if on_progress:
                 now = time.monotonic()
                 if now - last_tick > 0.1:
@@ -694,7 +744,21 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if not survivors:
         return []
 
-    # stage 4 — full content hash
+    # stage 4 — sample points spread through the file. Cheap way to settle
+    # same-size files that only agree on their first 64 KiB.
+    sample_buckets = None
+    if any(f.size > SAMPLE_SPAN for f in survivors):
+        say("sample", len(survivors))
+        sample_buckets = hash_stage(survivors, hash_sample, jobs, stats, tick)
+        if reporter:
+            reporter.finish_stage()
+        survivors = [f for group in sample_buckets.values() if len(group) > 1
+                     for f in group]
+        if not survivors:
+            return []
+
+    # stage 5 — full content hash. Never skipped: sampled agreement is not
+    # proof, and this tool deletes things.
     say("full", len(survivors))
     full_buckets = hash_stage(survivors, hash_full, jobs, stats, tick)
     if reporter:
@@ -803,6 +867,7 @@ class Reporter:
 
     LABELS = {
         "scan": "Scanning",
+        "sample": "Sampling deep",
         "head": "Sampling",
         "full": "Hashing",
     }
@@ -1356,8 +1421,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "the rest after one confirmation")
     p.add_argument("-y", "--yes", action="store_true",
                    help="with --auto, don't ask for confirmation")
-    p.add_argument("-j", "--jobs", type=int, default=min(8, (os.cpu_count() or 4)),
-                   help="parallel readers (use 2 on a spinning external drive)")
+    p.add_argument("-j", "--jobs", type=int, default=None,
+                   help="concurrent readers (default: 8 on an SSD, 2 on a "
+                        "spinning disk, where parallel reads only cause seeking)")
     p.add_argument("-p", "--parallel", type=int, default=None, metavar="N",
                    help="directories to scan at once (default: several on an "
                         "SSD, one on a spinning disk; -p 1 forces one)")
@@ -1391,7 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
             args.paths,
             excludes=args.exclude,
             min_size=args.min_size,
-            jobs=max(1, args.jobs),
+            jobs=read_jobs(args.paths, args.jobs),
             verify=args.verify,
             stats=stats,
             reporter=reporter,
