@@ -820,8 +820,8 @@ class TestSampledHashing:
         assert len(groups[0].files) == 2
 
     def test_difference_outside_the_samples_is_still_caught(self, tmp_path):
-        """The samples can agree while the files differ. The full hash is what
-        makes the default byte-exact, so this must NOT report a duplicate."""
+        """The samples can agree while the files differ. Stage 5 reads the
+        bytes, so this must NOT report a duplicate."""
         self._big(tmp_path / "a.bin", b"A", tail=b"")
         b = self._big(tmp_path / "b.bin", b"A")
         data = bytearray(b.read_bytes())
@@ -850,6 +850,188 @@ class TestSampledHashing:
         da = dedup.hash_sample(str(a), a.stat().st_size)
         db = dedup.hash_sample(str(b), b.stat().st_size)
         assert da != db
+
+
+class TestByteComparison:
+    """Stage 5 reads the files in step and splits them where they differ.
+
+    It is the stage that decides what gets deleted, so it gets the hardest
+    cases: groups that split more than one way, differences one byte from
+    the end, and files that only match for a while.
+    """
+
+    HEAD = b"H" * (dedup.HEAD_BYTES + 1024)     # shared, so they meet in stage 3
+
+    def _same_head(self, path, tail: bytes, length=200 * 1024):
+        body = bytearray(self.HEAD + tail)
+        body.extend(b"\0" * (length - len(body)))
+        return write(path, bytes(body[:length]))
+
+    def _rec(self, path):
+        st = os.stat(path)
+        return FileRec(str(path), st.st_size, st.st_mtime, st.st_dev, st.st_ino)
+
+    def test_one_bucket_splits_into_two_groups(self, tmp_path):
+        """Same size, same head — one bucket arrives at stage 5 holding two
+        different sets of duplicates. Both have to come out."""
+        for name in ("a", "b", "c"):
+            self._same_head(tmp_path / f"{name}.bin", b"first")
+        for name in ("d", "e"):
+            self._same_head(tmp_path / f"{name}.bin", b"second")
+
+        groups = scan(tmp_path)
+
+        assert sorted(len(g.files) for g in groups) == [2, 3]
+
+    def test_a_bucket_of_all_different_files_yields_nothing(self, tmp_path):
+        for i, name in enumerate("abcd"):
+            self._same_head(tmp_path / f"{name}.bin", bytes([i]) * 8)
+
+        assert scan(tmp_path) == []
+
+    def test_difference_in_the_final_byte_is_caught(self, tmp_path):
+        a = self._same_head(tmp_path / "a.bin", b"same")
+        b = self._same_head(tmp_path / "b.bin", b"same")
+        data = bytearray(b.read_bytes())
+        data[-1] ^= 0xFF
+        b.write_bytes(bytes(data))
+
+        assert scan(tmp_path) == []
+
+    def test_files_matching_across_many_chunks_are_found(self, tmp_path):
+        """Drive the multi-round loop without writing a 16 MB file: a tiny
+        chunk makes a 200 KB file take dozens of passes."""
+        a = self._same_head(tmp_path / "a.bin", b"same")
+        b = self._same_head(tmp_path / "b.bin", b"same")
+        recs = [self._rec(a), self._rec(b)]
+
+        matched = dedup.split_identical(recs, 4096, ScanStats())
+
+        assert len(matched) == 1 and len(matched[0]) == 2
+
+    def test_divergence_stops_the_read_early(self, tmp_path):
+        """The point of comparing rather than hashing: files that turn out to
+        differ are not read to the end."""
+        a = self._same_head(tmp_path / "a.bin", b"one")
+        b = self._same_head(tmp_path / "b.bin", b"two")
+        stats = ScanStats()
+
+        dedup.split_identical([self._rec(a), self._rec(b)], 4096, stats)
+
+        assert stats.hashed_bytes < a.stat().st_size
+
+    def test_an_unreadable_member_does_not_break_the_group(self, tmp_path):
+        """Opening happens inside the comparison, so a file that can't be read
+        has to drop out without taking its twins with it."""
+        if os.geteuid() == 0:
+            pytest.skip("root can read anything")
+        recs = [self._rec(self._same_head(tmp_path / f"{n}.bin", b"same"))
+                for n in ("a", "b", "c")]
+        locked = tmp_path / "c.bin"
+        locked.chmod(0o000)
+        try:
+            stats = ScanStats()
+            matched = dedup.split_identical(recs, 4096, stats)
+        finally:
+            locked.chmod(0o644)
+
+        assert [len(m) for m in matched] == [2]
+        assert str(locked) in stats.unreadable
+
+    def test_same_head_different_length_never_meet(self, tmp_path):
+        """A head digest covers 64 KiB, not the file. Size is part of the
+        bucket key so two different-length files are never compared."""
+        a = self._same_head(tmp_path / "a.bin", b"same", length=200 * 1024)
+        b = self._same_head(tmp_path / "b.bin", b"same", length=300 * 1024)
+        stats = ScanStats()
+
+        buckets = dedup.hash_stage([self._rec(a), self._rec(b)],
+                                   dedup.hash_head, 2, stats)
+
+        assert all(len(v) == 1 for v in buckets.values())
+
+    def test_every_file_is_accounted_for_so_progress_reaches_the_end(self, tmp_path):
+        """The bar counts files settled against files entering the stage. A
+        scan that stalls at 94% forever reads as a hang — it did once."""
+        for name in ("a", "b", "c"):
+            self._same_head(tmp_path / f"{name}.bin", b"first")
+        self._same_head(tmp_path / "d.bin", b"alone")
+        recs = [self._rec(tmp_path / f"{n}.bin") for n in ("a", "b", "c", "d")]
+        stats = ScanStats()
+
+        dedup.split_identical(recs, 4096, stats)
+
+        assert stats.hashed_files == len(recs)
+
+    def test_progress_ticks_during_a_long_comparison(self, tmp_path):
+        """One group of two enormous files is many rounds and one group. The
+        tick has to come from inside the loop, not after it."""
+        recs = [self._rec(self._same_head(tmp_path / f"{n}.bin", b"same"))
+                for n in ("a", "b")]
+        ticks = []
+
+        dedup.split_identical(recs, 4096, ScanStats(), tick=lambda: ticks.append(1))
+
+        assert len(ticks) > 5
+
+    def test_verify_flag_is_accepted_and_changes_nothing(self, tmp_path):
+        write(tmp_path / "a.txt", b"hello world")
+        write(tmp_path / "b.txt", b"hello world")
+
+        assert scan(tmp_path, verify=True) == scan(tmp_path, verify=False)
+
+
+class TestComparisonPrimitives:
+    def test_partition_splits_three_ways(self):
+        blocks = [("a", b"1"), ("b", b"2"), ("c", b"1"), ("d", b"3"), ("e", b"2")]
+
+        runs = dedup.partition_blocks(blocks)
+
+        assert sorted(sorted(r for r, _ in run) for run in runs) == \
+            [["a", "c"], ["b", "e"], ["d"]]
+
+    def test_partition_of_nothing_is_nothing(self):
+        assert dedup.partition_blocks([]) == []
+
+    def test_read_block_keeps_reading_after_a_short_read(self):
+        class Dribble:
+            """read(2) may return less than asked for. If that split two
+            identical files differently they would look unequal."""
+            def __init__(self, data):
+                self.data, self.pos = data, 0
+
+            def read(self, n):
+                out = self.data[self.pos:self.pos + min(n, 3)]
+                self.pos += len(out)
+                return out
+
+        assert dedup.read_block(Dribble(b"abcdefghij"), 8) == b"abcdefgh"
+
+    def test_read_block_returns_what_is_left_at_the_end(self):
+        import io
+        assert dedup.read_block(io.BytesIO(b"abc"), 100) == b"abc"
+        assert dedup.read_block(io.BytesIO(b""), 100) == b""
+
+    def test_chunk_is_smaller_on_flash_than_on_a_spinning_disk(self):
+        assert dedup.compare_chunk(2, True) < dedup.compare_chunk(2, None)
+
+    def test_a_wide_group_stays_inside_the_memory_budget(self):
+        """A round holds one chunk per member. A thousand copies of one file
+        is unusual but not impossible, and must not mean a gigabyte of RAM."""
+        for members in (2, 8, 64, 512, 1024):
+            for solid in (True, False, None):
+                held = dedup.compare_chunk(members, solid) * members
+                assert held <= dedup.COMPARE_BUDGET, (members, solid, held)
+
+    def test_chunks_never_shrink_to_a_pointless_read(self):
+        assert dedup.compare_chunk(100000, None) == dedup.MIN_CHUNK
+
+    def test_unknown_device_is_not_treated_as_flash(self, monkeypatch):
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: None)
+        assert dedup.all_solid_state(["/x"]) is False
+        monkeypatch.setattr(dedup, "is_solid_state", lambda p: True)
+        assert dedup.all_solid_state(["/x"]) is True
+        assert dedup.all_solid_state([]) is False
 
 
 class TestDeviceAwareJobs:

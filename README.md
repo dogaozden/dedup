@@ -27,13 +27,37 @@ The scan avoids reading files it doesn't have to:
 | 1 | list every file's size | one bulk syscall per directory, no reads |
 | 2 | discard unique sizes | a file with a unique size can't have a twin |
 | 3 | hash the first 64 KiB | cheap, eliminates most survivors |
-| 4 | hash 4 MB spread through the file | settles files that share a header |
-| 5 | hash in full | only for what's left, so the answer stays exact |
+| 4 | hash 4 MB spread through the file | settles big files that share a header |
+| 5 | compare the bytes, in step | only for what's left, and it stops early |
 
 Stage 4 matters on big files that begin identically — disk images, backups,
 container formats. Reading four megabytes from across the file settles them
 without reading all of it. On a set of 300 MB images sharing a 100 MB header
-it cut reads from 3.15 GB to 0.67 GB, 79% less, for the same answer.
+it cut reads from 3.15 GB to 0.67 GB, 79% less, for the same answer. Files
+too small to be worth sampling skip it: below 8 MB there is nothing to sample
+without reading the whole file, and stage 5 would then read it all again.
+
+Stage 5 reads the survivors in step and splits them apart the moment their
+bytes differ, rather than hashing each one to the end and comparing digests.
+That is faster twice over. Files that turn out not to match stop being read
+where they diverge instead of being read in full. And comparing blocks costs
+essentially nothing, where hashing them was the entire cost of a scan on a
+fast disk — BLAKE2b managed 1.5 GB/s per core, so a handful of cores hashing
+was the ceiling on an SSD that could deliver far more.
+
+Measured against the previous version, same trees, same answers:
+
+| Tree | Readers | Before | After | |
+|---|---|---|---|---|
+| /Applications, defaults | 2 | 0.33s | 0.13s | 2.6× |
+| /Applications, defaults | 8 | 0.20s | 0.08s | 2.4× |
+| /Applications, `--min-size 1M` | 8 | 0.59s | 0.35s | 1.7×, 27% fewer bytes |
+| 1.29 GB of large files | 2 | 0.79s | 0.15s | 5.4× |
+| 1.29 GB of large files | 8 | 0.34s | 0.12s | 2.9× |
+
+Those are the reading stages; the directory walk is unchanged. On a slow
+external disk the CPU was never the limit, so expect the fewer bytes rather
+than the multiple.
 
 There is deliberately no "fast mode" that stops at stage 4. Sampled agreement
 is not proof: two files can match at every sampled point and still differ in
@@ -53,8 +77,11 @@ volume which it is and picks for itself. `-p N` overrides that — `-p 1` forces
 one at a time, which is also what happens on any volume that won't say what it
 is (USB enclosures usually won't).
 
-Hashing is BLAKE2b-256. A collision is far less likely than a disk returning
-the wrong bytes, but `--verify` adds a byte-for-byte comparison if you want it.
+The narrowing stages hash with SHA-256, which every CPU this runs on has an
+instruction for — measured at twice BLAKE2b's speed here. Nothing is ever
+called a duplicate on the strength of a hash, though: the last stage compares
+the bytes, so a collision could only ever cost an extra comparison. `--verify`
+used to add that comparison and is now the default, so the flag does nothing.
 
 ## Hardlinks
 
@@ -131,7 +158,7 @@ anything unless you passed `-y`.
                     spinning disk)
     --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
-    --verify        byte-compare matches before reporting them
+    --verify        no-op; matches are always byte-compared now
     --hard          delete permanently instead of using the Trash
 -q, --quiet         no progress output
 ```

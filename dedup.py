@@ -11,7 +11,7 @@ Speed comes from never reading a file it doesn't have to:
   2. discard unique sizes     — a file with a unique size cannot have a twin
   3. hash the first 64 KiB    — cheap, kills most remaining candidates
   4. hash 4 MB spread through — settles files that share a header but diverge
-  5. hash in full             — only for what survived, so the answer is exact
+  5. compare the bytes        — in step, stopping the moment two files differ
 
 On a typical tree this reads a low single-digit percentage of the bytes on disk.
 
@@ -39,8 +39,13 @@ HEAD_BYTES = 64 * 1024          # stage-3 sample size
 SAMPLE_BYTES = 1024 * 1024      # per sample point in stage 4
 SAMPLE_POINTS = 4               # head, two middles, tail
 SAMPLE_SPAN = SAMPLE_BYTES * SAMPLE_POINTS * 2   # below this, just read it all
-CHUNK = 4 * 1024 * 1024         # streaming read size for full hashes
-DIGEST_SIZE = 32                # blake2b-256; collision risk is not a practical concern
+CHUNK = 4 * 1024 * 1024         # comparison chunk on flash
+SLOW_CHUNK = 16 * 1024 * 1024   # ...and on a spinning disk, where every extra
+                                # file in a group costs a seek per round
+COMPARE_BUDGET = 128 * 1024 * 1024   # ceiling on bytes held for one group
+MIN_CHUNK = 128 * 1024          # ...which the chunk shrinks towards, but not
+                                # below, so a group of a thousand copies still
+                                # fits and a read is still worth making
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +209,11 @@ def is_solid_state(path: str):
     return answer
 
 
+def all_solid_state(roots: list[str]) -> bool:
+    """True only when every root is known to be flash. 'Don't know' is a no."""
+    return bool(roots) and all(is_solid_state(r) is True for r in roots)
+
+
 def walk_workers(roots: list[str], requested) -> int:
     """How many directories to read at once: explicit setting, or by device."""
     if requested is not None:
@@ -213,7 +223,7 @@ def walk_workers(roots: list[str], requested) -> int:
     # Every root has to be flash before reading several at a time. Four is
     # measurably the best point: past it the threads spend more time waiting
     # on each other to parse than they save on the syscalls.
-    if roots and all(is_solid_state(r) is True for r in roots):
+    if all_solid_state(roots):
         return min(4, (os.cpu_count() or 4))
     return 1
 
@@ -223,7 +233,7 @@ def read_jobs(roots: list[str], requested) -> int:
     parallel reads there just make the heads seek between files."""
     if requested is not None:
         return max(1, requested)
-    if roots and all(is_solid_state(r) is True for r in roots):
+    if all_solid_state(roots):
         return min(8, (os.cpu_count() or 4))
     return 2
 
@@ -598,10 +608,22 @@ def drop_hardlinks(files: list[FileRec]) -> list[FileRec]:
 # hashing
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _digest():
+    """SHA-256 — every CPU this runs on has an instruction for it, which
+    makes it about twice as fast here as BLAKE2b (3.0 vs 1.5 GB/s measured).
+
+    These digests only narrow the field. Nothing is ever called a duplicate
+    on the strength of a hash: stage 5 compares the bytes.
+    """
+    return hashlib.sha256()
+
+
 def hash_head(path: str, size: int) -> bytes | None:
     try:
         with open(path, "rb") as fh:
-            return hashlib.blake2b(fh.read(HEAD_BYTES), digest_size=DIGEST_SIZE).digest()
+            h = _digest()
+            h.update(fh.read(HEAD_BYTES))
+            return h.digest()
     except (PermissionError, OSError):
         return None
 
@@ -616,7 +638,7 @@ def hash_sample(path: str, size: int) -> bytes | None:
     """
     if size <= SAMPLE_SPAN:
         return hash_full(path, size)
-    h = hashlib.blake2b(digest_size=DIGEST_SIZE)
+    h = _digest()
     h.update(str(size).encode())          # same samples, different length
     step = (size - SAMPLE_BYTES) // (SAMPLE_POINTS - 1)
     try:
@@ -638,9 +660,9 @@ def sampled_bytes(size: int) -> int:
 
 
 def hash_full(path: str, size: int) -> bytes | None:
-    h = hashlib.blake2b(digest_size=DIGEST_SIZE)
+    h = _digest()
     try:
-        with open(path, "rb") as fh:
+        with open(path, "rb", buffering=0) as fh:
             while True:
                 block = fh.read(CHUNK)
                 if not block:
@@ -652,9 +674,14 @@ def hash_full(path: str, size: int) -> bytes | None:
 
 
 def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
-               on_progress=None) -> dict[bytes, list[FileRec]]:
-    """Hash `files` with `fn` and bucket them by digest."""
-    buckets: dict[bytes, list[FileRec]] = defaultdict(list)
+               on_progress=None) -> dict:
+    """Hash `files` with `fn` and bucket them by size and digest.
+
+    Size is part of the key because a head or sample digest covers only part
+    of the file: two files of different lengths can easily agree on their
+    first 64 KiB and never be duplicates.
+    """
+    buckets: dict = defaultdict(list)
     last_tick = 0.0
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -662,7 +689,7 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
             if digest is None:
                 stats.unreadable.append(rec.path)
                 continue
-            buckets[digest].append(rec)
+            buckets[(rec.size, digest)].append(rec)
             stats.hashed_files += 1
             if fn is hash_head:
                 stats.hashed_bytes += min(rec.size, HEAD_BYTES)
@@ -679,23 +706,143 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
     return buckets
 
 
-def bytes_identical(paths: list[str]) -> bool:
-    """Byte-for-byte comparison, for --verify."""
+def compare_chunk(members: int, solid) -> int:
+    """How much to read from each file per round.
+
+    Flash likes small chunks — 4 MB measured fastest. A spinning disk pays a
+    seek every time we move to the next file in the group, so it wants big
+    ones. Either way a round holds one chunk per member, so a group with a
+    lot of copies in it gets a smaller chunk to stay inside the budget.
+    """
+    return max(MIN_CHUNK, min(CHUNK if solid is True else SLOW_CHUNK,
+                              COMPARE_BUDGET // max(1, members)))
+
+
+def read_block(fh, size: int) -> bytes:
+    """Read exactly `size` bytes, or whatever is left at the end of the file.
+
+    An unbuffered read is one read(2), and read(2) is allowed to come back
+    with less than it was asked for. Two identical files that happened to
+    return different amounts would compare unequal and be split apart, so
+    the loop matters — it's the difference between a missed duplicate and
+    a found one.
+    """
+    parts, remaining = [], size
+    while remaining > 0:
+        block = fh.read(remaining)
+        if not block:
+            break
+        parts.append(block)
+        remaining -= len(block)
+    return parts[0] if len(parts) == 1 else b"".join(parts)
+
+
+def partition_blocks(blocks: list) -> list[list]:
+    """Split (rec, block) pairs into runs that agree on this chunk.
+
+    Comparing against a pivot rather than hashing each block is the point of
+    the whole stage: a memcmp costs essentially nothing next to a digest.
+    """
+    runs, pending = [], blocks
+    while pending:
+        pivot = pending[0]
+        same, rest = [pivot], []
+        for item in pending[1:]:
+            (same if item[1] == pivot[1] else rest).append(item)
+        runs.append(same)
+        pending = rest
+    return runs
+
+
+def split_identical(members: list, chunk: int, stats: ScanStats,
+                    pool=None, tick=None) -> list[list]:
+    """Read every file in a group once, in step, and split them the moment
+    their bytes differ.
+
+    Two things make this cheaper than hashing each file and comparing digests.
+    Files that turn out not to match stop being read at the byte where they
+    diverge, instead of being read to the end. And comparing blocks costs
+    almost nothing, where hashing them is the whole cost of a scan on a fast
+    disk. It is also exact by construction — there is no digest left to
+    collide, so nothing is deleted on the strength of a guess.
+    """
+    handles, opened = {}, []
+    for rec in members:
+        try:
+            handles[id(rec)] = open(rec.path, "rb", buffering=0)
+            opened.append(rec)
+        except (PermissionError, OSError):
+            stats.unreadable.append(rec.path)
+    # Files that wouldn't open are settled, and so is a lone survivor: count
+    # them now or the progress bar stops short of the end.
+    stats.hashed_files += len(members) - len(opened)
+
+    def grab(rec):
+        try:
+            return rec, read_block(handles[id(rec)], chunk)
+        except (PermissionError, OSError):
+            return rec, None
+
+    matched: list[list] = []
     try:
-        handles = [open(p, "rb") for p in paths]
-    except OSError:
-        return False
-    try:
-        while True:
-            blocks = [fh.read(CHUNK) for fh in handles]
-            first = blocks[0]
-            if any(b != first for b in blocks[1:]):
-                return False
-            if not first:
-                return True
+        live = [opened] if len(opened) > 1 else []
+        if not live:
+            stats.hashed_files += len(opened)
+        while live:
+            following = []
+            for group in live:
+                blocks = list(pool.map(grab, group)) if pool else [grab(r) for r in group]
+                for rec, block in blocks:
+                    if block is None:
+                        stats.unreadable.append(rec.path)
+                        stats.hashed_files += 1
+                blocks = [b for b in blocks if b[1] is not None]
+                stats.hashed_bytes += sum(len(b) for _, b in blocks)
+
+                for run in partition_blocks(blocks):
+                    recs = [r for r, _ in run]
+                    if len(recs) < 2:
+                        stats.hashed_files += len(recs)   # settled, stop reading
+                    elif run[0][1]:
+                        following.append(recs)            # still together
+                    else:
+                        matched.append(recs)              # same bytes to EOF
+                        stats.hashed_files += len(recs)
+                if tick:
+                    tick()          # two huge files are one group and many
+                                    # rounds; the bar has to move meanwhile
+            live = following
     finally:
-        for fh in handles:
+        for fh in handles.values():
             fh.close()
+    return matched
+
+
+def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
+                  on_progress=None) -> list[list]:
+    """Run split_identical over every candidate group.
+
+    Groups go one at a time with their members read in parallel, rather than
+    the other way round: a folder whose duplicates are two enormous files is
+    one group, and it should still use the whole disk queue.
+    """
+    out: list[list] = []
+    last_tick = [0.0]
+
+    def tick() -> None:
+        if not on_progress:
+            return
+        now = time.monotonic()
+        if now - last_tick[0] > 0.1:
+            on_progress(stats)
+            last_tick[0] = now
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for members in buckets:
+            chunk = compare_chunk(len(members), solid)
+            out.extend(split_identical(members, chunk, stats,
+                                       pool if jobs > 1 else None, tick))
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -703,9 +850,13 @@ def bytes_identical(paths: list[str]) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
-                    jobs: int, verify: bool, stats: ScanStats,
+                    jobs: int, stats: ScanStats, verify: bool = False,
                     reporter=None, walkers=None) -> list[DupGroup]:
-    """Run the four-stage narrowing described in the module docstring."""
+    """Run the five-stage narrowing described in the module docstring.
+
+    `verify` is accepted so older commands keep working. It no longer changes
+    anything: the last stage compares bytes, so every answer is byte-exact.
+    """
     def say(key: str, total: int = 0) -> None:
         if reporter:
             reporter.stage(key, total, stats)
@@ -730,46 +881,56 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if not candidates:
         return []
 
+    # Read in the order the volume laid the files down, not the order they
+    # happened to be grouped in. On a spinning disk that turns a stage into
+    # one sweep across the platter instead of a jump per file.
+    def by_layout(f: FileRec):
+        return (f.dev, f.ino)
+
+    candidates.sort(key=by_layout)
+
     # stage 3 — sample the head
     say("head", len(candidates))
     head_buckets = hash_stage(candidates, hash_head, jobs, stats, tick)
     if reporter:
         reporter.finish_stage()
 
-    survivors: list[FileRec] = []
-    for group in head_buckets.values():
-        if len(group) > 1:
-            survivors.extend(group)
-
-    if not survivors:
+    pending = [g for g in head_buckets.values() if len(g) > 1]
+    if not pending:
         return []
 
     # stage 4 — sample points spread through the file. Cheap way to settle
     # same-size files that only agree on their first 64 KiB.
-    sample_buckets = None
-    if any(f.size > SAMPLE_SPAN for f in survivors):
+    #
+    # Only files big enough to be worth sampling go through it. Below
+    # SAMPLE_SPAN there is nothing to sample: hash_sample reads the whole
+    # file, and then stage 5 reads the whole file again. Every bucket holds
+    # one size, so a bucket is entirely on one side of the line.
+    small = [g for g in pending if g[0].size <= SAMPLE_SPAN]
+    big = [g for g in pending if g[0].size > SAMPLE_SPAN]
+    if big:
+        survivors = sorted((f for g in big for f in g), key=by_layout)
         say("sample", len(survivors))
         sample_buckets = hash_stage(survivors, hash_sample, jobs, stats, tick)
         if reporter:
             reporter.finish_stage()
-        survivors = [f for group in sample_buckets.values() if len(group) > 1
-                     for f in group]
-        if not survivors:
-            return []
+        big = [g for g in sample_buckets.values() if len(g) > 1]
+    pending = small + big
+    if not pending:
+        return []
 
-    # stage 5 — full content hash. Never skipped: sampled agreement is not
-    # proof, and this tool deletes things.
-    say("full", len(survivors))
-    full_buckets = hash_stage(survivors, hash_full, jobs, stats, tick)
+    # stage 5 — compare what's left byte for byte, in step. Sampled agreement
+    # is not proof and this tool deletes things, so the bytes get read; doing
+    # it as a comparison rather than a hash means files that turn out to
+    # differ stop being read where they diverge.
+    pending.sort(key=lambda g: min(by_layout(f) for f in g))
+    say("compare", sum(len(g) for g in pending))
+    matched = compare_stage(pending, jobs, all_solid_state(roots), stats, tick)
     if reporter:
         reporter.finish_stage()
 
     groups: list[DupGroup] = []
-    for members in full_buckets.values():
-        if len(members) < 2:
-            continue
-        if verify and not bytes_identical([m.path for m in members]):
-            continue
+    for members in matched:
         members.sort(key=lambda f: (len(f.path), f.path))
         groups.append(DupGroup(members[0].size, members))
 
@@ -869,7 +1030,7 @@ class Reporter:
         "scan": "Scanning",
         "sample": "Sampling deep",
         "head": "Sampling",
-        "full": "Hashing",
+        "compare": "Comparing",
     }
 
     def __init__(self, enabled: bool = True):
@@ -1432,7 +1593,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-x", "--exclude", action="append", default=[], metavar="GLOB",
                    help="skip names matching GLOB (repeatable)")
     p.add_argument("--verify", action="store_true",
-                   help="byte-compare matches before reporting them")
+                   help="no-op; matches are always byte-compared now")
     p.add_argument("--hard", action="store_true",
                    help="delete permanently instead of moving to the Trash")
     p.add_argument("-q", "--quiet", action="store_true", help="no progress output")
