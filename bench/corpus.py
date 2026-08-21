@@ -25,7 +25,7 @@ from collections import defaultdict
 
 # Bump this whenever a builder changes what it writes. Corpora stamped with an
 # older version are regenerated rather than trusted.
-GENERATOR_VERSION = 1
+GENERATOR_VERSION = 2
 
 # randbytes(n) builds one n*8-bit integer, so it is asked for the corpus in
 # pieces. The chunk size is part of the corpus definition: change it and every
@@ -39,7 +39,18 @@ SCALES = {"default": 1.0, "smoke": 0.1}
 # dedup changes them the scenario stops being interesting rather than wrong.
 SAMPLE_BYTES = 1 << 20
 SAMPLE_POINTS = 4
+
+# HEAD_BYTES here is 64 KiB because that is what `photos` and `samesize` were
+# built against, and it is deliberately NOT dedup's HEAD_BYTES any more —
+# dedup now reads its head in two tiers, 4 KiB then out to 64 KiB, and the
+# name stayed with the number rather than with the tier. Do not "fix" this to
+# match dedup: these two constants decide how many bytes those scenarios
+# write, so changing either one silently rewrites their corpora and every
+# number ever recorded against them stops being comparable. `prefixtrap` aims
+# at both tiers and names them explicitly instead.
 HEAD_BYTES = 64 << 10
+DEEP_HEAD = 64 << 10             # dedup's tier-2 target
+FIRST_PAGE = 4 << 10             # ...and its tier-1 first pass
 
 
 def blind_tail(size: int) -> int:
@@ -367,32 +378,56 @@ def _samesize(c: Corpus, rng: random.Random, f: float) -> None:
 
 
 PREFIXTRAP_BYTES = 2 << 20
-PREFIXTRAP_PREFIXES = (8 << 10, 24 << 10, 56 << 10)
+
+# One band under dedup's first page, three between it and the deep head. The
+# longest stops well short of DEEP_HEAD — 48 KiB against 64 — so the band is
+# separated by a comfortable margin rather than by the last kilobyte of it.
+PREFIXTRAP_PREFIXES = (2 << 10, 8 << 10, 24 << 10, 48 << 10)
 
 
 def _prefixtrap(c: Corpus, rng: random.Random, f: float) -> None:
     """Same-size files that share a short prefix and then nothing at all.
 
-    This scenario exists to punish one specific idea: shrinking HEAD_BYTES.
-    Every other scenario makes a smaller head look free — it reads less in
-    stage 3 and separates just as much — because nowhere else do same-size
-    files agree for a few kilobytes and then part company. Real trees are
-    full of that shape: camera raws from one body share a header, and so do
-    exports from one encoder.
+    This scenario exists to punish one specific idea: reading less of the
+    head. Every other scenario makes a shorter head look free — it reads
+    fewer bytes in stage 3 and separates just as much — because nowhere else
+    do same-size files agree for a few kilobytes and then part company. Real
+    trees are full of that shape: camera raws from one body share a header,
+    and so do exports from one encoder.
 
-    Three bands, one shared prefix each, divergence on the byte after it. At
-    the current 64 KiB every band's prefix is inside the head, so stage 3
-    reads 64 KiB per file and hands stage 5 nothing but the true duplicates.
-    Shrink the head below a band's prefix and every file in that band has an
-    identical head, arrives at stage 5 as one bucket, and gets read — bytes
-    regress by roughly the size of the band.
+    Four bands, one shared prefix each, divergence on the byte after it, all
+    at one size so stage 2 hands the whole population to stage 3 together.
+
+    Stage 3 reads its head in two tiers, and there is a band aimed at each:
+
+      2 KiB   under FIRST_PAGE, so tier 1 settles this band on its own for
+              one page a file. This band is a marker, not a trap: shrinking
+              tier 1 below 2 KiB drops it through to tier 2 and gives the
+              saving back, which shows in the table as bytes rising, but it
+              cannot trip the veto. Losing tier-1 separation costs at most
+              the whole deep head, and paying the whole head is exactly what
+              the pinned baseline already did — so the number returns to
+              1.00x and stops there. Measured: tier 1 at 1 KiB reads 18.0 MB
+              against a baseline of 18.0 MB.
+      8, 24,
+      48 KiB  over FIRST_PAGE and under DEEP_HEAD, so tier 1 leaves them
+              crowded and tier 2 separates them. This is the trap. Pull
+              DEEP_HEAD in below a band's prefix and that band is not
+              separated at all: it arrives at stage 5 as a single bucket and
+              is read far past the head, which is far past anything the
+              baseline paid. Measured at default scale: DEEP_HEAD at 4 KiB
+              reads 147.2 MB against a baseline of 44.2 MB, a 3.33x
+              regression that voids the score.
+
+    The scenario says nothing about making the head *longer* — that is still
+    a live idea, and this corpus is indifferent to it.
 
     The files sit below SAMPLE_SPAN on purpose. Above it stage 4 would sample
-    the divergent part and separate the band anyway, which would let a
-    shrunken head off with a warning instead of a bill.
+    the divergent part and separate a band anyway, which would let a
+    shortened head off with a warning instead of a bill.
     """
     n = max(24, round(180 * f))
-    n_pairs = max(2, round(6 * f))
+    n_pairs = max(4, round(8 * f))
     bands = len(PREFIXTRAP_PREFIXES)
 
     for band, shared in enumerate(PREFIXTRAP_PREFIXES):
@@ -401,8 +436,8 @@ def _prefixtrap(c: Corpus, rng: random.Random, f: float) -> None:
         rest = PREFIXTRAP_BYTES - shared
         for i in range(n // bands + (1 if band < n % bands else 0)):
             c.write("{}/u{:04d}.raw".format(stem, i), prefix, rand(rng, rest))
-        # A few real duplicates in every band, so the scenario has groups to
-        # prove and stage 5 has honest work to do on the unshrunken head.
+        # A real duplicate pair in every band, so the scenario has groups to
+        # prove and stage 5 has honest work to do however the head is read.
         for i in range(n_pairs // bands + (1 if band < n_pairs % bands else 0)):
             body = rand(rng, rest)
             c.write("{}/dup{:03d}-a.raw".format(stem, i), prefix, body)
@@ -547,7 +582,7 @@ ESTIMATE = {
     "needle":      (12e6, 430e6),
     "samesize":    (70e6, 440e6),
     "widegroup":   (20e6, 145e6),
-    "prefixtrap":  (60e6, 405e6),
+    "prefixtrap":  (68e6, 412e6),
     "adversarial": (14e6, 14e6),
     "deletion":    (10e6, 70e6),
 }
