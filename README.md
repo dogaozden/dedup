@@ -190,3 +190,61 @@ Needs Python 3.9 or newer. No third-party packages.
 ```
 python3 -m pytest tests/ -v
 ```
+
+## Benchmarks
+
+`bench/` measures a change to dedup against a fixed corpus, with correctness
+as a gate rather than a score.
+
+```
+python3 bench/run.py                    # everything, ~2 GB of corpora
+python3 bench/run.py --scale smoke      # a tenth the size, for iterating
+python3 bench/run.py --selftest         # check that the gates still bite
+```
+
+The corpora live on a RAM disk the harness attaches at `/Volumes/dedupbench`,
+because a 2 GB benchmark has no business on the boot disk and a real device
+would make every number a story about the page cache. Each corpus is written
+from a seeded PRNG, so the same `--seed` and `--scale` always produce the same
+bytes, and the answer key is written beside the tree — never inside it.
+
+Eight scenarios, each aimed at a different part of the pipeline: `typical`
+(a mixed tree), `photos` (few files, all large), `bigheader` (long shared
+prefixes, where stage 4 earns its keep), `needle` (100k tiny files, so mostly
+the walk), `samesize` (every file the same length with the same first 64 KiB,
+so nothing before stage 5 separates anything), `widegroup` (one group of 500,
+plus the hardlink cases), `adversarial` (symlink loops, unreadable files, odd
+names) and `deletion` (the real command line, checked against the Trash).
+
+### What the gates mean
+
+Nothing is reported as faster until it is first shown to be right. A failure
+in any of these fails the whole run and prints no timings at all:
+
+- **pytest** — the existing suite, run against the `dedup.py` under test.
+- **correctness** — every group found must match the manifest exactly, down
+  to which names belong to which inode and whether the entry can be deleted.
+  A scan that reads anything outside the tree it was given fails here too,
+  as does one whose byte count moves between identical rounds.
+- **adversarial** — the scan finishes, finds the right groups, and reports
+  the unreadable file as unreadable instead of quietly skipping it.
+- **deletion** — `--auto shortest -y` leaves exactly one copy per group, with
+  its bytes intact, every removed file in the volume's `.Trashes`, and
+  nothing for a second pass to find.
+
+Bytes are counted by wrapping `open()` in the measuring process, not by asking
+the tool: `stats.hashed_bytes` is read as well, and a gap of more than 20%
+between the two is itself a failure. There is also a floor. dedup's promise is
+that nothing is called a duplicate on the strength of a hash, so every member
+of every group must have been read to the end — a scan that reports the right
+groups having read less than that did not prove them, and fails. Between the
+two, the byte count cannot be improved by reading somewhere the harness
+cannot see.
+
+Timings are the scan alone, measured in a
+fresh process, three rounds a side with the two sides interleaved, reporting
+the fastest of each — the part of a measurement that a drifting machine load
+cannot inflate. Results land in `bench/state/results.json`.
+
+`--dedup PATH` points the harness at a different file, which is how a
+work-in-progress is measured and how the gates themselves get tested.

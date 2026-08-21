@@ -1,0 +1,2 @@
+# dedup.py as of "perf: compare bytes instead of hashing them in the last stage" — the side every measurement is compared against.
+012acc4370b5b3e354be68e0b77ba37d835049ef
