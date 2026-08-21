@@ -46,6 +46,9 @@ COMPARE_BUDGET = 128 * 1024 * 1024   # ceiling on bytes held for one group
 MIN_CHUNK = 128 * 1024          # ...which the chunk shrinks towards, but not
                                 # below, so a group of a thousand copies still
                                 # fits and a read is still worth making
+HASH_BATCH = 64                 # files handed to a reader thread at a time —
+                                # one task per file spends more time in the
+                                # queue than in the read
 PARTITION_FANOUT = 256          # a compare pass that strips off nothing but
                                 # its own pivot, with this many blocks still
                                 # pending, means the pivot loop is going
@@ -688,24 +691,34 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
     buckets: dict = defaultdict(list)
     last_tick = 0.0
 
+    def batch(recs: list) -> list:
+        return [fn(f.path, f.size) for f in recs]
+
+    # Enough batches to keep every reader busy, but no smaller than that: on a
+    # tree of a hundred thousand small files, one task per file costs more in
+    # queueing than the read it is carrying.
+    span = max(1, min(HASH_BATCH, -(-len(files) // max(1, jobs * 4))))
+    batches = [files[i:i + span] for i in range(0, len(files), span)]
+
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        for rec, digest in zip(files, pool.map(lambda f: fn(f.path, f.size), files)):
-            if digest is None:
-                stats.unreadable.append(rec.path)
-                continue
-            buckets[(rec.size, digest)].append(rec)
-            stats.hashed_files += 1
-            if fn is hash_head:
-                stats.hashed_bytes += min(rec.size, HEAD_BYTES)
-            elif fn is hash_sample:
-                stats.hashed_bytes += sampled_bytes(rec.size)
-            else:
-                stats.hashed_bytes += rec.size
-            if on_progress:
-                now = time.monotonic()
-                if now - last_tick > 0.1:
-                    on_progress(stats)
-                    last_tick = now
+        for recs, digests in zip(batches, pool.map(batch, batches)):
+            for rec, digest in zip(recs, digests):
+                if digest is None:
+                    stats.unreadable.append(rec.path)
+                    continue
+                buckets[(rec.size, digest)].append(rec)
+                stats.hashed_files += 1
+                if fn is hash_head:
+                    stats.hashed_bytes += min(rec.size, HEAD_BYTES)
+                elif fn is hash_sample:
+                    stats.hashed_bytes += sampled_bytes(rec.size)
+                else:
+                    stats.hashed_bytes += rec.size
+                if on_progress:
+                    now = time.monotonic()
+                    if now - last_tick > 0.1:
+                        on_progress(stats)
+                        last_tick = now
 
     return buckets
 
