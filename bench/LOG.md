@@ -2,87 +2,86 @@
 
 ## Stop summary — 2026-08-22
 
-Five ideas processed, which is where this run was told to stop. Two kept, one
-rejected on reasoning the benchmark could not supply, one rejected on
-measurement, one left on a branch because it is a trade an optimizer does not
-get to make alone.
+Six ideas processed. Three kept, two rejected, one rejected and then reopened
+and kept when a later change removed the reason it was rejected.
 
-**Cumulative result — branch tip `df8f3f7` against the pinned baseline
-`012acc4`, full suite, seed 1, exit 0, 119 passed:**
+**Cumulative result — branch tip against the pinned baseline `012acc4`, full
+suite, seed 1, exit 0, 119 passed:**
 
 ```text
 scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
-typical      pass  108.7 MB   108.7 MB    1.00x     0.358    0.482     0.74x     35       53
-photos       pass  150.8 MB   150.8 MB    1.00x     0.021    0.024     0.88x     148      149
-bigheader    pass  296.5 MB   296.5 MB    1.00x     0.033    0.032     1.02x     109      109
-needle       pass  244.1 MB   244.1 MB    1.00x     2.950    4.222     0.70x     105      303
-samesize     pass  348.4 MB   348.4 MB    1.00x     0.290    1.686     0.17x     284      219
-widegroup    pass  158.8 MB   158.8 MB    1.00x     0.052    0.057     0.92x     152      152
+typical      pass  73.1 MB    108.7 MB    0.67x     0.428    0.467     0.92x     33       51
+photos       pass  150.3 MB   150.8 MB    1.00x     0.026    0.027     0.97x     149      146
+bigheader    pass  296.5 MB   296.5 MB    1.00x     0.040    0.039     1.03x     109      110
+needle       pass  244.1 MB   244.1 MB    1.00x     2.860    4.207     0.68x     108      281
+samesize     pass  348.4 MB   348.4 MB    1.00x     0.328    1.916     0.17x     284      219
+widegroup    pass  158.8 MB   158.8 MB    1.00x     0.055    0.071     0.78x     152      150
 ```
 
-Time: `samesize` 5.8x faster, `needle` 1.43x, `typical` 1.35x, nothing slower
-(`bigheader` 1.02x at 3 rounds is 0.99x at 9). Bytes: unchanged — **no bytes
-were won on this branch**, and the one large bytes win found is sitting
-unmerged on `opus-head-twotier` for the reason given below. RSS: `needle`
-303 MB → 105 MB, `typical` 53 → 35. The `samesize` RSS column moves between
-284 and 219 on identical code and is noise; the baseline run at the top of
-this log shows the same swing.
+**Bytes:** `typical` 0.67x on seed 1 and 0.71x on seed 2 at default scale,
+holding at 1.00x on all five others. **Time:** `samesize` 5.8x faster, `needle`
+1.47x, `typical` 1.09x here and 0.76x at `--rounds 9`, nothing slower
+(`bigheader` 1.03x on a 40 ms scenario is 1.02x at 9 rounds). **RSS:** `needle`
+281 MB → 108, `typical` 51 → 33. The `samesize` RSS column swings 219↔284 on
+identical code and is noise; the baseline run at the top of this log shows the
+same swing.
 
 **Kept**
 
 - `227827e` — deterministic tie-break on the final group sort. Not a
-  performance change; it closes the known nondeterminism bug so that every
+  performance change; it closes the known nondeterminism bug so every
   comparison after it reads against a stable ordering.
 - `7b7b77b` — `partition_blocks` hands off to grouping-on-the-block when a
   compare pass strips off nothing but its own pivot. `samesize` 1.627s →
-  0.302s (5.4x), seed 2 5.2x, everything else flat.
+  0.302s, seed 2 5.2x, everything else flat.
 - `df8f3f7` — `hash_stage` gives each reader a batch instead of one task per
   file. `needle` 0.70x, `typical` 0.74x, RSS on `needle` down 65%.
+- `bf627d9` — the stage-3 head in two tiers: one page for everyone, the
+  remaining 60 KiB only for files that page left crowded. `typical` 0.67x
+  bytes with discrimination unchanged.
 
 **Rejected, and why**
 
-- A flat smaller `HEAD_BYTES`. Passes every gate and every written rule — 4
-  KiB gives `typical` 0.54x and `samesize` 0.76x with no regression anywhere —
-  and is still wrong. Stage-5 fall-through is byte-identical from 64 KiB down
-  to 1 KiB on these corpora, so the benchmark rewards shrinking the head
-  without limit; no scenario contains files sharing a 1–64 KiB prefix, which
-  is the case that would charge for it, and real camera raws do exactly that.
-  The full argument is in the entry below.
+- A flat smaller `HEAD_BYTES`. Passes every gate and every written rule — 4 KiB
+  gives `typical` 0.54x and `samesize` 0.76x with no regression anywhere — and
+  is still wrong. Stage-5 fall-through is byte-identical from 64 KiB down to 1
+  KiB on these corpora, so the benchmark rewards shrinking the head without
+  limit; no scenario contains files sharing a 1–64 KiB prefix, which is the
+  case that would charge for it, and real camera raws do exactly that. The
+  two-tier head above is the version that captures the win without the risk.
 - Unbuffered and raw-fd reads in `hash_head`. 12–15% faster on one thread,
-  0.99x at the two readers the tool actually uses, because the bottleneck
-  there is the GIL. A cautionary entry more than a result.
+  0.99x at the two readers the tool actually uses, because the bottleneck there
+  is the GIL. A cautionary entry more than a result.
 - Raising the reader count. `jobs=2` measured optimal on `needle` (1: 4.649s,
   2: 3.174s, 4: 3.333s, 8: 4.169s). Nothing to win.
 
-**Left for the user — `opus-head-twotier` (`b7ef1a3`), not merged**
+**One rejection that was wrong, and how it was caught**
 
-Reading the head in two tiers cuts `typical` from 108.7 MB to 73.1 MB with
-bytes holding on every other scenario and full 64 KiB discrimination intact.
-It costs `widegroup` 1.30x wall time (1.25x at `--rounds 9`), because its 519
-files are true copies that always need both tiers and pay a second open and
-seek for nothing. §4 says a cross-scenario trade goes to the user, so it did.
-Whether it is worth taking depends on the device, and this RAM disk is the
-wrong instrument to ask: with reads near-free it charges the extra open at
-full weight while charging nothing for the seeks a real disk would.
+The two-tier head was first measured before `hash_stage` was batched, cost
+`widegroup` 1.30x, and went to branch `opus-head-twotier` as a cross-scenario
+trade §4 says an optimizer may not decide alone. The regression was real; my
+explanation of it — an extra `open` and seek per crowded file — was not. It was
+per-file future overhead in the second pass, and batching removed it. Re-tested
+against the tip, `widegroup` measures 1.01x at `--rounds 9` and the change
+landed as `bf627d9`. **A rejection is only valid against the tree it was
+measured on**; re-test rejected ideas after anything lands near them.
 
 **Where I would look next**
 
-1. Kill `widegroup`'s regression and the two-tier head becomes a clean keep —
-   the largest unclaimed bytes win in the tool. The cost is one extra `open`
-   per crowded file; anything that avoids reopening (carrying the handle, or
-   deciding tier depth per size-bucket before reading) turns a trade into a
-   win.
-2. `samesize` and `widegroup` spend 91.9 MB and 34.0 MB in stage 3 on heads
-   that separate nothing, because every file in those buckets shares all 64
-   KiB. Detecting a non-discriminating head *during* the stage rather than
-   after would recover most of it.
-3. Stage 5 re-reads from offset 0 bytes that stage 3 and stage 4 already read.
-   The only legal way to exploit it is to keep those bytes and *compare* them
-   rather than trust the digest, which trades RSS for I/O — worth measuring,
-   given `COMPARE_BUDGET` already bounds what a group may hold.
-4. Not stage-4 sample geometry. `bigheader` is 276.8 MB of stage 5 against
-   33.6 MB of stage 4, and its stage 5 is the byte floor — six genuinely
-   identical 56 MiB files that must be read end to end. There is little there.
+1. `samesize` and `widegroup` still spend 91.9 MB and 34.0 MB in stage 3 on
+   heads that separate nothing, because every file in those buckets shares all
+   64 KiB. The two-tier head cannot help there — both tiers are needed. What
+   would is noticing *during* the stage that a head is not discriminating.
+2. Stage 5 re-reads from offset 0 bytes stage 3 and stage 4 already read. The
+   only legal way to exploit that is to keep those bytes and *compare* them
+   rather than trust the digest, trading RSS for I/O — worth measuring, since
+   `COMPARE_BUDGET` already bounds what a group may hold.
+3. Group-level parallelism in stage 5. `typical` reaches it with ~640 groups of
+   about 2.4 members, so most of a 2-reader pool sits idle; `bigheader` must
+   keep its ability to give one group the whole pool.
+4. Not stage-4 sample geometry. `bigheader` is 276.8 MB of stage 5 against 33.6
+   MB of stage 4, and its stage 5 is the byte floor — six genuinely identical
+   56 MiB files that must be read end to end. There is little there.
 
 **Two notes on the harness, for whoever maintains it**
 
@@ -92,14 +91,13 @@ full weight while charging nothing for the seeks a real disk would.
   measured by this harness at all: the throttle branch never executes, and
   import cost lands in `setup_seconds`, which is a 2-second gate and not a
   reported metric. §4's "no unmeasured wins" rule disqualifies both ideas that
-  §7 recommends. (The other branch, `luna`, spent an idea confirming the
-  curses half of this empirically and reverted it.)
-- The RAM disk was 83–94% full for this entire run, so `ensure_space()`
-  evicted corpora repeatedly. That is the harness working as designed, but it
-  means a second seed at default scale costs the other seed's corpora, and
-  with two optimizers sharing the volume it is a live hazard rather than a
-  slow path. See the preamble.
-
+  §7 recommends. (The other branch, `luna`, spent an idea confirming the curses
+  half empirically and reverted it.)
+- §4 tells you to confirm on seed 2 and, to avoid eviction, to use `--scale
+  smoke`. For anything touching `partition_blocks` that advice is a trap:
+  `samesize` runs 0.036 s at smoke against 1.6–1.9 s at default and does not
+  reproduce the behaviour at all. The two pieces of guidance pull against each
+  other whenever the volume is tight, and it was 83–98% full throughout.
 
 ## Preamble: two optimizers, one machine
 
