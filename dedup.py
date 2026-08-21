@@ -26,6 +26,7 @@ import fnmatch
 import hashlib
 import os
 import shutil
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -46,6 +47,9 @@ COMPARE_BUDGET = 128 * 1024 * 1024   # ceiling on bytes held for one group
 MIN_CHUNK = 128 * 1024          # ...which the chunk shrinks towards, but not
                                 # below, so a group of a thousand copies still
                                 # fits and a read is still worth making
+
+CACHE_SCHEMA = 1                # bump when the stored columns change meaning
+CACHE_TTL_DAYS = 180            # entries not seen in this long are dropped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,6 +93,7 @@ class FileRec:
     ino: int
     nlink: int = 1
     links: list = field(default_factory=list)   # every name we found for this inode
+    mtime_ns: int = 0                           # exact mtime, for the cache key
 
     @property
     def display(self) -> str:
@@ -126,6 +131,10 @@ class FileRec:
 class DupGroup:
     size: int
     files: list[FileRec]
+    # True when the members were matched from remembered digests instead of
+    # being read this scan. Such a group is a candidate, not a conclusion:
+    # nothing may be deleted from it until verify_attested has read the bytes.
+    attested: bool = False
 
     @property
     def reclaimable(self) -> int:
@@ -290,7 +299,8 @@ def _walk_scandir(roots: list[str], excludes: list[str], min_size: int,
             if st.st_size < min_size:
                 continue
             out.append(FileRec(entry.path, st.st_size, st.st_mtime,
-                               st.st_dev, st.st_ino, st.st_nlink))
+                               st.st_dev, st.st_ino, st.st_nlink,
+                               mtime_ns=st.st_mtime_ns))
 
         if on_progress:
             now = time.monotonic()
@@ -449,7 +459,8 @@ class DirReader:
                         errors.append(f"{path}: {e}")
                         continue
                     files.append(FileRec(path, st.st_size, st.st_mtime,
-                                         st.st_dev, st.st_ino, st.st_nlink))
+                                         st.st_dev, st.st_ino, st.st_nlink,
+                                         mtime_ns=st.st_mtime_ns))
         except OSError as e:
             errors.append(f"{directory}: {e}")
         finally:
@@ -674,22 +685,40 @@ def hash_full(path: str, size: int) -> bytes | None:
 
 
 def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
-               on_progress=None) -> dict:
+               on_progress=None, cache=None) -> dict:
     """Hash `files` with `fn` and bucket them by size and digest.
 
     Size is part of the key because a head or sample digest covers only part
     of the file: two files of different lengths can easily agree on their
     first 64 KiB and never be duplicates.
+
+    With a cache attached, files whose digest is already remembered are
+    bucketed without being opened, and the ones that do get read are
+    remembered on the way past.
     """
     buckets: dict = defaultdict(list)
     last_tick = 0.0
 
+    field = CACHED_FIELD.get(fn) if cache is not None else None
+    todo = files
+    if field:
+        todo = []
+        for rec in files:
+            digest = cache.get(rec, field)
+            if digest is None:
+                todo.append(rec)
+                continue
+            buckets[(rec.size, digest)].append(rec)
+            stats.hashed_files += 1     # settled, and it cost nothing
+
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        for rec, digest in zip(files, pool.map(lambda f: fn(f.path, f.size), files)):
+        for rec, digest in zip(todo, pool.map(lambda f: fn(f.path, f.size), todo)):
             if digest is None:
                 stats.unreadable.append(rec.path)
                 continue
             buckets[(rec.size, digest)].append(rec)
+            if field:
+                cache.remember(rec, field, digest)
             stats.hashed_files += 1
             if fn is hash_head:
                 stats.hashed_bytes += min(rec.size, HEAD_BYTES)
@@ -704,6 +733,12 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
                     last_tick = now
 
     return buckets
+
+
+# Which column of the cache a hashing stage fills. hash_full is deliberately
+# absent: the whole-file digest is only ever learned in stage 5, from bytes
+# that were compared rather than merely hashed.
+CACHED_FIELD = {hash_head: "head", hash_sample: "sample"}
 
 
 def compare_chunk(members: int, solid) -> int:
@@ -755,7 +790,7 @@ def partition_blocks(blocks: list) -> list[list]:
 
 
 def split_identical(members: list, chunk: int, stats: ScanStats,
-                    pool=None, tick=None) -> list[list]:
+                    pool=None, tick=None, cache=None) -> list[list]:
     """Read every file in a group once, in step, and split them the moment
     their bytes differ.
 
@@ -773,6 +808,11 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
             opened.append(rec)
         except (PermissionError, OSError):
             stats.unreadable.append(rec.path)
+    # The bytes are going past anyway, and SHA-256 runs at a few GB/s where a
+    # disk does not, so a group read here is also a group learned. Only files
+    # that reach the end still matching get their digest kept — one that
+    # diverged early was never read in full.
+    hashers = {id(rec): _digest() for rec in opened} if cache is not None else None
     # Files that wouldn't open are settled, and so is a lone survivor: count
     # them now or the progress bar stops short of the end.
     stats.hashed_files += len(members) - len(opened)
@@ -798,6 +838,9 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
                         stats.hashed_files += 1
                 blocks = [b for b in blocks if b[1] is not None]
                 stats.hashed_bytes += sum(len(b) for _, b in blocks)
+                if hashers is not None:
+                    for rec, block in blocks:
+                        hashers[id(rec)].update(block)
 
                 for run in partition_blocks(blocks):
                     recs = [r for r, _ in run]
@@ -808,6 +851,10 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
                     else:
                         matched.append(recs)              # same bytes to EOF
                         stats.hashed_files += len(recs)
+                        if hashers is not None:
+                            for rec in recs:
+                                cache.remember(rec, "full",
+                                               hashers[id(rec)].digest())
                 if tick:
                     tick()          # two huge files are one group and many
                                     # rounds; the bar has to move meanwhile
@@ -819,7 +866,7 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
 
 
 def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
-                  on_progress=None) -> list[list]:
+                  on_progress=None, cache=None) -> list[list]:
     """Run split_identical over every candidate group.
 
     Groups go one at a time with their members read in parallel, rather than
@@ -841,8 +888,278 @@ def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
         for members in buckets:
             chunk = compare_chunk(len(members), solid)
             out.extend(split_identical(members, chunk, stats,
-                                       pool if jobs > 1 else None, tick))
+                                       pool if jobs > 1 else None, tick, cache))
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the re-scan cache
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Scanning the same volume twice reads the same bytes twice, and on a large
+# disk that reading is the whole cost. Remembering each file's digests against
+# (inode, size, mtime_ns) lets the narrowing stages skip everything nothing has
+# touched since last time.
+#
+# The rule that makes this safe to ship in a deletion tool: the cache may only
+# ever NARROW. A remembered digest can save a read. It can never be the reason
+# a file is removed. Every group matched from memory is read and compared
+# before anything in it is deleted — see verify_attested, which is the other
+# half of this feature and not optional.
+
+CACHE_COLUMNS = {"head": 2, "sample": 3, "full": 4}   # into a stored entry
+
+
+def cache_home() -> str:
+    """Where the per-volume databases live."""
+    override = os.environ.get("DEDUP_CACHE_DIR")
+    if override:
+        return override
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Caches/dedup")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "dedup")
+
+
+def volume_id(path: str) -> str:
+    """A stable filename for the cache belonging to the volume `path` is on.
+
+    The UUID survives a remount under a different name, which a mount point
+    does not. Where there is no UUID to be had the mount point is all there
+    is, and guessing wrong only ever costs one cold scan.
+    """
+    root = mount_point(path) or "/"
+    if sys.platform == "darwin":
+        try:
+            import plistlib
+            import subprocess
+            out = subprocess.run(["diskutil", "info", "-plist", root],
+                                 capture_output=True, timeout=5)
+            if out.returncode == 0:
+                uuid = plistlib.loads(out.stdout).get("VolumeUUID")
+                if isinstance(uuid, str) and uuid:
+                    return uuid
+        except Exception:                       # noqa: BLE001 - fall back, never fail
+            pass
+    return hashlib.sha256(os.fsencode(root)).hexdigest()[:32]
+
+
+class ScanCache:
+    """Digests remembered from earlier scans, one sqlite file per volume.
+
+    Rows are keyed by inode, which is exactly what drop_hardlinks collapses a
+    file's names down to: one entry serves every name an inode wears. A row
+    only applies while its size and mtime_ns still match, so an edited file is
+    a miss and gets read.
+
+    Forging an mtime defeats the key, and that is allowed to be true, because
+    nothing here is trusted at deletion time.
+    """
+
+    def __init__(self, directory: str | None = None):
+        self.directory = directory or cache_home()
+        self.paths: dict = {}      # dev -> database file
+        self.entries: dict = {}    # dev -> {ino: [size, mtime_ns, head, sample, full]}
+        self.touched: dict = {}    # dev -> inodes whose row changed
+        self.seen: dict = {}       # dev -> inodes this scan recognised
+        self.warned = False
+
+    # ── opening ──────────────────────────────────────────────────────────
+    def _warn(self, message: str) -> None:
+        """Say it once. An unusable cache is a slow scan, not a failed one."""
+        if self.warned:
+            return
+        self.warned = True
+        print(f"dedup: {message}; reading everything and rebuilding it",
+              file=sys.stderr)
+
+    @staticmethod
+    def _prepare(con) -> None:
+        con.execute("CREATE TABLE IF NOT EXISTS files ("
+                    "ino INTEGER PRIMARY KEY, size INTEGER NOT NULL, "
+                    "mtime_ns INTEGER NOT NULL, head BLOB, sample BLOB, "
+                    "full BLOB, last_seen INTEGER NOT NULL)")
+        con.execute(f"PRAGMA user_version = {CACHE_SCHEMA}")
+
+    def _read(self, dev: int, db: str) -> None:
+        con = sqlite3.connect(db)
+        try:
+            if con.execute("PRAGMA user_version").fetchone()[0] != CACHE_SCHEMA:
+                # Another version's columns do not mean what this one thinks
+                # they mean. Start over rather than interpret them.
+                con.execute("DROP TABLE IF EXISTS files")
+                self._prepare(con)
+                con.commit()
+                return
+            self._prepare(con)
+            for row in con.execute("SELECT ino, size, mtime_ns, head, sample, full "
+                                   "FROM files"):
+                self.entries[dev][row[0]] = list(row[1:])
+        finally:
+            con.close()
+
+    def _load(self, dev: int, on_volume: str) -> None:
+        if dev in self.entries:
+            return
+        self.entries[dev] = {}
+        self.touched[dev] = set()
+        self.seen[dev] = set()
+        db = None
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            db = os.path.join(self.directory, volume_id(on_volume) + ".db")
+            self.paths[dev] = db
+            self._read(dev, db)
+        except (OSError, sqlite3.Error) as e:
+            self._warn(f"the scan cache could not be read ({e})")
+            self.entries[dev] = {}
+            # A file sqlite cannot make sense of is not worth repairing. Clear
+            # the way so close() can lay down a fresh one in its place.
+            try:
+                if db:
+                    os.unlink(db)
+            except OSError:
+                self.paths.pop(dev, None)       # nowhere to write either
+
+    def open_paths(self, paths: list[str]) -> None:
+        """Open the cache for the volumes these paths sit on."""
+        for path in paths:
+            try:
+                self._load(os.stat(path).st_dev, path)
+            except OSError:
+                continue
+
+    def open_for(self, records: list) -> None:
+        """...and for any further volume the scan turned out to reach into."""
+        for rec in records:
+            if rec.dev not in self.entries:
+                self._load(rec.dev, rec.path)
+
+    # ── remembering ──────────────────────────────────────────────────────
+    def get(self, rec: FileRec, field: str):
+        """The remembered digest for this file, or None if there is not one."""
+        entry = self.entries.get(rec.dev, {}).get(rec.ino)
+        if entry is None or entry[0] != rec.size or entry[1] != rec.mtime_ns:
+            return None
+        self.seen[rec.dev].add(rec.ino)
+        return entry[CACHE_COLUMNS[field]]
+
+    def remember(self, rec: FileRec, field: str, digest: bytes) -> None:
+        volume = self.entries.get(rec.dev)
+        if volume is None:
+            return
+        entry = volume.get(rec.ino)
+        if entry is None or entry[0] != rec.size or entry[1] != rec.mtime_ns:
+            entry = volume[rec.ino] = [rec.size, rec.mtime_ns, None, None, None]
+        entry[CACHE_COLUMNS[field]] = digest
+        self.touched[rec.dev].add(rec.ino)
+
+    def forget(self, records: list) -> None:
+        """Drop everything remembered about these files.
+
+        Called when a group we vouched for turned out not to match, so the
+        wrong answer cannot survive into the next scan.
+        """
+        for rec in records:
+            volume = self.entries.get(rec.dev)
+            if volume is not None and volume.pop(rec.ino, None) is not None:
+                self.touched[rec.dev].add(rec.ino)
+                self.seen[rec.dev].discard(rec.ino)
+
+    def attested_runs(self, groups: list) -> tuple:
+        """Split stage-5 candidates into (to compare, matched from memory).
+
+        A group only goes the fast way when every member's whole-file digest is
+        remembered. One unknown member and the whole group is read as usual,
+        which re-learns the others on the way through.
+        """
+        pending, matched = [], []
+        for members in groups:
+            digests = [self.get(rec, "full") for rec in members]
+            if any(d is None for d in digests):
+                pending.append(members)
+                continue
+            by_digest: dict = defaultdict(list)
+            for rec, digest in zip(members, digests):
+                by_digest[digest].append(rec)
+            for run in by_digest.values():
+                if len(run) > 1:
+                    matched.append(run)
+        return pending, matched
+
+    # ── closing ──────────────────────────────────────────────────────────
+    def close(self) -> None:
+        """Write back what changed and drop what has not been seen in months.
+
+        Files that were recognised but not re-read have their last_seen moved
+        forward too, or a tree nobody edits would eventually age out of its
+        own cache and pay for a cold scan it never earned.
+        """
+        now = int(time.time())
+        cutoff = now - CACHE_TTL_DAYS * 86400
+        for dev, db in self.paths.items():
+            volume = self.entries.get(dev, {})
+            writing = self.touched.get(dev, set()) | self.seen.get(dev, set())
+            rows, gone = [], []
+            for ino in writing:
+                entry = volume.get(ino)
+                if entry is None:
+                    gone.append((ino,))
+                else:
+                    rows.append((ino, entry[0], entry[1], entry[2], entry[3],
+                                 entry[4], now))
+            try:
+                con = sqlite3.connect(db)
+                try:
+                    self._prepare(con)
+                    con.executemany(
+                        "INSERT OR REPLACE INTO files "
+                        "(ino, size, mtime_ns, head, sample, full, last_seen) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                    con.executemany("DELETE FROM files WHERE ino = ?", gone)
+                    con.execute("DELETE FROM files WHERE last_seen < ?", (cutoff,))
+                    con.commit()
+                finally:
+                    con.close()
+            except (OSError, sqlite3.Error) as e:
+                self._warn(f"the scan cache could not be written ({e})")
+        self.paths.clear()
+        self.entries.clear()
+        self.touched.clear()
+        self.seen.clear()
+
+
+def verify_group(group: DupGroup, solid=None, cache=None) -> bool:
+    """Read a remembered group's members and confirm the bytes really agree.
+
+    A group compared during this scan is already proved and is not read again.
+    Anything else has only a digest behind it, and a digest is not what this
+    tool deletes on.
+    """
+    if not group.attested:
+        return True
+    stats = ScanStats()
+    members = list(group.files)
+    runs = split_identical(members, compare_chunk(len(members), solid), stats)
+    if len(runs) == 1 and len(runs[0]) == len(members) and not stats.unreadable:
+        group.attested = False              # proved, here, now
+        return True
+    if cache is not None:
+        cache.forget(members)
+    return False
+
+
+def verify_attested(groups: list, solid=None, cache=None) -> tuple:
+    """Byte-compare every group matched from memory rather than read.
+
+    Returns (safe to act on, refused). Nothing from a refused group may be
+    deleted: its members disagree, so whatever was remembered of them was
+    wrong, and the tool has no idea which copy is which.
+    """
+    safe, refused = [], []
+    for group in groups:
+        (safe if verify_group(group, solid, cache) else refused).append(group)
+    return safe, refused
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -851,17 +1168,25 @@ def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
 
 def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
                     jobs: int, stats: ScanStats, verify: bool = False,
-                    reporter=None, walkers=None) -> list[DupGroup]:
+                    reporter=None, walkers=None, cache=None) -> list[DupGroup]:
     """Run the five-stage narrowing described in the module docstring.
 
     `verify` is accepted so older commands keep working. It no longer changes
     anything: the last stage compares bytes, so every answer is byte-exact.
+
+    With no `cache`, this reads exactly what it always read. With one, the
+    stages skip files that have not changed since a previous scan, and the
+    groups they produce carry `attested` — a promise that still has to be
+    kept before anything is deleted.
     """
     def say(key: str, total: int = 0) -> None:
         if reporter:
             reporter.stage(key, total, stats)
 
     tick = reporter.tick if reporter else None
+
+    if cache is not None:
+        cache.open_paths(roots)
 
     say("scan")
     files = walk_files(roots, excludes, min_size, stats, tick, walkers)
@@ -881,6 +1206,9 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if not candidates:
         return []
 
+    if cache is not None:
+        cache.open_for(candidates)
+
     # Read in the order the volume laid the files down, not the order they
     # happened to be grouped in. On a spinning disk that turns a stage into
     # one sweep across the platter instead of a jump per file.
@@ -891,7 +1219,7 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
 
     # stage 3 — sample the head
     say("head", len(candidates))
-    head_buckets = hash_stage(candidates, hash_head, jobs, stats, tick)
+    head_buckets = hash_stage(candidates, hash_head, jobs, stats, tick, cache)
     if reporter:
         reporter.finish_stage()
 
@@ -911,7 +1239,7 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if big:
         survivors = sorted((f for g in big for f in g), key=by_layout)
         say("sample", len(survivors))
-        sample_buckets = hash_stage(survivors, hash_sample, jobs, stats, tick)
+        sample_buckets = hash_stage(survivors, hash_sample, jobs, stats, tick, cache)
         if reporter:
             reporter.finish_stage()
         big = [g for g in sample_buckets.values() if len(g) > 1]
@@ -923,16 +1251,26 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     # is not proof and this tool deletes things, so the bytes get read; doing
     # it as a comparison rather than a hash means files that turn out to
     # differ stop being read where they diverge.
+    #
+    # A group every one of whose members carries a remembered whole-file digest
+    # is set aside instead: it is reported, marked attested, and read later —
+    # at deletion time, where being sure actually matters.
+    remembered: list = []
+    if cache is not None:
+        pending, remembered = cache.attested_runs(pending)
+
     pending.sort(key=lambda g: min(by_layout(f) for f in g))
     say("compare", sum(len(g) for g in pending))
-    matched = compare_stage(pending, jobs, all_solid_state(roots), stats, tick)
+    matched = compare_stage(pending, jobs, all_solid_state(roots), stats, tick,
+                            cache)
     if reporter:
         reporter.finish_stage()
 
     groups: list[DupGroup] = []
-    for members in matched:
+    for members, attested in [(m, False) for m in matched] + \
+                             [(m, True) for m in remembered]:
         members.sort(key=lambda f: (len(f.path), f.path))
-        groups.append(DupGroup(members[0].size, members))
+        groups.append(DupGroup(members[0].size, members, attested))
 
     groups.sort(key=lambda g: (-g.size, g.name))
     return groups
@@ -1109,10 +1447,13 @@ BULK_ACTIONS = [
 
 
 class Browser:
-    def __init__(self, groups: list[DupGroup], root_label: str, hard: bool):
+    def __init__(self, groups: list[DupGroup], root_label: str, hard: bool,
+                 cache=None, solid=None):
         self.groups = groups
         self.root_label = root_label
         self.hard = hard
+        self.cache = cache
+        self.solid = solid
         self.gi = 0
         self.fi = 0
         self.marked: set[tuple[int, int]] = set()
@@ -1121,6 +1462,7 @@ class Browser:
         self.applied_files = 0
         self.applied_bytes = 0
         self.failures: list[str] = []
+        self.refused: list[DupGroup] = []
 
     # ── state helpers ────────────────────────────────────────────────────
     @property
@@ -1347,10 +1689,34 @@ class Browser:
             if ch in (ord("y"), ord("Y")):
                 break
 
-        self._overlay(win, "Working", ["Moving files…"], "")
+        self._overlay(win, "Working", ["Checking and moving files…"], "")
+        self.apply_marks()
+        if self.refused:
+            self.flash = (f"{human_count(len(self.refused))} group(s) refused — "
+                          "their copies no longer match")
+        else:
+            self.flash = f"moved {human_count(self.applied_files)} files"
+        return not self.groups
+
+    def apply_marks(self) -> int:
+        """Remove every marked file it is safe to remove; return how many.
+
+        Groups matched from the cache are compared here, at the last possible
+        moment, because this is the moment it matters: the bytes have to agree
+        in this process, on this run, before anything is taken away.
+        """
+        blocked = set()
+        for gi in sorted({g for (g, _) in self.marked}):
+            group = self.groups[gi]
+            if not verify_group(group, self.solid, self.cache):
+                blocked.add(gi)
+                self.refused.append(group)
+
         remover = delete_permanently if self.hard else send_to_trash
         removed: set[tuple[int, int]] = set()
         for (gi, fi) in sorted(self.marked):
+            if gi in blocked:
+                continue
             rec = self.groups[gi].files[fi]
             ok, err = remove_record(rec, remover)
             if ok:
@@ -1365,13 +1731,12 @@ class Browser:
         for gi, group in enumerate(self.groups):
             keep = [f for fi, f in enumerate(group.files) if (gi, fi) not in removed]
             if len(keep) > 1:
-                rebuilt.append(DupGroup(group.size, keep))
+                rebuilt.append(DupGroup(group.size, keep, group.attested))
         self.groups = rebuilt
         self.marked.clear()
         self.gi = min(self.gi, max(0, len(self.groups) - 1))
         self.fi = 0
-        self.flash = f"moved {human_count(self.applied_files)} files"
-        return not self.groups
+        return len(removed)
 
     # ── main loop ────────────────────────────────────────────────────────
     def run(self, win) -> None:
@@ -1459,8 +1824,28 @@ def plan_auto(groups: list[DupGroup], rule: str) -> list:
     return doomed
 
 
-def run_auto(groups: list[DupGroup], rule: str, hard: bool, assume_yes: bool) -> int:
+def report_refusals(refused: list) -> None:
+    """Say plainly that some groups were not what the cache thought they were."""
+    if not refused:
+        return
+    print(f"\n  Refusing to touch {human_count(len(refused))} group(s): their "
+          f"copies no longer match.", file=sys.stderr)
+    for group in refused[:10]:
+        print(f"    {group.files[0].display} "
+              f"(+{len(group.files) - 1} more)", file=sys.stderr)
+    print("  Nothing was removed from them, and what was remembered about "
+          "them has been discarded.", file=sys.stderr)
+
+
+def run_auto(groups: list[DupGroup], rule: str, hard: bool, assume_yes: bool,
+             cache=None, solid=None) -> int:
     """Non-interactive cleanup: keep one copy per group by `rule`, remove the rest."""
+    # Groups matched from the cache have not been read yet. They are read here,
+    # before a plan is even printed, so the plan describes files that really
+    # are identical rather than files a digest said were.
+    groups, refused = verify_attested(groups, solid, cache)
+    report_refusals(refused)
+
     doomed = plan_auto(groups, rule)
     if not doomed:
         print("\n  Nothing to remove.\n")
@@ -1544,6 +1929,12 @@ def print_report(groups: list[DupGroup], limit: int | None = None) -> None:
     total = sum(g.reclaimable for g in groups)
     print(f"\n  {human_count(len(groups))} duplicate groups · "
           f"{human_size(total)} reclaimable\n")
+    attested = sum(1 for g in groups if g.attested)
+    if attested:
+        print(f"  {human_count(len(groups) - attested)} byte-compared just now · "
+              f"{human_count(attested)} remembered from an earlier scan")
+        print("  Remembered groups are re-read and verified before anything "
+              "in them is deleted.\n")
     for i, g in enumerate(groups):
         if limit and i >= limit:
             print(f"  … and {human_count(len(groups) - limit)} more groups")
@@ -1594,6 +1985,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip names matching GLOB (repeatable)")
     p.add_argument("--verify", action="store_true",
                    help="no-op; matches are always byte-compared now")
+    p.add_argument("--no-cache", action="store_true",
+                   help="read every file, remember nothing (default is to "
+                        "reuse digests from earlier scans of this volume)")
     p.add_argument("--hard", action="store_true",
                    help="delete permanently instead of moving to the Trash")
     p.add_argument("-q", "--quiet", action="store_true", help="no progress output")
@@ -1612,7 +2006,15 @@ def main(argv: list[str] | None = None) -> int:
     stats = ScanStats()
     reporter = Reporter(enabled=not args.quiet)
     started = time.monotonic()
+    cache = None if args.no_cache else ScanCache()
+    try:
+        return _scan_and_act(args, stats, reporter, started, cache)
+    finally:
+        if cache is not None:
+            cache.close()
 
+
+def _scan_and_act(args, stats: ScanStats, reporter, started: float, cache) -> int:
     try:
         groups = find_duplicates(
             args.paths,
@@ -1623,6 +2025,7 @@ def main(argv: list[str] | None = None) -> int:
             stats=stats,
             reporter=reporter,
             walkers=args.parallel,
+            cache=cache,
         )
     except KeyboardInterrupt:
         reporter.finish_stage()
@@ -1645,14 +2048,22 @@ def main(argv: list[str] | None = None) -> int:
         print_no_duplicates(stats, args.min_size, plain=args.list or not sys.stdout.isatty())
         return 0
 
+    solid = all_solid_state(args.paths)
+    attested = sum(1 for g in groups if g.attested)
+    if attested and not args.list and not args.quiet:
+        print(f"  {human_count(attested)} of {human_count(len(groups))} groups "
+              f"came from the cache; they are read and compared again before "
+              f"anything in them is deleted.", file=sys.stderr)
+
     if args.auto:
-        return run_auto(groups, args.auto, args.hard, args.yes)
+        return run_auto(groups, args.auto, args.hard, args.yes, cache, solid)
 
     if args.list or not sys.stdout.isatty():
         print_report(groups)
         return 0
 
-    browser = Browser(groups, os.path.abspath(args.paths[0]), args.hard)
+    browser = Browser(groups, os.path.abspath(args.paths[0]), args.hard,
+                      cache, solid)
 
     def _run(win):
         init_colors()
@@ -1667,6 +2078,7 @@ def main(argv: list[str] | None = None) -> int:
         where = "deleted" if args.hard else "moved to Trash"
         print(f"\n  {human_count(browser.applied_files)} files {where} · "
               f"{human_size(browser.applied_bytes)} reclaimed\n")
+    report_refusals(browser.refused)
     if browser.failures:
         print(f"  {human_count(len(browser.failures))} could not be removed:",
               file=sys.stderr)
