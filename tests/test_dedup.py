@@ -134,6 +134,24 @@ class TestDetection:
 
         assert [g.size for g in groups] == [5000, 900, 100]
 
+    def test_groups_tying_on_size_and_name_order_by_keeper_path(self, tmp_path):
+        # Both groups are 40 bytes and both keep a file called "same.bin", so
+        # size and basename both tie. Only the keeper's full path separates
+        # them, and it has to, or the order is whatever the pipeline emitted.
+        write(tmp_path / "d2" / "same.bin", b"b" * 40)
+        write(tmp_path / "d2" / "other2.bin", b"b" * 40)
+        write(tmp_path / "d1" / "same.bin", b"a" * 40)
+        write(tmp_path / "d1" / "other1.bin", b"a" * 40)
+
+        groups = scan(tmp_path)
+
+        assert [g.size for g in groups] == [40, 40]
+        assert [g.name for g in groups] == ["same.bin", "same.bin"]
+        assert [g.files[0].path for g in groups] == [
+            str(tmp_path / "d1" / "same.bin"),
+            str(tmp_path / "d2" / "same.bin"),
+        ]
+
     def test_size_beats_reclaimable_in_ordering(self, tmp_path):
         # Five copies of a small file reclaim 1600 bytes; two copies of a
         # larger one reclaim only 1000. The larger file must still sort first.

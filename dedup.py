@@ -934,7 +934,11 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
         members.sort(key=lambda f: (len(f.path), f.path))
         groups.append(DupGroup(members[0].size, members))
 
-    groups.sort(key=lambda g: (-g.size, g.name))
+    # The keeper's path is the last word: size and basename can both tie, and
+    # without a third key the order falls back to however the pipeline
+    # happened to emit the groups — which traces back to inode allocation, so
+    # the same tree scanned twice could report in a different order.
+    groups.sort(key=lambda g: (-g.size, g.name, g.files[0].path))
     return groups
 
 
