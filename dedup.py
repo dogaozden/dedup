@@ -661,7 +661,9 @@ def hash_sample(path: str, size: int) -> bytes | None:
     On a slow disk the full read is the whole cost of a scan, and most
     same-size files are not duplicates. Sampling settles those after a few
     MB rather than after gigabytes. Survivors still get read in full, so
-    the result stays byte-exact.
+    the result stays byte-exact. Stage 3 has already hashed the first
+    HEAD_BYTES of every candidate, so the first deep sample starts
+    immediately after that page instead of reading it a second time.
     """
     if size <= SAMPLE_SPAN:
         return hash_full(path, size)
@@ -671,8 +673,13 @@ def hash_sample(path: str, size: int) -> bytes | None:
     try:
         with open(path, "rb", buffering=0) as fh:
             for i in range(SAMPLE_POINTS):
-                fh.seek(i * step)
-                block = fh.read(SAMPLE_BYTES)
+                offset = i * step
+                count = SAMPLE_BYTES
+                if i == 0:
+                    offset = HEAD_BYTES
+                    count -= HEAD_BYTES
+                fh.seek(offset)
+                block = fh.read(count)
                 if not block:
                     break
                 h.update(block)
@@ -683,7 +690,8 @@ def hash_sample(path: str, size: int) -> bytes | None:
 
 def sampled_bytes(size: int) -> int:
     """How much hash_sample actually reads — for honest progress accounting."""
-    return size if size <= SAMPLE_SPAN else SAMPLE_BYTES * SAMPLE_POINTS
+    return (size if size <= SAMPLE_SPAN else
+            SAMPLE_BYTES * SAMPLE_POINTS - HEAD_BYTES)
 
 
 def hash_full(path: str, size: int) -> bytes | None:
