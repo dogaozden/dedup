@@ -366,6 +366,50 @@ def _samesize(c: Corpus, rng: random.Random, f: float) -> None:
     c.write("same/bigtwin-b.bin", body, b"\xff")
 
 
+PREFIXTRAP_BYTES = 2 << 20
+PREFIXTRAP_PREFIXES = (8 << 10, 24 << 10, 56 << 10)
+
+
+def _prefixtrap(c: Corpus, rng: random.Random, f: float) -> None:
+    """Same-size files that share a short prefix and then nothing at all.
+
+    This scenario exists to punish one specific idea: shrinking HEAD_BYTES.
+    Every other scenario makes a smaller head look free — it reads less in
+    stage 3 and separates just as much — because nowhere else do same-size
+    files agree for a few kilobytes and then part company. Real trees are
+    full of that shape: camera raws from one body share a header, and so do
+    exports from one encoder.
+
+    Three bands, one shared prefix each, divergence on the byte after it. At
+    the current 64 KiB every band's prefix is inside the head, so stage 3
+    reads 64 KiB per file and hands stage 5 nothing but the true duplicates.
+    Shrink the head below a band's prefix and every file in that band has an
+    identical head, arrives at stage 5 as one bucket, and gets read — bytes
+    regress by roughly the size of the band.
+
+    The files sit below SAMPLE_SPAN on purpose. Above it stage 4 would sample
+    the divergent part and separate the band anyway, which would let a
+    shrunken head off with a warning instead of a bill.
+    """
+    n = max(24, round(180 * f))
+    n_pairs = max(2, round(6 * f))
+    bands = len(PREFIXTRAP_PREFIXES)
+
+    for band, shared in enumerate(PREFIXTRAP_PREFIXES):
+        stem = "raw/shared{}k".format(shared >> 10)
+        prefix = rand(rng, shared)
+        rest = PREFIXTRAP_BYTES - shared
+        for i in range(n // bands + (1 if band < n % bands else 0)):
+            c.write("{}/u{:04d}.raw".format(stem, i), prefix, rand(rng, rest))
+        # A few real duplicates in every band, so the scenario has groups to
+        # prove and stage 5 has honest work to do on the unshrunken head.
+        for i in range(n_pairs // bands + (1 if band < n_pairs % bands else 0)):
+            body = rand(rng, rest)
+            c.write("{}/dup{:03d}-a.raw".format(stem, i), prefix, body)
+            c.write("{}/dup{:03d}-b.raw".format(stem, i), prefix, body)
+        del prefix
+
+
 def _widegroup(c: Corpus, rng: random.Random, f: float) -> None:
     """One enormous group, and the hardlink cases.
 
@@ -488,6 +532,7 @@ SCENARIOS = {
     "needle":      (1,             True,  _needle),
     "samesize":    (1,             True,  _samesize),
     "widegroup":   (1,             True,  _widegroup),
+    "prefixtrap":  (1 << 20,       True,  _prefixtrap),
     "adversarial": (1,             False, _adversarial),
     "deletion":    (1,             False, _deletion),
 }
@@ -502,6 +547,7 @@ ESTIMATE = {
     "needle":      (12e6, 430e6),
     "samesize":    (70e6, 440e6),
     "widegroup":   (20e6, 145e6),
+    "prefixtrap":  (60e6, 405e6),
     "adversarial": (14e6, 14e6),
     "deletion":    (10e6, 70e6),
 }

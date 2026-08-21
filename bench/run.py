@@ -58,7 +58,32 @@ ADVERSARIAL_TIMEOUT = 60
 DELETE_TIMEOUT = 900
 
 ORDER = ["typical", "photos", "bigheader", "needle", "samesize", "widegroup",
-         "adversarial", "deletion"]
+         "prefixtrap", "adversarial", "deletion"]
+
+# The scenarios the score is the geometric mean of. This list is FIXED. A
+# scenario added after it was written — `prefixtrap` is the first — does not
+# join it, whatever it measures, because a score is only worth anything if
+# today's number can be compared with one recorded months ago. New scenarios
+# earn their keep as gates and as vetoes (see score()), not as terms.
+SCORE_SCENARIOS = ("typical", "photos", "bigheader", "needle", "samesize",
+                   "widegroup")
+
+# Bytes are what the machines this tool exists for actually pay in, so they
+# carry most of the weight; time keeps a change that trades a whole second
+# for a byte from looking like progress.
+SCORE_BYTES_WEIGHT = 0.7
+SCORE_TIME_WEIGHT = 0.3
+
+# photos, bigheader and widegroup finish in tens of milliseconds. Three rounds
+# of min-of-N is too thin to put in a score that gets quoted.
+SCORE_MIN_ROUNDS = 9
+
+# One harness run at a time per volume.
+LOCK_NAME = ".bench.lock"
+LOCK_WAIT = 1800.0
+LOCK_POLL = 2.0
+LOCK_GRACE = 5.0        # a lockfile younger than this that will not parse is
+                        # assumed to be one that is mid-write, not junk
 
 
 class Fatal(Exception):
@@ -163,6 +188,134 @@ def ensure_space(volume: str, need: int, keep: set) -> None:
             return
     free = shutil.disk_usage(volume).free
     raise Fatal("{} needs {} free, has {}".format(volume, human(need), human(free)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# one run at a time
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VolumeLock:
+    """Serialize harness runs that share a volume.
+
+    Two runs on one RAM disk do not merely go slowly, they corrupt each
+    other's results: `ensure_space` evicts a corpus the other run is halfway
+    through scanning, and the deletion gate empties `.Trashes` underneath it.
+    Both show up afterwards as a mystery gate failure rather than as a
+    collision, which is the worst kind of bug to be handed.
+
+    Advisory, and deliberately so — it is a file with a pid in it, not a
+    kernel lock. Anything that bypasses it is on its own. But every path in
+    this file that writes to the volume is behind it.
+    """
+
+    def __init__(self, volume: str, wait: float = LOCK_WAIT):
+        self.path = os.path.join(volume, LOCK_NAME)
+        self.wait = wait
+        self.pid = os.getpid()
+        self.held = False
+
+    def _payload(self) -> dict:
+        return {"pid": self.pid, "host": platform.node(),
+                "started": datetime.now().astimezone().isoformat(timespec="seconds")}
+
+    def _read(self):
+        try:
+            with open(self.path) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def _holder(self):
+        """(description, alive) for whoever holds it, or None if it is gone."""
+        try:
+            written = os.stat(self.path).st_mtime
+        except OSError:
+            return None
+        data = self._read()
+        if data is None:
+            # Either a lock caught between its create and its write — a window
+            # of microseconds — or a file that is never going to parse. Age is
+            # what tells them apart, and a lock nobody can read must not be
+            # allowed to wedge the volume forever.
+            if time.time() - written < LOCK_GRACE:
+                return "a lock still being written", True
+            return "an unreadable lock file", False
+        text = "pid {} on {}, since {}".format(
+            data.get("pid"), data.get("host"), data.get("started", "?"))
+        pid = data.get("pid")
+        if data.get("host") != platform.node() or not isinstance(pid, int):
+            return text, True          # not ours to check: assume it is alive
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return text, False
+        except PermissionError:
+            pass                       # alive, just not ours to signal
+        return text, True
+
+    def _claim_stale(self) -> bool:
+        """Take over a lock whose owner is gone, and say whether we won.
+
+        Two runs can decide the same lock is stale at the same moment. Both
+        write, `os.replace` picks a winner atomically, and both then read
+        back: only one finds its own pid, and the loser goes back to waiting.
+        Unlink-then-create would leave both of them thinking they had it.
+        """
+        temp = "{}.{}".format(self.path, self.pid)
+        with open(temp, "w") as fh:
+            json.dump(self._payload(), fh)
+        os.replace(temp, self.path)
+        time.sleep(0.2)                # let any rival's replace land too
+        data = self._read()
+        return bool(data) and data.get("pid") == self.pid
+
+    def acquire(self) -> "VolumeLock":
+        deadline = time.monotonic() + self.wait
+        announced = last = None
+        while True:
+            if last is not None and time.monotonic() >= deadline:
+                raise Fatal("gave up waiting for {}: still held by {}"
+                            .format(self.path, last))
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(self._payload(), fh)
+                self.held = True
+                return self
+
+            holder = self._holder()
+            if holder is None:
+                last = last or "a lock that vanished as we read it"
+                time.sleep(0.05)               # released between the two calls
+                continue
+            text, alive = holder
+            last = text
+            if not alive:
+                print("bench: clearing a stale lock ({})".format(text))
+                if self._claim_stale():
+                    self.held = True
+                    return self
+                continue                       # a rival stole it first
+            if not announced:
+                print("bench: {} is locked by {} — waiting up to {:.0f}s"
+                      .format(self.path, text, self.wait))
+                announced = True
+            time.sleep(LOCK_POLL)
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        self.held = False
+        data = self._read()
+        if data and data.get("pid") != self.pid:
+            return                             # someone took it over; leave it
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,6 +545,59 @@ def render(results: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# the score
+# ─────────────────────────────────────────────────────────────────────────────
+
+def score(gates: dict, scenarios: dict):
+    """(value, void_reason) — one of the two is always None.
+
+    The geometric mean over SCORE_SCENARIOS of
+
+        (bytes_cur / bytes_base) ** 0.7  ×  (sec_cur / sec_base) ** 0.3
+
+    so lower is better and 1.0000 is the pinned baseline exactly. A geometric
+    mean because these are ratios: halving one scenario and doubling another
+    has to come out where it started, and an arithmetic mean does not.
+
+    The score can also be void, which is not the same as being bad. A void
+    score has no number at all, because the run it would have summarised is
+    not a run whose numbers mean anything.
+    """
+    for name, verdict in sorted(gates.items()):
+        if verdict.startswith("fail"):
+            return None, "the {} gate failed".format(name)
+
+    # Rule 2 of GOAL.md §4, mechanized. Bytes are deterministic, so a
+    # regression is never noise, and no time win buys one off. Every scenario
+    # that reports bytes is checked — not just the six that are scored —
+    # which is how a scenario added later can veto a change without ever
+    # touching the number.
+    for name in ORDER:
+        entry = scenarios.get(name)
+        if entry is None:
+            continue
+        cur, base = entry["bytes"]["current"], entry["bytes"]["baseline"]
+        if cur is None or base is None:
+            continue
+        if cur > base:
+            return None, "bytes regressed on {} ({} vs {})".format(
+                name, human(cur), human(base))
+
+    product = 1.0
+    for name in SCORE_SCENARIOS:
+        entry = scenarios.get(name)
+        if entry is None:
+            return None, "{} did not run, and the score is all six or none".format(name)
+        b, s = entry["bytes"], entry["seconds"]
+        if not b["baseline"] or not s["baseline"] or b["current"] is None \
+                or s["current"] is None:
+            return None, "{} has no baseline to be scored against".format(name)
+        product *= ((b["current"] / b["baseline"]) ** SCORE_BYTES_WEIGHT *
+                    (s["current"] / s["baseline"]) ** SCORE_TIME_WEIGHT)
+    return product ** (1.0 / len(SCORE_SCENARIOS)), None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # selftest
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -465,6 +671,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the dedup.py under test")
     p.add_argument("--selftest", action="store_true",
                    help="sabotage the tool and check that the gates catch it")
+    p.add_argument("--score", action="store_true",
+                   help="print one number for the whole run; implies --rounds {}"
+                        .format(SCORE_MIN_ROUNDS))
     p.add_argument("--root", default=DEFAULT_ROOT, help="corpus volume")
     return p
 
@@ -485,12 +694,26 @@ def _run(args) -> int:
         raise Fatal("no such file: {}".format(dedup_path))
     if args.rounds < 1:
         raise Fatal("--rounds must be at least 1")
+    if args.score:
+        if args.no_tests or args.no_baseline:
+            raise Fatal("--score cannot be combined with --no-tests or "
+                        "--no-baseline: a score with a gate unrun, or with "
+                        "nothing to compare against, is not a score")
+        args.rounds = max(args.rounds, SCORE_MIN_ROUNDS)
     check_descriptors()
 
     megabytes, halve = ram_disk_mb()
     volume_note = ensure_volume(root, megabytes)
     os.makedirs(STATE, exist_ok=True)
 
+    lock = VolumeLock(root).acquire()
+    try:
+        return _locked(args, root, dedup_path, volume_note, halve)
+    finally:
+        lock.release()
+
+
+def _locked(args, root, dedup_path, volume_note, halve) -> int:
     if args.selftest:
         return selftest(dedup_path, root, args.seed)
 
@@ -584,7 +807,14 @@ def _run(args) -> int:
                        "solid_state": sides["current"][0]["solid_state"]}
         if not timed:
             gates["adversarial"] = "pass"
-            scenarios[name] = blank_entry("pass")
+            # One round is too thin to time, but bytes are deterministic and
+            # worth having: it puts this scenario behind the same bytes veto
+            # as every other, which is the only thing a score can do with it.
+            entry = blank_entry("pass")
+            for side, runs in sides.items():
+                if runs and runs[0].get("ok"):
+                    entry["bytes"][side] = runs[0]["bytes_instrumented"]
+            scenarios[name] = entry
             continue
         scenarios[name] = summarize(sides)
 
@@ -592,6 +822,8 @@ def _run(args) -> int:
     for value in gates.values():
         if value.startswith("fail"):
             verdict = "fail"
+
+    score_value, void_reason = score(gates, scenarios) if args.score else (None, None)
 
     results = {
         "meta": {
@@ -606,6 +838,8 @@ def _run(args) -> int:
         "gates": gates,
         "scenarios": scenarios,
         "verdict": verdict,
+        "score": None if score_value is None else round(score_value, 4),
+        "score_void_reason": void_reason,
     }
     with open(os.path.join(STATE, "results.json"), "w") as fh:
         json.dump(results, fh, indent=1)
@@ -620,6 +854,14 @@ def _run(args) -> int:
     else:
         print(render(scenarios))
     print("\nverdict: {}   ({})".format(verdict, os.path.join(STATE, "results.json")))
+
+    # Last line, always, so a referee can read the score off the tail of the
+    # output without parsing anything above it.
+    if args.score:
+        if score_value is None:
+            print("SCORE: void ({})".format(void_reason))
+            return 1
+        print("SCORE: {:.4f}".format(score_value))
     return 0 if verdict == "pass" else 1
 
 
