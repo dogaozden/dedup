@@ -415,3 +415,52 @@ bigheader 0.99x, bytes 1.00x throughout.
 suite and 0.74x on the most representative one, bytes identical everywhere,
 and RSS on `needle` down from 303 MB to 105 MB — the 100,000 `Future` objects
 that no longer exist.
+
+## 2026-08-22 — The two-tier head, revisited: the trade was never a trade
+
+**Hypothesis:** The entry above left the two-tier head unmerged because it cost
+`widegroup` 1.30x wall time, and I attributed that to the second pass paying an
+extra `open` and seek on 519 files that always need both tiers. That attribution
+was wrong, and the ordering of my own work is what exposed it: the two-tier
+measurement was taken on the tree *before* `hash_stage` was batched (`df8f3f7`).
+If the cost were syscalls it would survive batching; if it were per-file future
+overhead in the second pass, batching would absorb it. Worth one measurement.
+
+**Change:** none to the two-tier logic. Rebuilt exactly the same change on top
+of the batched `hash_stage` and re-measured.
+
+**Numbers:** it was future overhead. `widegroup` goes from 1.30x to 1.02x at 3
+rounds and 1.01x at 9. Full suite, seed 1, tree, exit 0, 119 passed:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  73.1 MB    108.7 MB    0.67x     0.428    0.467     0.92x     33       51
+photos       pass  150.3 MB   150.8 MB    1.00x     0.026    0.027     0.97x     149      146
+bigheader    pass  296.5 MB   296.5 MB    1.00x     0.040    0.039     1.03x     109      110
+needle       pass  244.1 MB   244.1 MB    1.00x     2.860    4.207     0.68x     108      281
+samesize     pass  348.4 MB   348.4 MB    1.00x     0.328    1.916     0.17x     284      219
+widegroup    pass  158.8 MB   158.8 MB    1.00x     0.055    0.071     0.78x     152      150
+```
+
+`--rounds 9` on the four scenarios worth re-timing: typical 0.76x, photos
+0.98x, bigheader 1.02x, widegroup 1.01x. Seed 2, smoke: typical 5.1 MB vs 5.5
+MB (0.93x), everything else 1.00x bytes. Seed 2 at default scale on `typical`,
+because smoke understates a head change:
+
+```text
+typical   pass  86.3 MB    121.8 MB    0.71x     0.354    0.472     0.75x     41       59
+```
+
+**Verdict:** KEPT (commit `bf627d9`). Bytes strictly improve on `typical` —
+0.67x on seed 1, 0.71x on seed 2 — and hold at 1.00x on every other scenario;
+time improves or holds everywhere. Branch `opus-head-twotier` (`b7ef1a3`) is
+superseded and left in place only as the record of the rejected trade.
+
+**The lesson, for whoever reads this next:** I measured a cross-scenario trade
+correctly, reasoned about its cause plausibly, and got the cause wrong. The
+number was real; the story I attached to it was not, and the story is what sent
+the change to a branch instead of into the tree. Two independent changes
+interacted, and measuring one before the other existed made a clean win look
+like a trade. When an optimization is rejected for a regression, it is worth
+re-testing it against the tip after anything else lands nearby — a rejection is
+only valid against the tree it was measured on.
