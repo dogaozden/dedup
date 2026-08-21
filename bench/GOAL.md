@@ -50,7 +50,7 @@ for the whole run — section 3 defines it. It is a way of reporting where you
 have got to, not a target to aim at: there is still no number to hit, and a
 score is worthless the moment a gate is red or bytes have regressed anywhere,
 which is why the harness refuses to print one in either case. `main` currently
-scores **~0.849**.
+scores **~0.85**.
 
 ---
 
@@ -272,9 +272,10 @@ these are ratios — halving one scenario and doubling another has to come out
 where it started.
 
 **How much it wobbles.** The bytes term is exact, so all of the movement
-comes from the time term at weight 0.3. Two consecutive `--score` runs of
-identical code on `main` gave `0.8802` and `0.8791`. Treat a move in the third
-decimal place as nothing. This is the same noise floor section 4 rule 3 puts
+comes from the time term at weight 0.3. Two `--score` runs of identical code
+on `main` gave `0.8489` and `0.8517` — a spread of about 0.3%, and an earlier
+pair on the pre-merge tree sat 0.13% apart. Treat a move in the third decimal
+place as nothing, and do not read the fourth at all. This is the same noise floor section 4 rule 3 puts
 at 5% on a single scenario's time, diluted by the weighting and by taking six
 scenarios at once — but it is not zero, and a score is not a precision
 instrument. If you need to know whether a change is real, look at the row it
@@ -819,15 +820,15 @@ that apart from an honest repair. The user will look at it.
 cd /Users/dogaozden/AI_Projects/dedup
 git checkout -b <your-branch>
 python3 -m pytest tests/ -q          # expect: 119 passed
-python3 bench/run.py --score         # expect: exit 0, a table, SCORE: ~0.849
+python3 bench/run.py --score         # expect: exit 0, a table, SCORE: ~0.85
 ```
 
 If the pytest count is not 119, or the starting score is not somewhere around
-0.849 on an unmodified tree, you have an environment problem, not an
+0.85 on an unmodified tree, you have an environment problem, not an
 optimization problem. Log it and stop. ("Around" is doing real work there —
-see "How much it wobbles" in section 3. Observed: 0.8802 and 0.8791.)
+see "How much it wobbles" in section 3. Observed: 0.8489 and 0.8517.)
 
-That ~0.849 is the line you are trying to get below. It is not the baseline —
+That ~0.85 is the line you are trying to get below. It is not the baseline —
 the baseline is the older `dedup.py` pinned in `bench/baseline.lock`, which is
 what scores 1.0000 and what every ratio in the table is against. `main` is
 already about 15% under it. Round one got it there; the numbers are in
