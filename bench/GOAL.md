@@ -42,6 +42,13 @@ The robustness gates (correctness, deletion safety, adversarial cases, the
 pytest suite) are not metrics. They are gates. They are always green or the run
 did not happen.
 
+`python3 bench/run.py --score` folds the first two metrics into a single number
+for the whole run — section 3 defines it. It is a way of reporting where you
+have got to, not a target to aim at: there is still no number to hit, and a
+score is worthless the moment a gate is red or bytes have regressed anywhere,
+which is why the harness refuses to print one in either case. `main` currently
+scores **0.8802**.
+
 ---
 
 ## 2. The machine
@@ -117,16 +124,51 @@ Exit codes:
   the one in the tree. This is how you try an idea without committing it.
 - `--selftest` — proves the gates still catch sabotage. Run it after any change
   you make to anything under `bench/`.
+- `--score` — reduce the whole run to one number. Section 3's "The score" has
+  the definition. Implies `--rounds 9`, and refuses `--no-tests` and
+  `--no-baseline`.
 - `--root PATH` — override the RAM disk location.
+
+Only one harness run may use a volume at a time. `run.py` takes an advisory
+lock at `<root>/.bench.lock` before it generates anything, and a second run
+waits for it (up to 30 minutes) rather than starting. Two runs sharing a RAM
+disk evict each other's corpora mid-scan and empty each other's `.Trashes`,
+and the wreckage arrives looking like a gate failure in your change. If a run
+is killed hard, the next one detects the dead pid and takes the lock over by
+itself; there is nothing to clean up by hand.
 
 ### Scenarios
 
 `typical`, `photos`, `bigheader`, `needle`, `samesize`, `widegroup`,
-`adversarial`, `deletion`.
+`prefixtrap`, `adversarial`, `deletion`.
 
 The last two — `adversarial` and `deletion` — are untimed. They are gate-only:
 they prove the tool is still correct and still safe, and they produce no
-performance numbers.
+timings (`adversarial` still reports bytes, so it sits behind the bytes veto
+like everything else).
+
+`prefixtrap` is timed and gated but deliberately **not scored** — see "The
+score" below. It exists to punish one specific idea. ~180 files, all exactly
+2 MiB, in three bands sharing a common prefix of 8, 24 and 56 KiB and then
+diverging on the very next byte. At the current `HEAD_BYTES` of 64 KiB every
+band's prefix fits inside the head, so stage 3 separates the lot for 64 KiB a
+file. Shrink the head below a band's prefix and that whole band arrives at
+stage 5 in one bucket and gets read in full. That shape — same-size files
+with a shared header — is what a folder of camera raws actually is.
+
+It is worth knowing how badly this was needed. Setting `HEAD_BYTES = 4096` and
+running the harness gives **every gate green** and this:
+
+```
+typical      0.54x bytes   photos     0.98x   bigheader  1.00x
+needle       1.00x bytes   samesize   0.76x   widegroup  0.81x
+prefixtrap  10.69x bytes  ← 384.8 MB against 36.0 MB
+```
+
+Six scenarios out of six say it is a large win — it would have scored
+**0.7576** against `main`'s 0.8802 — and it is a disaster on real photo
+libraries. Before `prefixtrap` existed the benchmark had nothing to say about
+that at all.
 
 ### Corpus layout
 
@@ -149,7 +191,9 @@ section 5 has the tripwire that catches it.
       "maxrss_mb":  {"current": N, "baseline": N}
     }
   },
-  "verdict": ...
+  "verdict": ...,
+  "score":             <number, or null>,
+  "score_void_reason": <string, or null>
 }
 ```
 
@@ -182,6 +226,76 @@ correctness:
 None of these three has its own line in the gates dict — they surface as a
 `correctness` (or `adversarial`) failure whose message says which one fired.
 
+### The score
+
+`python3 bench/run.py --score` reduces a whole run to one number and prints it
+as the very last line:
+
+```
+SCORE: 0.8802
+```
+
+It is the geometric mean, over **exactly six** scenarios, of
+
+```
+(bytes_cur / bytes_base) ** 0.7  ×  (sec_cur / sec_base) ** 0.3
+```
+
+Lower is better. `1.0000` is the pinned baseline exactly. Bytes carry most of
+the weight because bytes are what the machines this tool exists for actually
+pay in; the time term is there so a change that buys a byte with a second
+cannot look like progress. A geometric mean, not an arithmetic one, because
+these are ratios — halving one scenario and doubling another has to come out
+where it started.
+
+**The six are `typical`, `photos`, `bigheader`, `needle`, `samesize`,
+`widegroup`, and that list is fixed forever.** A scenario added after this was
+written does not join it, whatever it measures. A score is only worth having
+if today's number can be compared with one recorded months ago, and a score
+whose terms drift is not a score. New scenarios earn their keep as gates and
+as vetoes, not as terms.
+
+**A void score.** Void is not a bad score; it is the absence of one. The run
+prints `SCORE: void (<reason>)`, no number, and exits nonzero when either:
+
+1. **Any gate failed.** The numbers from a run that got the wrong answer do
+   not get summarised into anything.
+2. **Bytes regressed against the baseline on any scenario at all** — including
+   `prefixtrap`, including `adversarial`, including any scenario added after
+   this was written. This is section 4's rule 2, mechanized: it is no longer
+   something you are asked to check and be honest about, it is something the
+   harness refuses to give you a number for.
+
+That second condition is the whole reason a new scenario does not need to be
+in the six to matter. `prefixtrap` cannot make your score better and cannot
+make it worse — it can only take it away.
+
+### The score that counts
+
+Your local `bench/` is yours to change, and you are encouraged to add
+scenarios to it. That is also exactly why a score you compute in your own
+tree is not the score you are judged on.
+
+**The score that counts is computed by a clean `bench/` checked out from
+`main`, scoring your `dedup.py` from outside.** Edits to your own harness —
+a scenario dropped, a corpus reshaped, a weight nudged — cannot move it,
+because none of your harness is running. The acceptance command:
+
+```
+git worktree add /tmp/dedup-referee main
+cd /tmp/dedup-referee
+python3 bench/run.py --dedup /path/to/your/dedup.py --score
+```
+
+Note `--dedup`: the referee tree's own `dedup.py` is the one on `main`, and
+the point of the exercise is to score yours against the same pinned baseline
+in `bench/baseline.lock`. Run it yourself before you claim a number, and quote
+what it printed. Clean up afterwards with `git worktree remove
+/tmp/dedup-referee`.
+
+If a scenario you added belongs in the benchmark for everybody, land it on
+`main` — then the referee runs it too, and it starts vetoing for everyone.
+
 ---
 
 ## 4. Rules of measurement
@@ -199,7 +313,8 @@ A change counts as a win only when all of these hold:
 3. A time win is only a time win at **≥5%**. Below that it is noise on this
    machine. Do not keep a change on the strength of a 2% timing improvement.
 4. The win reproduces at `--seed 2`. A win that only exists on seed 1 is a win
-   against one particular corpus, not against the problem.
+   against one particular corpus, not against the problem. **At which scale is
+   not your choice** — see "Which scale to confirm a seed-2 win at" below.
 5. Every number you write in a commit message or in `bench/LOG.md` is copied
    from harness output. Never estimate, never round from memory, never write
    "roughly 20% faster" because it felt faster.
@@ -231,15 +346,43 @@ reports. Any read you add must be counted there. Reading bytes without counting
 them does not make the tool faster, it makes the benchmark lie, and it will be
 treated as sabotage.
 
+### Which scale to confirm a seed-2 win at
+
+Rule 4 and the eviction caveat below pull against each other: seed 2 at
+default scale evicts seed 1's corpora, and getting back costs about eleven
+seconds of regeneration per corpus. That is a real cost and it has made people
+reach for `--scale smoke` as the seed-2 check by default. Settle it this way:
+
+**Ask whether the effect you are claiming even exists at smoke scale.** Run
+seed 1 at both scales and look. If the win shows up at smoke with roughly the
+shape it has at default, a smoke seed-2 confirmation is enough and you should
+take it — it is faster and it evicts nothing.
+
+**If it does not, the default-scale seed-2 run is required, and the eviction
+is simply the price.** Pay it. Anything whose behaviour depends on how wide a
+bucket gets, how deep a directory goes, or how many files land in one group is
+in this category by construction: `samesize` is ~1,400 files at default and
+~140 at smoke, and a fan-out effect that needs hundreds of near-misses in one
+bucket is invisible in the smaller one. A change tuned to a threshold —
+`PARTITION_FANOUT`, `HASH_BATCH`, `COMPARE_BUDGET`, any new constant of your
+own — is in it too.
+
+A smoke seed-2 run that confirms nothing because the effect was never there is
+not a cheaper confirmation. It is no confirmation, written down as if it were
+one, and that is worse than skipping the step.
+
 ### Measurement caveats on this machine
 
-- **`bigheader`, `photos` and `widegroup` finish in tens of milliseconds.**
-  At the default `--rounds 3` the min-of-N is thin. Use `--rounds 9` on these
-  three before trusting a time verdict either way.
+- **`bigheader`, `photos`, `widegroup` and `prefixtrap` finish in tens of
+  milliseconds.** At the default `--rounds 3` the min-of-N is thin. Use
+  `--rounds 9` on these four before trusting a time verdict either way —
+  `--score` already forces that, which is most of why it does.
 - **Switching `--seed` at default scale evicts the other seed's corpora** to
   make room (section 3 has the eviction mechanics) — the next run on the old
-  seed pays a regeneration cost again. `--scale smoke` for a quick seed check
-  sidesteps this.
+  seed pays a regeneration cost again, about eleven seconds a corpus.
+  `--scale smoke` for a quick seed check sidesteps this, but only when the
+  effect survives the smaller corpus; "Which scale to confirm a seed-2 win at"
+  above says when you may and may not do that.
 - **The RAM disk measures memory bandwidth, not device I/O.** No seek, no
   queue depth, no real readahead — it's `hdiutil` over RAM. An idea aimed at
   any of those will look flat here by construction, not because it failed.
@@ -435,6 +578,36 @@ should still be able to use the whole disk queue.
   double read. On a set of 300 MB images sharing a 100 MB header, sampling cut
   reads from 3.15 GB to 0.67 GB — 79% fewer — for the same answer.
 
+### Already on `main` — do NOT re-do these
+
+Round one landed three changes. `main` scores **0.8802** against the baseline
+pinned in `bench/baseline.lock`, and that is the line round two starts from.
+Everything here is already in the tree you are reading; re-proposing any of it
+is a wasted idea.
+
+- **The group-order tie-break.** The final sort is `(-size, name, keeper path)`.
+  The known-bug entry the idea menu used to carry is fixed.
+- **The partition fan-out guard.** `partition_blocks` keeps its pivot loop, but
+  when one pass strips off nothing except its own pivot and more than
+  `PARTITION_FANOUT` (256) blocks are still pending, it finishes the bucket by
+  grouping on the block itself in a single dict pass. That is the quadratic
+  signature and nothing else reaches it, so small groups run exactly the code
+  they ran before. `samesize` 1.746s → 0.294s, every other scenario flat,
+  bytes 1.00x everywhere. A plain dictionary partition without the guard was
+  tried twice, independently, and lost badly on `photos` and `bigheader` —
+  a dict must hash a block end to end where the pivot's `==` exits on the
+  first differing byte. Do not remove the guard and do not widen it into an
+  unconditional dict.
+- **Batched `hash_stage`.** Readers get `HASH_BATCH` files per task instead of
+  one task per file. On `needle`'s hundred thousand small files the queueing
+  cost was larger than the reads.
+
+**Still parked, not merged: the two-tier head**, on branch `opus-head-twotier`.
+It reads the head in two tiers and buys a real bytes win on some scenarios at
+a cost on others — a cross-scenario trade, which section 4 rule 2 says is the
+user's call and not the optimizer's. It is left on its branch on purpose.
+Do not merge it, and do not re-derive it and present it as new.
+
 ---
 
 ## 7. Idea menu
@@ -449,16 +622,26 @@ measured, not a known win. Several will turn out to be losses — log those too.
   sample point starts at offset 0 and reads 1 MiB, covering those same 64 KiB
   again. That is a real, countable duplicate read on every large candidate.
 - **Adaptive `HEAD_BYTES` by size class.** 64 KiB is one number for a 10 MB file
-  and a 10 GB file.
+  and a 10 GB file. Read the `prefixtrap` scenario before you start: making the
+  head *smaller* is not the free win the other scenarios make it look like, and
+  `prefixtrap` will veto your score if you try. Making it bigger, or making it
+  grow with the file, is still open.
 - **Chunk-size autotuning per device**, rather than the two hardcoded values.
 - **Walk parallelism on flash.** `walk_workers()` caps at 4. Verify that cap
   still holds on this CPU, both by measurement and via `-p`.
 - **Progress overhead in the tight loops.** The `Reporter` throttle is evaluated
   once per file in `hash_stage()` and once per round in `compare_stage()` — each
   iteration calls `time.monotonic()` just to decide it has nothing to do yet.
+  **UNMEASURABLE HERE — do not spend an idea on it.** `bench/_measure.py`
+  passes `reporter=None`, so `tick` is `None` and the `if on_progress:` branch
+  never runs during a measurement. Whatever you do to it, the harness reads 0.
 - **Interpreter startup.** `dedup.py` imports `curses` at module scope for a UI
   that a `--list` run never opens. Measure the import cost; on the smoke
   scenarios startup may be a visible fraction of the run.
+  **UNMEASURABLE HERE — do not spend an idea on it.** The clock starts after
+  `load_dedup()` and around `find_duplicates()` alone; import cost lands in
+  `setup_seconds`, which is a 2-second pass/fail ceiling and not a reported
+  number. Two optimizers have now burned an attempt confirming this.
 - **`BULK_BUF` sizing.** 128 KiB per `DirReader`, one reader per walk thread.
   Bigger buffer, fewer syscalls, more memory.
 - **Stage-5 group ordering by layout.** `find_duplicates()` already sorts
@@ -466,21 +649,20 @@ measured, not a known win. Several will turn out to be losses — log those too.
   holds through the whole pipeline before assuming there is anything to win.
 - **Memory honesty in wide groups.** `COMPARE_BUDGET` bounds one group's round,
   but check what actually happens to RSS on the `widegroup` scenario.
-- **KNOWN BUG — nondeterministic group ordering.** The final sort key is
-  `(-size, basename)`. When two groups tie on both, the tie is broken by
-  whatever order the pipeline happened to produce, which traces back to inode
-  allocation order — so the same logical corpus, regenerated, can report its
-  groups in a different order. This is pre-existing, not something you
-  introduced. Fix it with a deterministic tie-break (the keeper's path is the
-  obvious one). Cheap, and it makes benchmark output more comparable.
-- **`samesize`'s O(n²) partition.** ~1,400 same-size files share one stage-3
-  bucket (same size, same first 64 KiB) and reach `compare_stage` as a single
-  group. `partition_blocks` picks a pivot and compares everyone else's 128
-  KiB chunk against it, one pass per pivot — cheap when most files match, but
-  this bucket is mostly unique content, so most passes strip off only the
-  pivot. That's on the order of n²/2 block comparisons — roughly 10⁶ here —
-  and it accounts for most of `samesize`'s ~1.8s scan time. Comparison-only,
-  no I/O: a CPU cost riding on top of bytes already being read.
+- **~~KNOWN BUG — nondeterministic group ordering.~~ DONE, on `main`.** The
+  final sort key was `(-size, basename)`, and a tie on both fell back to inode
+  allocation order. It now breaks on the keeper's path. Nothing left here.
+- **~~`samesize`'s O(n²) partition.~~ DONE, on `main`** — the fan-out guard in
+  "Already on `main`" above. The diagnosis is left here because it is still the
+  thing to understand before you touch `partition_blocks`: ~1,400 same-size
+  files share one stage-3 bucket (same size, same first 64 KiB) and reach
+  `compare_stage` as a single group. `partition_blocks` picks a pivot and
+  compares everyone else's 128 KiB chunk against it, one pass per pivot —
+  cheap when most files match, but this bucket is mostly unique content, so
+  most passes stripped off only the pivot. That is on the order of n²/2 block
+  comparisons, roughly 10⁶ here, and it was most of `samesize`'s 1.746s scan
+  time. Comparison-only, no I/O: a CPU cost riding on top of bytes already
+  being read.
 - **Group-level parallelism in stage 5.** `compare_stage()` runs groups one at
   a time with members read in parallel — deliberate, so a single group of two
   enormous files can use the whole reader pool. But a tree of thousands of
@@ -551,6 +733,12 @@ Symptoms: a gate fires on code you did not change; `bench/run.py` exits `2`; the
 RAM disk fails to create or mount; baseline numbers move between two runs of
 identical code; results.json is malformed.
 
+First check you are alone on the volume. If a run says it is waiting on
+`/Volumes/dedupbench/.bench.lock`, that is not a malfunction — someone else is
+using the RAM disk and your run will start when theirs finishes. Before that
+lock existed, a second run would silently evict the first one's corpora
+mid-scan and the damage surfaced as exactly the symptoms above.
+
 **STOP. Log it in `bench/LOG.md` with the exact command and the exact output.
 Do not "fix" the harness.** A benchmark that you have repaired to make your own
 change look good is worth nothing, and from the outside there is no way to tell
@@ -562,11 +750,17 @@ that apart from an honest repair. The user will look at it.
 
 ```
 cd /Users/dogaozden/AI_Projects/dedup
-git checkout -b luna
-python3 -m pytest tests/ -q          # expect: 117 passed
-python3 bench/run.py                 # expect: exit 0, a baseline table
+git checkout -b <your-branch>
+python3 -m pytest tests/ -q          # expect: 119 passed
+python3 bench/run.py --score         # expect: exit 0, a table, SCORE: 0.8802
 ```
 
-If the pytest count is not 117, or `bench/run.py` does not exit 0 on an
+If the pytest count is not 119, or the starting score is not 0.8802 on an
 unmodified tree, you have an environment problem, not an optimization problem.
 Log it and stop.
+
+That 0.8802 is the line you are trying to get below. It is not the baseline —
+the baseline is the older `dedup.py` pinned in `bench/baseline.lock`, which is
+what scores 1.0000 and what every ratio in the table is against. `main` is
+already 12% under it. Round one got it there; the numbers are in
+"Already on `main`" in section 6 and the working is in `bench/LOG.md`.
