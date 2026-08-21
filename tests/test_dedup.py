@@ -59,6 +59,24 @@ class TestDetection:
 
         assert scan(tmp_path) == []
 
+    def test_wide_bucket_of_near_misses_finds_the_one_real_pair(self, tmp_path):
+        # Same size and the same first 64 KiB, so all of these reach stage 5
+        # as one bucket, and every compare pass strips off only its pivot.
+        # Past PARTITION_FANOUT that hands off to grouping on the block, and
+        # the real pair still has to come back out of it — and only it.
+        head = b"h" * dedup.HEAD_BYTES
+        for i in range(dedup.PARTITION_FANOUT + 2):
+            write(tmp_path / f"u{i:04d}.bin", head + f"{i:08d}".encode())
+        write(tmp_path / "twin_a.bin", head + b"XXXXXXXX")
+        write(tmp_path / "twin_b.bin", head + b"XXXXXXXX")
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+        assert sorted(os.path.basename(f.path) for f in groups[0].files) == [
+            "twin_a.bin", "twin_b.bin"
+        ]
+
     def test_extension_is_ignored(self, tmp_path):
         """A renamed copy is still a duplicate — this is the documented rule."""
         write(tmp_path / "photo.jpg", b"\xff\xd8\xff" + b"x" * 200)

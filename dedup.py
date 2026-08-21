@@ -46,6 +46,10 @@ COMPARE_BUDGET = 128 * 1024 * 1024   # ceiling on bytes held for one group
 MIN_CHUNK = 128 * 1024          # ...which the chunk shrinks towards, but not
                                 # below, so a group of a thousand copies still
                                 # fits and a read is still worth making
+PARTITION_FANOUT = 256          # a compare pass that strips off nothing but
+                                # its own pivot, with this many blocks still
+                                # pending, means the pivot loop is going
+                                # quadratic — see partition_blocks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,7 +745,20 @@ def partition_blocks(blocks: list) -> list[list]:
     """Split (rec, block) pairs into runs that agree on this chunk.
 
     Comparing against a pivot rather than hashing each block is the point of
-    the whole stage: a memcmp costs essentially nothing next to a digest.
+    the whole stage: a memcmp against a block that differs early costs
+    essentially nothing next to a digest of the whole thing. That holds as
+    long as each pass settles a decent share of what is left.
+
+    It stops holding when a bucket is mostly distinct content — same size,
+    same head, different bodies. Then every pass strips off just the pivot
+    and the loop is quadratic in the number of files. When a pass does that
+    to a bucket that is still large, finish the job by grouping on the block
+    itself: one pass, and each block is looked at once.
+
+    That stays byte-exact. A dict only puts two keys in one group when they
+    are equal, and equality on bytes is a memcmp — the hash picks the slot,
+    it never decides the answer. Nothing is called a duplicate here on the
+    strength of a digest.
     """
     runs, pending = [], blocks
     while pending:
@@ -750,6 +767,12 @@ def partition_blocks(blocks: list) -> list[list]:
         for item in pending[1:]:
             (same if item[1] == pivot[1] else rest).append(item)
         runs.append(same)
+        if len(same) == 1 and len(rest) > PARTITION_FANOUT:
+            by_block: dict = {}
+            for item in rest:
+                by_block.setdefault(item[1], []).append(item)
+            runs.extend(by_block.values())
+            return runs
         pending = rest
     return runs
 
