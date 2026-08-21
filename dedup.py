@@ -56,6 +56,9 @@ PARTITION_FANOUT = 256          # a compare pass that strips off nothing but
                                 # its own pivot, with this many blocks still
                                 # pending, means the pivot loop is going
                                 # quadratic — see partition_blocks
+RETAIN_BUDGET = 128 * 1024 * 1024    # ceiling on head bytes carried from stage
+                                # 3 to stage 5 so the compare does not read
+                                # them a second time — see find_duplicates
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +102,8 @@ class FileRec:
     ino: int
     nlink: int = 1
     links: list = field(default_factory=list)   # every name we found for this inode
+    head: bytes = b""       # bytes stage 3 read from offset 0, kept so stage 5
+                            # can compare them instead of reading them again
 
     @property
     def display(self) -> str:
@@ -655,6 +660,37 @@ def hash_head_rest(path: str, size: int) -> bytes | None:
         return None
 
 
+def keep_head(path: str, size: int) -> tuple | None:
+    """hash_head, and the block it read, for hash_stage to keep.
+
+    Stage 5 has to see the bytes of the head to prove a group — a digest only
+    narrows. Handing it the block that stage 3 already read is the difference
+    between reading the head once and reading it twice.
+    """
+    try:
+        with open(path, "rb") as fh:
+            block = fh.read(HEAD_BYTES)
+    except (PermissionError, OSError):
+        return None
+    h = _digest()
+    h.update(block)
+    return h.digest(), block
+
+
+def keep_head_rest(path: str, size: int) -> tuple | None:
+    """hash_head_rest, and the block it read. Appended to what keep_head kept,
+    so the record carries one contiguous run of bytes from offset 0."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(HEAD_BYTES)
+            block = fh.read(DEEP_HEAD - HEAD_BYTES)
+    except (PermissionError, OSError):
+        return None
+    h = _digest()
+    h.update(block)
+    return h.digest(), block
+
+
 def hash_sample(path: str, size: int) -> bytes | None:
     """Hash a few chunks spread through the file instead of all of it.
 
@@ -709,12 +745,16 @@ def hash_full(path: str, size: int) -> bytes | None:
 
 
 def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
-               on_progress=None) -> dict:
+               on_progress=None, keep: bool = False) -> dict:
     """Hash `files` with `fn` and bucket them by size and digest.
 
     Size is part of the key because a head or sample digest covers only part
     of the file: two files of different lengths can easily agree on their
     first 64 KiB and never be duplicates.
+
+    With `keep`, `fn` returns its block alongside the digest and the block is
+    appended to the record's `head`. Stages read strictly forward, so what
+    the record ends up carrying is one contiguous run from offset 0.
     """
     buckets: dict = defaultdict(list)
     last_tick = 0.0
@@ -734,11 +774,14 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
                 if digest is None:
                     stats.unreadable.append(rec.path)
                     continue
+                if keep:
+                    digest, block = digest
+                    rec.head += block
                 buckets[(rec.size, digest)].append(rec)
                 stats.hashed_files += 1
-                if fn is hash_head:
+                if fn is hash_head or fn is keep_head:
                     stats.hashed_bytes += min(rec.size, HEAD_BYTES)
-                elif fn is hash_head_rest:
+                elif fn is hash_head_rest or fn is keep_head_rest:
                     stats.hashed_bytes += max(
                         0, min(rec.size, DEEP_HEAD) - HEAD_BYTES)
                 elif fn is hash_sample:
@@ -844,6 +887,22 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
     # them now or the progress bar stops short of the end.
     stats.hashed_files += len(members) - len(opened)
 
+    # Whatever stage 3 kept is compared here instead of being read again —
+    # the bytes themselves, not the digest of them, so the proof is the same
+    # proof. Bytes on disk that have moved since they were read are not the
+    # bytes we are about to delete something over, so the first stat that
+    # disagrees puts the whole group back on reading from zero.
+    prefix = min([len(r.head) for r in opened], default=0)
+    if prefix:
+        for rec in opened:
+            st = os.fstat(handles[id(rec)].fileno())
+            if st.st_size != rec.size or st.st_mtime != rec.mtime:
+                prefix = 0
+                break
+    if prefix:
+        for rec in opened:
+            handles[id(rec)].seek(prefix)
+
     def grab(rec):
         try:
             return rec, read_block(handles[id(rec)], chunk)
@@ -852,9 +911,19 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
 
     matched: list[list] = []
     try:
-        live = [opened] if len(opened) > 1 else []
-        if not live:
+        if len(opened) < 2:
+            live = []
             stats.hashed_files += len(opened)
+        elif prefix:
+            live = []
+            for run in partition_blocks([(r, r.head[:prefix]) for r in opened]):
+                recs = [r for r, _ in run]
+                if len(recs) < 2:
+                    stats.hashed_files += len(recs)   # settled on kept bytes
+                else:
+                    live.append(recs)
+        else:
+            live = [opened]
         while live:
             following = []
             for group in live:
@@ -883,6 +952,14 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
         for fh in handles.values():
             fh.close()
     return matched
+
+
+def release(files: list, pending: list) -> None:
+    """Drop kept bytes for records no later stage will look at again."""
+    live = {id(f) for g in pending for f in g}
+    for f in files:
+        if id(f) not in live:
+            f.head = b""
 
 
 def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
@@ -956,13 +1033,25 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
 
     candidates.sort(key=by_layout)
 
+    # Stage 5 has to see the bytes of the head to prove a group, and stage 3
+    # is about to read them. Keeping them means stage 5 compares what is
+    # already in hand instead of reading the same region a second time — a
+    # third of the typical corpus. The cost is holding them until then, so
+    # this only happens when the whole set fits in RETAIN_BUDGET: a hundred
+    # thousand small files do not fit, and would gain nothing anyway, since
+    # hardly any of them reach stage 5.
+    keep = sum(min(f.size, HEAD_BYTES) for f in candidates) <= RETAIN_BUDGET
+
     # stage 3 — sample the head
     say("head", len(candidates))
-    head_buckets = hash_stage(candidates, hash_head, jobs, stats, tick)
+    head_buckets = hash_stage(candidates, keep_head if keep else hash_head,
+                              jobs, stats, tick, keep)
     if reporter:
         reporter.finish_stage()
 
     pending = [g for g in head_buckets.values() if len(g) > 1]
+    if keep:
+        release(candidates, pending)
     if not pending:
         return []
 
@@ -974,11 +1063,17 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if deep:
         pending = [g for g in pending if g[0].size <= HEAD_BYTES]
         crowded = sorted((f for g in deep for f in g), key=by_layout)
+        keep_rest = keep and sum(min(f.size, DEEP_HEAD) - HEAD_BYTES
+                                 for f in crowded) <= RETAIN_BUDGET
         say("head2", len(crowded))
-        rest_buckets = hash_stage(crowded, hash_head_rest, jobs, stats, tick)
+        rest_buckets = hash_stage(
+            crowded, keep_head_rest if keep_rest else hash_head_rest,
+            jobs, stats, tick, keep_rest)
         if reporter:
             reporter.finish_stage()
         pending += [g for g in rest_buckets.values() if len(g) > 1]
+        if keep:
+            release(crowded, pending)
         if not pending:
             return []
 

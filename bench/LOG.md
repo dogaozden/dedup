@@ -662,3 +662,96 @@ widegroup    pass  18.1 MB    18.1 MB     1.00x     0.011    0.011     1.02x    
 
 **Verdict:** REVERTED — no scenario produced a meaningful time win and bytes
 held on every scenario.
+
+---
+
+# Round two — branch `opus-round2`
+
+Target: `SCORE ≤ 0.50` at seed 1 and seed 2. Starting point, measured on this
+branch before any change (`python3 bench/run.py --score`, unmodified tree at
+`main` `0661a5e`): **SCORE: 0.8522**, exit 0, 119 passed.
+
+**Where the bytes actually are.** Before touching anything I instrumented the
+pipeline per stage against the default corpora and put the harness's own byte
+floor (Σ size × members over the manifest's true groups) beside it. Every
+number below is MB = 10⁶ bytes, self-reported `hashed_bytes`, seed 1:
+
+```text
+scenario   cand    tier-1  tier-2  sample  compare   total    FLOOR
+typical    9071      37.2    15.3       –     24.2     76.6     24.2
+photos       47       0.2     2.4       –    155.0    157.6    155.0
+bigheader     8      0.03     0.5    33.5    276.8    310.9    117.4
+needle   100000     255.6       –       –      0.3    255.9      0.3
+samesize   1402       5.7    86.1     8.4    265.0    365.3     23.6
+widegroup   519       2.1    31.9       –    132.5    166.5    132.5
+prefixtrap  196       0.8     9.3       –     33.6     43.6     33.6
+```
+
+Two things fall out of that table. `photos` and `widegroup` are already at or
+near the floor and have nothing to give. `needle` reads 255.6 MB as one page
+per file over 100,000 files of 1–4 KB — a page is the smallest thing a disk
+can hand back, so its bytes are at the floor too even though the manifest
+floor says 0.3 MB. **Shrinking the first-page read below 4 KiB would look like
+an enormous win here and would not save a single real byte of I/O on any
+device; it is not on the table.** What is on the table is `samesize`,
+`bigheader` and `typical`, where the tool reads regions twice or reads far
+past the point where a file has been told apart from its bucket.
+
+## 2026-08-22 — Compare the head stage 3 already read instead of reading it again
+
+**Hypothesis:** Stage 5 opens at offset 0 and re-reads every byte stages 3 and
+4 have already read. Round one's log flags this and names the only legal way to
+exploit it: keep the bytes and *compare* them, since a digest may narrow but
+may never prove. Keeping the head should remove that re-read wherever a file is
+read to EOF — which is exactly the true duplicates, i.e. the floor.
+
+**Change:** `keep_head` / `keep_head_rest` return the block alongside the
+digest; `hash_stage(..., keep=True)` appends it to `FileRec.head`, so a record
+carries one contiguous run from offset 0. `split_identical` compares those
+bytes as its first round and seeks past them, after an `fstat` per member
+confirming size and mtime still match what was read — a file that moved under
+us goes back to reading from zero. `release()` drops kept bytes for records no
+later stage will look at. Retention is skipped entirely when the projected
+cost exceeds `RETAIN_BUDGET` (128 MB), which is what keeps `needle`'s 100,000
+files from being held in memory for a 0.3 MB gain.
+
+**Numbers:** full suite, seed 1, exit 0, 119 passed:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.338    0.467     0.72x     106      53
+photos       pass  147.9 MB   150.8 MB    0.98x     0.022    0.022     0.99x     148      149
+bigheader    pass  296.2 MB   296.5 MB    1.00x     0.032    0.033     0.98x     119      109
+needle       pass  244.1 MB   244.1 MB    1.00x     2.837    4.064     0.70x     104      283
+samesize     pass  341.4 MB   348.4 MB    0.98x     0.220    1.683     0.13x     342      219
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.060    0.055     1.08x     175      152
+prefixtrap   pass  40.6 MB    44.2 MB     0.92x     0.015    0.016     0.97x     36       51
+adversarial  pass  1.2 MB     4.2 MB      0.30x     -        -         -         -        -
+SCORE: 0.7791
+```
+
+Seed 2, default scale, exit 0:
+
+```text
+typical      pass  64.8 MB    121.8 MB    0.53x     0.336    0.467     0.72x     111      59
+photos       pass  149.1 MB   152.0 MB    0.98x     0.023    0.023     1.02x     155      156
+bigheader    pass  296.2 MB   296.5 MB    1.00x     0.032    0.032     1.02x     119      109
+needle       pass  244.2 MB   244.2 MB    1.00x     2.780    4.188     0.66x     106      304
+samesize     pass  341.5 MB   348.6 MB    0.98x     0.280    1.968     0.14x     328      219
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.068    0.063     1.09x     173      152
+prefixtrap   pass  40.6 MB    44.2 MB     0.92x     0.015    0.015     1.00x     36       50
+adversarial  pass  1.2 MB     4.2 MB      0.30x     -        -         -         -        -
+SCORE: 0.7919
+```
+
+`widegroup` lands on 126.3 MB, which is its floor to the byte: every file in
+that corpus is a true copy, so once the head is not read twice there is
+nothing left to remove. The saving only ever appears where a member is read to
+EOF — a file settled by its first compare round reads one chunk either way,
+just starting later — which is why `samesize` moves 0.98x here and not more.
+That is the next entry's problem.
+
+**Verdict:** KEPT. Bytes improve on five scenarios and hold on two, no
+regression anywhere, 0.8522 → 0.7791 (seed 1) and 0.7919 (seed 2). RSS rises
+where bytes are kept (typical 53→106, samesize 219→342): metric 3 paying for
+metric 1, which is the order the brief asks for.
