@@ -58,7 +58,18 @@ ADVERSARIAL_TIMEOUT = 60
 DELETE_TIMEOUT = 900
 
 ORDER = ["typical", "photos", "bigheader", "needle", "samesize", "widegroup",
-         "adversarial", "deletion"]
+         "adversarial", "deletion", "rescan"]
+
+# The six timed scenarios and the two gate-only ones are measured with the
+# re-scan cache switched off, so every score stays comparable with every score
+# taken before the cache existed, and the byte floor keeps its full force.
+# `rescan` is the one scenario that turns it on, and it is not timed.
+CACHE_FREE = [n for n in ORDER if n != "rescan"]
+
+# A warm scan of a tree nobody has touched should read essentially nothing.
+# Five percent is a ceiling with room in it, not a target: the real figure on
+# an unchanged corpus is zero.
+WARM_CEILING = 0.05
 
 
 class Fatal(Exception):
@@ -127,11 +138,14 @@ def ensure_volume(root: str, megabytes: int) -> str:
     if os.path.ismount(root):
         return "reused"
     if root != DEFAULT_ROOT:
-        if not os.path.isdir(root):
-            os.makedirs(root, exist_ok=True)
+        # An explicit --root is taken at its word. A plain directory is a
+        # perfectly good place to check that the gates fire; it is just not a
+        # place to take a timing from, and the note says so on every run.
+        os.makedirs(root, exist_ok=True)
+        if not os.access(root, os.W_OK):
+            raise Fatal("{} is not writable".format(root))
         if os.stat(root).st_dev == os.stat("/").st_dev:
-            raise Fatal("{} is on the boot disk; corpora belong on a RAM disk"
-                        .format(root))
+            return "boot disk — gates are valid here, timings are not"
         return "existing"
 
     attach = run(["hdiutil", "attach", "-nomount", "ram://{}"
@@ -220,14 +234,28 @@ def pytest_gate(dedup_path: str) -> str:
 # measuring and checking
 # ─────────────────────────────────────────────────────────────────────────────
 
+def scan_env(cache_dir=None) -> dict:
+    """The environment a scan runs in.
+
+    DEDUP_CACHE_DIR always points somewhere the harness owns, so no
+    measurement can reach the user's real cache — belt to the braces of the
+    scored scenarios passing no cache directory at all.
+    """
+    env = dict(os.environ)
+    env["DEDUP_CACHE_DIR"] = cache_dir or os.path.join(STATE, "no-cache")
+    return env
+
+
 def measure(dedup_path: str, tree: str, volume: str, min_size: int,
-            sabotage=None, timeout: int = SCAN_TIMEOUT) -> dict:
+            sabotage=None, timeout: int = SCAN_TIMEOUT, cache_dir=None) -> dict:
     cmd = [sys.executable, MEASURE, "--dedup", dedup_path, "--root", tree,
            "--volume", volume, "--min-size", str(min_size)]
     if sabotage:
         cmd += ["--sabotage", sabotage]
+    if cache_dir:
+        cmd += ["--cache-dir", cache_dir]
     try:
-        out = run(cmd, timeout=timeout)
+        out = run(cmd, timeout=timeout, env=scan_env(cache_dir))
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "timed out after {}s".format(timeout)}
     try:
@@ -238,8 +266,14 @@ def measure(dedup_path: str, tree: str, volume: str, min_size: int,
                     (out.stderr or out.stdout).strip()[-400:])}
 
 
-def check(manifest: dict, result: dict):
-    """None when the scan is correct, otherwise why it is not."""
+def check(manifest: dict, result: dict, byte_floor: bool = True):
+    """None when the scan is correct, otherwise why it is not.
+
+    `byte_floor` is off for exactly one thing: the warm half of `rescan`,
+    where not reading is the whole point and the floor is replaced by a
+    stricter pair of demands — the same answer as the cold scan, for a
+    fraction of the bytes. Nothing else may turn it off.
+    """
     if not result.get("ok"):
         return "scan failed: {}".format(result.get("error", "?"))
     if result.get("tripwire"):
@@ -269,10 +303,11 @@ def check(manifest: dict, result: dict):
     # can go under, and it is what stops a tool from scoring well by reading
     # nothing at all — through mmap, through os.read, or out of a cache it
     # kept from a previous run.
-    floor = sum(g["size"] * len(g["members"]) for g in manifest["groups"])
-    if counted < floor:
-        return ("read {} — proving these groups takes at least {}, so they were "
-                "not proved".format(human(counted), human(floor)))
+    if byte_floor:
+        floor = sum(g["size"] * len(g["members"]) for g in manifest["groups"])
+        if counted < floor:
+            return ("read {} — proving these groups takes at least {}, so they "
+                    "were not proved".format(human(counted), human(floor)))
 
     if result.get("setup_seconds", 0) > SETUP_CEILING:
         return ("spent {:.1f}s before the clock started; scan work does not "
@@ -290,20 +325,52 @@ def byte_gap(result: dict) -> float:
 # gate-only scenarios
 # ─────────────────────────────────────────────────────────────────────────────
 
+def trash_for(tree: str, home: str) -> str:
+    """Where dedup will put what it removes from `tree`.
+
+    The same rule trash_dir_for uses, worked out from outside the tool so the
+    gate is checking dedup's behaviour rather than agreeing with itself. On a
+    corpus volume that is the volume's own .Trashes; on a plain directory on
+    the boot disk it is ~/.Trash, which is why the run gets its own HOME.
+    """
+    path = os.path.realpath(tree)
+    try:
+        dev = os.stat(path).st_dev
+    except OSError:
+        return os.path.join(home, ".Trash")
+    while path != os.path.dirname(path):
+        parent = os.path.dirname(path)
+        try:
+            if os.stat(parent).st_dev != dev:
+                return os.path.join(path, ".Trashes", str(os.getuid()))
+        except OSError:
+            break
+        path = parent
+    return os.path.join(home, ".Trash")
+
+
 def deletion_gate(dedup_path: str, volume: str, base: str, manifest: dict) -> str:
     """Drive the real command line and check what it left behind.
 
     The scan is only half of what this tool does. This is the other half: one
-    survivor per group, its bytes untouched, every victim in the volume's own
-    Trash, and nothing left for a second pass to find.
+    survivor per group, its bytes untouched, every victim in the Trash, and
+    nothing left for a second pass to find.
     """
     tree = os.path.join(base, "tree")
-    trash = os.path.join(volume, ".Trashes", str(os.getuid()))
-    shutil.rmtree(os.path.join(volume, ".Trashes"), ignore_errors=True)
+    # A run rooted on the boot disk would otherwise trash into the user's own
+    # home folder. It gets a home of its own instead.
+    home = os.path.join(STATE, "home")
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(home)
+    trash = trash_for(tree, home)
+    shutil.rmtree(trash, ignore_errors=True)
+    env = scan_env()
+    env["HOME"] = home
 
     try:
         out = run([sys.executable, dedup_path, tree, "--auto", "shortest", "-y",
-                   "--min-size", str(manifest["min_size"])], timeout=DELETE_TIMEOUT)
+                   "--no-cache", "--min-size", str(manifest["min_size"])],
+                  timeout=DELETE_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
         return "fail: dedup --auto timed out"
     if out.returncode != 0:
@@ -343,14 +410,185 @@ def deletion_gate(dedup_path: str, volume: str, base: str, manifest: dict) -> st
         return "fail: {} files left, expected {}".format(
             left, manifest["file_count"] - len(victims))
 
-    again = run([sys.executable, dedup_path, tree, "--list",
-                 "--min-size", str(manifest["min_size"])], timeout=DELETE_TIMEOUT)
+    again = run([sys.executable, dedup_path, tree, "--list", "--no-cache",
+                 "--min-size", str(manifest["min_size"])],
+                timeout=DELETE_TIMEOUT, env=env)
     if again.returncode != 0 or "No duplicates found" not in again.stdout:
         return "fail: a second pass still found duplicates"
 
-    shutil.rmtree(os.path.join(volume, ".Trashes"), ignore_errors=True)
+    shutil.rmtree(trash, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
     shutil.rmtree(base, ignore_errors=True)
     return "pass"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the re-scan gate
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Three things have to be true at once for the cache to be worth having, and
+# this scenario refuses to let any one of them be traded for another:
+#
+#   cold   with nothing remembered, everything is read — the byte floor, in
+#          full force, exactly as it applies to every other scenario
+#   warm   with everything remembered, the answer is identical and the bytes
+#          are a rounding error
+#   wrong  when what was remembered is a lie, the deletion path notices before
+#          it removes anything
+#
+# The third is the one that matters. The first two are a performance feature;
+# the third is the reason the performance feature is allowed to exist.
+
+
+def mutable_groups(manifest: dict) -> list:
+    """Manifest groups whose members are ordinary single-named files.
+
+    Hardlinked members share an inode, so writing to one name writes to all of
+    them, which is not the experiment. Widest groups first, and ties broken by
+    name, so the same corpus always gets the same treatment.
+    """
+    out = [g for g in manifest["groups"]
+           if len(g["members"]) >= 2 and all(len(m["names"]) == 1
+                                             for m in g["members"])]
+    return sorted(out, key=lambda g: (-len(g["members"]),
+                                      g["members"][0]["names"][0]))
+
+
+def without_member(groups: list, target: dict, name: str) -> list:
+    """The manifest's groups as they should read once `name` stops matching."""
+    out = []
+    for g in groups:
+        if g is not target:
+            out.append(g)
+            continue
+        left = [m for m in g["members"] if name not in m["names"]]
+        if len(left) > 1:
+            out.append(dict(g, members=left))
+    return out
+
+
+def rewrite(path: str, filler: bytes, keep_mtime: bool) -> None:
+    """Replace a file's contents with something else of exactly the same length.
+
+    Same length on purpose: a file that changed size would be dropped by the
+    size bucketing before any cached digest could be consulted, which would
+    prove nothing about the cache at all.
+    """
+    st = os.stat(path)
+    body = (filler * (st.st_size // len(filler) + 1))[:st.st_size]
+    with open(path, "r+b") as fh:
+        fh.write(body)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if keep_mtime:
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    after = os.stat(path)
+    if after.st_size != st.st_size:
+        raise Fatal("rewrite changed the size of {}".format(path))
+    if keep_mtime and after.st_mtime_ns != st.st_mtime_ns:
+        raise Fatal("could not restore mtime_ns on {}".format(path))
+
+
+def rescan_gate(dedup_path: str, volume: str, base: str, manifest: dict) -> tuple:
+    """-> (verdict, cold_bytes, warm_bytes)."""
+    tree = os.path.join(base, "tree")
+    cache = os.path.join(STATE, "rescan-cache")
+    shutil.rmtree(cache, ignore_errors=True)
+    min_size = manifest["min_size"]
+
+    def fail(what, why):
+        return ("fail: {} — {}".format(what, why), None, None)
+
+    groups = mutable_groups(manifest)
+    if len(groups) < 2:
+        return fail("setup", "corpus has fewer than two mutable groups")
+
+    # ── phase 1: cold ────────────────────────────────────────────────────
+    cold = measure(dedup_path, tree, volume, min_size, cache_dir=cache)
+    reason = check(manifest, cold)
+    if reason:
+        return fail("cold scan", reason)
+    if any(g.get("attested") for g in cold["groups"]):
+        return fail("cold scan", "a group was attested with an empty cache")
+    cold_bytes = cold["bytes_instrumented"]
+    if not cold_bytes:
+        return fail("cold scan", "read nothing at all")
+
+    # ── phase 2: warm ────────────────────────────────────────────────────
+    warm = measure(dedup_path, tree, volume, min_size, cache_dir=cache)
+    reason = check(manifest, warm, byte_floor=False)
+    if reason:
+        return fail("warm scan", reason)
+    warm_bytes = warm["bytes_instrumented"]
+    ratio = warm_bytes / cold_bytes
+    if ratio >= WARM_CEILING:
+        return ("fail: warm scan — read {} of the cold scan's {} ({:.1%}), "
+                "which is not a re-scan cache".format(
+                    human(warm_bytes), human(cold_bytes), ratio), None, None)
+    if not any(g.get("attested") for g in warm["groups"]):
+        return fail("warm scan", "nothing was attested, so nothing was cached")
+
+    # ── phase 3a: an ordinary edit ───────────────────────────────────────
+    edited = groups[0]
+    edited_name = edited["members"][0]["names"][0]
+    rewrite(os.path.join(tree, edited_name), b"\x5a\xa5", keep_mtime=False)
+    expect = without_member(manifest["groups"], edited, edited_name)
+
+    after = measure(dedup_path, tree, volume, min_size, cache_dir=cache)
+    reason = check(dict(manifest, groups=expect), after, byte_floor=False)
+    if reason:
+        return fail("after an edit", reason)
+    if not after["bytes_instrumented"]:
+        return fail("after an edit", "the edited file was never re-read")
+
+    # ── phase 3b: a forged mtime, and then the deletion path ─────────────
+    #
+    # The cache cannot see this one and is not expected to: the key it
+    # remembers still matches. The warm scan will group these files wrongly,
+    # by design. Everything now rests on the deletion path reading the bytes.
+    poisoned = groups[1]
+    poison_names = [m["names"][0] for m in poisoned["members"]]
+    victim = poison_names[0]
+    rewrite(os.path.join(tree, victim), b"\xde\xad\xbe\xef", keep_mtime=True)
+
+    lied = measure(dedup_path, tree, volume, min_size, cache_dir=cache)
+    if not lied.get("ok"):
+        return fail("poisoned scan", lied.get("error", "?"))
+    still = [g for g in lied["groups"]
+             if g.get("attested") and any(victim in m["names"] for m in g["members"])]
+    if not still:
+        return fail("poisoned scan",
+                    "the poisoned group was not reported, so the refusal below "
+                    "would prove nothing")
+
+    before = {n: os.path.getsize(os.path.join(tree, n)) for n in poison_names}
+    env = scan_env(cache)
+    env["HOME"] = os.path.join(STATE, "home")
+    try:
+        out = run([sys.executable, dedup_path, tree, "--auto", "shortest", "-y",
+                   "--hard", "--min-size", str(min_size)],
+                  timeout=DELETE_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return fail("deletion", "dedup --auto timed out")
+    said = out.stdout + out.stderr
+    if out.returncode != 0:
+        return fail("deletion", "dedup --auto exited {} ({})".format(
+            out.returncode, said.strip()[-200:]))
+
+    for name in poison_names:
+        path = os.path.join(tree, name)
+        if not os.path.isfile(path):
+            return fail("deletion",
+                        "deleted {} out of a group whose copies do not "
+                        "match".format(name))
+        if os.path.getsize(path) != before[name]:
+            return fail("deletion", "{} was modified".format(name))
+    if "Refusing" not in said:
+        return fail("deletion",
+                    "kept the poisoned files but never said why; a refusal "
+                    "nobody is told about is a bug waiting to be reported")
+
+    return ("pass", cold_bytes, warm_bytes)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -373,7 +611,11 @@ def render(results: dict) -> str:
             continue
         b, s, m = entry["bytes"], entry["seconds"], entry["maxrss_mb"]
         rows.append((
-            name,
+            # rescan has no baseline to compare against — the baseline dedup.py
+            # has no cache at all. Its two byte columns are its own cold and
+            # warm scans, which makes the ratio column the number this whole
+            # scenario exists to report.
+            "rescan warm/cold" if name == "rescan" else name,
             entry["gate"] if entry["gate"] in ("pass", "skipped") else "FAIL",
             human(b["current"]), human(b["baseline"]), ratio(b["current"], b["baseline"]),
             "-" if s["current"] is None else "{:.3f}".format(s["current"]),
@@ -395,6 +637,48 @@ def render(results: dict) -> str:
 # selftest
 # ─────────────────────────────────────────────────────────────────────────────
 
+SOURCE_SABOTAGE = {
+    # Take the cache's word for it and delete without comparing. This is the
+    # single mistake that would turn the re-scan cache from a speed feature
+    # into a way of losing files, so the rescan gate has to catch it.
+    "skip-attested-verify":
+        "def verify_attested(groups, solid=None, cache=None):\n"
+        "    return list(groups), []\n",
+}
+
+
+def sabotaged_dedup(dedup_path: str, mode: str) -> str:
+    """Write a copy of dedup.py with one thing deliberately broken.
+
+    The deletion path runs as a real command line, so a sabotage that only
+    lives in the measuring process cannot reach it. This one goes into the
+    source, just above the entry point, where it overrides the real thing.
+    """
+    with open(dedup_path) as fh:
+        source = fh.read()
+    anchor = '\nif __name__ == "__main__":'
+    if anchor not in source:
+        raise Fatal("cannot sabotage {}: no entry point to patch above"
+                    .format(dedup_path))
+    os.makedirs(STATE, exist_ok=True)
+    out = os.path.join(STATE, "sabotaged-{}.py".format(mode))
+    with open(out, "w") as fh:
+        fh.write(source.replace(anchor, "\n\n" + SOURCE_SABOTAGE[mode] + anchor, 1))
+    return out
+
+
+def ensure_corpus(volume: str, name: str, scale: str, seed: int, factor: float,
+                  rebuild: bool = False) -> tuple:
+    """(base directory, manifest), building the corpus if it is not usable."""
+    base = corpus.corpus_dir(volume, name, scale, seed)
+    manifest = None if rebuild else corpus.load(volume, name, scale, seed)
+    if manifest is None or manifest.get("factor") != factor:
+        shutil.rmtree(base, ignore_errors=True)
+        ensure_space(volume, int(corpus.estimated_bytes(name, factor) * 1.4), {base})
+        manifest = corpus.build(volume, name, seed, scale, factor)
+    return base, manifest
+
+
 def selftest(dedup_path: str, volume: str, seed: int) -> int:
     """Break the tool on purpose and insist the gates notice.
 
@@ -404,11 +688,7 @@ def selftest(dedup_path: str, volume: str, seed: int) -> int:
     """
     name, scale = "samesize", "smoke"
     factor = corpus.SCALES[scale]
-    base = corpus.corpus_dir(volume, name, scale, seed)
-    manifest = corpus.load(volume, name, scale, seed)
-    if manifest is None or manifest.get("factor") != factor:
-        ensure_space(volume, int(corpus.estimated_bytes(name, factor) * 1.4), {base})
-        manifest = corpus.build(volume, name, seed, scale, factor)
+    base, manifest = ensure_corpus(volume, name, scale, seed, factor)
     tree = os.path.join(base, "tree")
 
     print("selftest: scenario {} at {} scale\n".format(name, scale))
@@ -438,6 +718,33 @@ def selftest(dedup_path: str, volume: str, seed: int) -> int:
     caught = gap > BYTE_TOLERANCE and check(manifest, lying) is not None
     print("\n  underreport-bytes           {}".format("caught" if caught else "MISSED"))
     print("      byte gap {:.1%} against a {:.0%} tolerance".format(gap, BYTE_TOLERANCE))
+    passed &= caught
+
+    # The re-scan gate, twice: once honest, to show the gate can be satisfied,
+    # and once with the deletion-time comparison removed, to show it cannot be
+    # satisfied without it. A corpus is rebuilt for each, because the gate
+    # deletes from what it scans.
+    print("\nselftest: scenario rescan at smoke scale\n")
+    rfactor = corpus.SCALES["smoke"]
+    base, manifest = ensure_corpus(volume, "rescan", "smoke", seed, rfactor,
+                                   rebuild=True)
+    verdict, cold, warm = rescan_gate(dedup_path, volume, base, manifest)
+    ok = verdict == "pass"
+    print("  control, no sabotage        {}".format(
+        "clean" if ok else "UNEXPECTED FAILURE: {}".format(verdict)))
+    if ok:
+        print("      warm read {} against a cold {} ({:.2%})".format(
+            human(warm), human(cold), warm / cold if cold else 0))
+    passed &= ok
+
+    base, manifest = ensure_corpus(volume, "rescan", "smoke", seed, rfactor,
+                                   rebuild=True)
+    verdict, _, _ = rescan_gate(sabotaged_dedup(dedup_path, "skip-attested-verify"),
+                                volume, base, manifest)
+    caught = verdict.startswith("fail")
+    print("\n  skip-attested-verify        {}".format("caught" if caught else "MISSED"))
+    print("      {}".format(verdict if caught else
+                            "deletion skipped the comparison and nothing fired"))
     passed &= caught
 
     print("\nselftest {}".format("passed" if passed else "FAILED"))
@@ -510,8 +817,9 @@ def _run(args) -> int:
     for name in names:
         base = corpus.corpus_dir(root, name, args.scale, args.seed)
         manifest = corpus.load(root, name, args.scale, args.seed)
-        # The deletion scenario destroys what it scans, so it is never reused.
-        if manifest is None or manifest.get("factor") != factor or name == "deletion":
+        # deletion and rescan both destroy what they scan, so neither is reused.
+        if (manifest is None or manifest.get("factor") != factor
+                or name in ("deletion", "rescan")):
             # Out with the old first: the space it is holding is the space the
             # replacement needs.
             shutil.rmtree(base, ignore_errors=True)
@@ -524,7 +832,8 @@ def _run(args) -> int:
         manifests[name] = manifest
 
     gates = {"pytest": "skipped", "correctness": "pass",
-             "deletion": "skipped", "adversarial": "skipped"}
+             "deletion": "skipped", "adversarial": "skipped",
+             "rescan": "skipped"}
 
     if not args.no_tests:
         print("\nbench: pytest gate ...", end=" ", flush=True)
@@ -545,6 +854,18 @@ def _run(args) -> int:
             gates["deletion"] = deletion_gate(dedup_path, root, base, manifest)
             print(gates["deletion"] if gates["deletion"] == "pass" else "FAILED")
             scenarios[name] = blank_entry(gates["deletion"])
+            continue
+
+        if name == "rescan":
+            print("\nbench: rescan gate ...", end=" ", flush=True)
+            verdict, cold, warm = rescan_gate(dedup_path, root, base, manifest)
+            gates["rescan"] = verdict
+            print("pass" if verdict == "pass" else "FAILED")
+            if verdict != "pass":
+                print("    {}".format(verdict))
+            entry = blank_entry(verdict)
+            entry["bytes"] = {"current": warm, "baseline": cold}
+            scenarios[name] = entry
             continue
 
         timed = manifest["timed"]
@@ -619,6 +940,14 @@ def _run(args) -> int:
                 print("  {}: {}".format(key, value))
     else:
         print(render(scenarios))
+        entry = scenarios.get("rescan")
+        if entry and entry["bytes"]["baseline"]:
+            warm, cold = entry["bytes"]["current"], entry["bytes"]["baseline"]
+            print("\nre-scan: a warm scan of an unchanged corpus read {} where "
+                  "the cold scan read {} ({:.2%}).".format(
+                      human(warm), human(cold), warm / cold))
+            print("         Every group it reported from memory is still read "
+                  "and compared before anything is deleted.")
     print("\nverdict: {}   ({})".format(verdict, os.path.join(STATE, "results.json")))
     return 0 if verdict == "pass" else 1
 

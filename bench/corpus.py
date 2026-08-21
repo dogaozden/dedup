@@ -490,6 +490,11 @@ SCENARIOS = {
     "widegroup":   (1,             True,  _widegroup),
     "adversarial": (1,             False, _adversarial),
     "deletion":    (1,             False, _deletion),
+    # The re-scan scenario has no shape of its own on purpose: it is the
+    # `photos` corpus, scanned twice and then interfered with. Its own name
+    # only buys it its own directory, so mutating it cannot disturb the
+    # scored run of the same profile.
+    "rescan":      (1 << 20,       False, _photos),
 }
 
 # Rough on-disk cost, used only to refuse to start a corpus that will not fit.
@@ -504,6 +509,7 @@ ESTIMATE = {
     "widegroup":   (20e6, 145e6),
     "adversarial": (14e6, 14e6),
     "deletion":    (10e6, 70e6),
+    "rescan":      (60e6, 430e6),
 }
 
 

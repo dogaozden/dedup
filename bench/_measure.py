@@ -136,6 +136,10 @@ def main() -> int:
     ap.add_argument("--volume", required=True, help="corpus volume, for the tripwire")
     ap.add_argument("--min-size", type=int, required=True)
     ap.add_argument("--sabotage", default=None)
+    ap.add_argument("--cache-dir", default=None,
+                    help="scan with the re-scan cache kept here. Without it "
+                         "the scan gets no cache at all, which is how every "
+                         "scored scenario is measured.")
     args = ap.parse_args()
 
     tree = os.path.abspath(args.root)
@@ -151,14 +155,27 @@ def main() -> int:
         jobs = mod.read_jobs([tree], None)
         solid = mod.is_solid_state(tree)
 
+        # No --cache-dir means no cache object at all, and the keyword is not
+        # even passed — so this drives an older dedup.py that has never heard
+        # of a cache exactly as it always did.
+        cache = None
+        extra = {}
+        if args.cache_dir:
+            if not hasattr(mod, "ScanCache"):
+                raise RuntimeError("{} has no ScanCache".format(args.dedup))
+            cache = mod.ScanCache(args.cache_dir)
+            extra["cache"] = cache
+
         stats = mod.ScanStats()
         tally, tripwire, restore = instrument(tree, os.path.abspath(args.volume))
         try:
             started = time.perf_counter()
             groups = mod.find_duplicates(
                 [tree], excludes=[], min_size=args.min_size, jobs=jobs,
-                stats=stats, verify=False, reporter=None, walkers=None,
+                stats=stats, verify=False, reporter=None, walkers=None, **extra
             )
+            if cache is not None:
+                cache.close()      # writing it back is part of the scan's cost
             seconds = time.perf_counter() - started
         finally:
             restore()
@@ -185,6 +202,9 @@ def main() -> int:
             "groups": [
                 {
                     "size": g.size,
+                    # False on any dedup.py that predates the cache, which is
+                    # exactly what it means there: everything was read.
+                    "attested": bool(getattr(g, "attested", False)),
                     "members": [
                         {"names": [relative(n, tree) for n in rec.all_names],
                          "deletable": rec.deletable}

@@ -117,16 +117,27 @@ Exit codes:
   the one in the tree. This is how you try an idea without committing it.
 - `--selftest` — proves the gates still catch sabotage. Run it after any change
   you make to anything under `bench/`.
-- `--root PATH` — override the RAM disk location.
+- `--root PATH` — override the RAM disk location. Any existing writable
+  directory will do, including one on the boot disk: the gates are entirely
+  valid there and it is the quickest way to check them. Timings taken there are
+  not, and the run says so on its first line.
 
 ### Scenarios
 
 `typical`, `photos`, `bigheader`, `needle`, `samesize`, `widegroup`,
-`adversarial`, `deletion`.
+`adversarial`, `deletion`, `rescan`.
 
-The last two — `adversarial` and `deletion` — are untimed. They are gate-only:
-they prove the tool is still correct and still safe, and they produce no
-performance numbers.
+The last three — `adversarial`, `deletion` and `rescan` — are untimed. They are
+gate-only: they prove the tool is still correct and still safe, and they produce
+no performance numbers.
+
+`rescan` is the re-scan cache's scenario, and the only one that runs with the
+cache on. It reuses the `photos` profile under a name of its own so that
+mutating it cannot disturb the scored `photos` run. It scans cold, scans warm,
+edits a file, then forges one — and finishes by driving the real deletion path
+at a group the cache is wrong about. It reports one number, the warm/cold byte
+ratio, in the `cur/base` column: those two columns are its own two scans, not a
+baseline comparison, because the baseline has no cache to compare against.
 
 ### Corpus layout
 
@@ -174,7 +185,11 @@ correctness:
   of its members end to end. The harness sums `size × members` over the true
   groups and fails the run if the bytes it counted come in under that —
   nothing is allowed to be reported as a duplicate on the strength of a
-  cached answer, a sample, or a read that never happened.
+  sample or a read that never happened. Every scored scenario runs with the
+  re-scan cache switched off, so this floor applies to all of them at full
+  force. The single exception is the warm half of `rescan`, which is cache-on
+  by design and where reading nothing is the point; it answers to a stricter
+  pair of demands instead (section 5).
 - **The setup ceiling.** More than 2 seconds between process start and the
   scan actually starting fails the run. Work done before the timer starts
   does not get to disappear from the number.
@@ -267,17 +282,42 @@ differ in between. A tool that deletes files does not guess.
 **At least one survivor per group, always, enforced by the tool itself.** Not by
 the user being careful. Not by the UI making it awkward. The code refuses.
 
-**No persistent cache between runs.** No mtime/inode digest cache, no
-`~/.cache/dedup`, no sidecar index, nothing that carries a conclusion from one
-scan to the next. A deletion tool must prove identity fresh on every scan. Be
-clear-eyed about this one: a cache **would score enormously** on this benchmark,
-because the benchmark runs the same corpus repeatedly. It is **forbidden**. If
-you find yourself reasoning toward "we could remember that these matched last
-time", stop and write the idea in the log as rejected. The harness backs this
-up mechanically: the byte floor (section 3) requires every reported group's
-members to be read in full, in this process, this scan. A cache that skipped
-a read to score better fails that check before it gets the chance to look
-fast.
+**The cache may narrow. It may never prove.** There is a persistent re-scan
+cache now — digests remembered against `(inode, size, mtime_ns)` in a per-volume
+sqlite file. It exists to let a stage skip a read. It does not exist to let a
+file be deleted. The line between those two is the whole feature, and it is
+drawn in four places that all have to hold:
+
+- **Deletion always byte-verifies.** A group matched from remembered digests is
+  reported as *attested*, not proved. Before anything in it is trashed or hard
+  deleted — in `--auto` and in the browser's apply path alike — its members are
+  read and compared in that process, on that run. On a mismatch the whole group
+  is refused, said out loud, and its entries are discarded. The net guarantee is
+  the one that was always true: **no file is deleted without its bytes having
+  been compared this run.** Weakening this is not an optimisation, it is the
+  bug.
+- **The six scored scenarios run cache-off, forever.** They pass no cache
+  directory, so no cache object is ever constructed, and `DEDUP_CACHE_DIR` is
+  pointed at a throwaway path regardless. Their byte floor is untouched and
+  untouchable. This is what keeps every score comparable with every score taken
+  before the cache existed — including the baseline, which has no cache at all.
+  Do not "improve" a scored scenario by letting it remember anything.
+- **The `rescan` gates may not be weakened.** Cold reads everything, with the
+  byte floor in full force. Warm must return *exactly* the manifest's answer for
+  under 5% of the cold bytes. And the poison case — a file rewritten with its
+  size and `mtime_ns` restored, which the cache genuinely cannot see — must end
+  with the tool **refusing to delete from that group and saying so**. That
+  refusal is the price of admission for the whole feature. `--selftest` removes
+  the deletion-time comparison on purpose and requires the gate to catch it.
+- **The warm/cold ratio is a metric, not a gate.** Driving it down is fair game
+  and it is reported in the table. Driving it down by skipping the deletion-time
+  comparison is not an improvement to it; it is a different program.
+
+Be clear-eyed about the trap here, because it has not gone away: a cache
+**scores enormously** on a benchmark that runs the same corpus repeatedly. That
+is exactly why the scored scenarios do not get one. If you find yourself
+reasoning toward "we could let `typical` remember that these matched last time",
+stop and write the idea in the log as rejected.
 
 **Standard library only.** No third-party packages, ever. Python 3.9+
 compatible. `dedup.py` is a single file and stays a single file — no new
