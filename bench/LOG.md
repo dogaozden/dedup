@@ -1,4 +1,7 @@
-# Optimization log — branch `opus`
+# Optimization log — round one
+
+Both optimizers' journals, merged onto `main`. Branch `opus` first, then
+branch `luna` under its own heading at the end.
 
 ## Stop summary — 2026-08-22
 
@@ -462,3 +465,200 @@ interacted, and measuring one before the other existed made a clean win look
 like a trade. When an optimization is rejected for a regression, it is worth
 re-testing it against the tip after anything else lands nearby — a rejection is
 only valid against the tree it was measured on.
+
+---
+
+## Round one, branch `luna` — appended verbatim
+
+Two optimizers ran the `GOAL.md` loop against the pinned baseline `012acc4`
+at the same time, on separate branches and separate worktrees; the preamble
+above has the arrangement. Everything before this line is `opus`. Everything
+after it is `luna`'s log, moved here unchanged (its headings demoted one
+level to sit under this one) when `main` took `luna`'s `a77e106` and stopped
+`luna` being a branch anyone would think to read.
+
+It is kept for the rejections as much as the wins. `luna` measured and threw
+away dictionary grouping in `partition_blocks`, lazy-loading `curses`, and a
+256 KiB `BULK_BUF` — and the first of those was later reopened on `opus` and
+kept, once a guard was found that made it win. Read section 4 of `GOAL.md`
+on why a rejection only holds against the tree it was measured on before
+re-running any of these.
+
+### Stop summary — 2026-08-22
+
+Three consecutive ideas after the first kept win were tested and rejected, so
+the optimization loop stops here.
+
+**Kept:** `a77e106` (`perf: skip stage-3 head during sampling`) removes the
+stage-3 64 KiB head reread from the first deep sample. On the full seed-1
+measurement it holds bytes on typical, photos, needle, and widegroup, and
+reduces bigheader from 296.5 MB to 296.0 MB and samesize from 348.4 MB to
+348.2 MB. Its recorded seed-1 time/RSS changes were mixed and below the
+decision threshold overall; seed 2 reproduced the byte reductions. The
+cumulative kept result is therefore a deterministic byte reduction with no
+byte regression, no broad time claim, and mixed RSS movement.
+
+**Rejected:** dictionary grouping for stage-5 blocks made default-scale
+samesize 0.13x the baseline but made photos 3.13x, bigheader 3.67x, and
+widegroup 1.76x slower; lazy curses loading produced no meaningful time win;
+and a 256 KiB bulk-directory buffer produced no smoke-scale time win while
+making needle 1.06x slower. All three passed correctness and deletion gates,
+were reverted, and are retained below with their measurements.
+
+**Next place to look:** stage-4 sample geometry or adaptive head sizing, then
+stage-5 scheduling across many small groups. Flash-specific walk and reader
+paths remain unmeasured on this conservative benchmark profile and would need
+coverage before being treated as wins.
+
+### 2026-08-21 — Baseline and briefing log filename discrepancy
+
+**Hypothesis:** Establish an unmodified reference before testing optimizations.
+
+**Change:** The briefing requires `bench/LOG.md`, but this checkout contained
+only `bench/GOAL.md`; this journal was added to resolve that discrepancy. The
+tree was verified on branch `luna`, and the stale factor-1.0 generated corpus
+was rebuilt by the harness for the current factor-1.0 run.
+
+**Numbers:**
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  108.7 MB   108.7 MB    1.00x     0.449    0.478     0.94x     53       51
+photos       pass  150.8 MB   150.8 MB    1.00x     0.029    0.043     0.68x     145      146
+bigheader    pass  296.5 MB   296.5 MB    1.00x     0.031    0.031     1.00x     109      112
+needle       pass  244.1 MB   244.1 MB    1.00x     4.042    4.092     0.99x     277      308
+samesize     pass  348.4 MB   348.4 MB    1.00x     1.619    1.663     0.97x     219      284
+widegroup    pass  158.8 MB   158.8 MB    1.00x     0.062    0.064     0.97x     152      152
+```
+
+**Verdict:** BASELINE — no optimization tested yet; full harness exited 0.
+
+### 2026-08-21 — Skip the stage-3 head in the first deep sample
+
+**Hypothesis:** Stage 3 already reads the first 64 KiB of every candidate, but
+stage 4 rereads that region as part of its first 1 MiB sample. Starting that
+sample at `HEAD_BYTES` and reading 64 KiB less should reduce disk bytes without
+changing the exact stage-5 proof.
+
+**Change:** `hash_sample()` now reads 960 KiB from offset 64 KiB for its first
+deep point, keeps the other three 1 MiB points unchanged, and subtracts the
+saved 64 KiB from `sampled_bytes()`.
+
+**Numbers:** Smoke seed 1 passed all gates; `bigheader` was 112.0 MB current vs
+112.5 MB baseline and `samesize` was 75.8 MB vs 75.9 MB. Full seed 1:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  108.7 MB   108.7 MB    1.00x     0.463    0.456     1.02x     53       52
+photos       pass  150.8 MB   150.8 MB    1.00x     0.024    0.024     0.97x     149      149
+bigheader    pass  296.0 MB   296.5 MB    1.00x     0.036    0.042     0.86x     112      109
+needle       pass  244.1 MB   244.1 MB    1.00x     4.095    4.140     0.99x     312      301
+samesize     pass  348.2 MB   348.4 MB    1.00x     1.695    1.683     1.01x     284      284
+widegroup    pass  158.8 MB   158.8 MB    1.00x     0.056    0.055     1.01x     152      153
+```
+
+Full seed 2:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  121.8 MB   121.8 MB    1.00x     0.539    0.544     0.99x     57       57
+photos       pass  152.0 MB   152.0 MB    1.00x     0.024    0.025     0.96x     159      158
+bigheader    pass  296.0 MB   296.5 MB    1.00x     0.032    0.035     0.92x     112      109
+needle       pass  244.2 MB   244.2 MB    1.00x     4.194    4.340     0.97x     312      301
+samesize     pass  348.5 MB   348.6 MB    1.00x     1.724    1.728     1.00x     284      284
+widegroup    pass  158.8 MB   158.8 MB    1.00x     0.057    0.055     1.03x     152      152
+```
+
+**Verdict:** KEPT (commit `a77e106`); all gates passed, bytes strictly improved
+or held on every scenario, and the reduction reproduced on seed 2.
+
+### 2026-08-21 — Dictionary grouping for stage-5 block partitions
+
+**Hypothesis:** The `samesize` corpus sends about 1,400 members through the
+pivot-based `partition_blocks()` loop. Grouping by the complete block bytes in
+a dictionary should avoid its O(n²) comparisons while remaining exact because
+dictionary equality verifies byte strings after hashing.
+
+**Change:** Replaced the pivot/rest partition loop with dictionary grouping in
+the WIP copy only. No repository code from this attempt was retained.
+
+**Numbers:** Smoke seed 1 passed all gates:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  7.2 MB     7.2 MB      1.00x     0.031    0.029     1.05x     25       25
+photos       pass  33.5 MB    33.5 MB     1.00x     0.020    0.008     2.55x     50       50
+bigheader    pass  112.0 MB   112.5 MB    1.00x     0.057    0.022     2.60x     104      102
+needle       pass  23.4 MB    23.4 MB     1.00x     0.333    0.353     0.95x     46       46
+samesize     pass  75.8 MB    75.9 MB     1.00x     0.046    0.034     1.34x     84       84
+widegroup    pass  18.1 MB    18.1 MB     1.00x     0.017    0.012     1.39x     31       31
+```
+
+The targeted default-scale `samesize` run passed with 348.2 MB current vs
+348.4 MB baseline, 0.215 seconds current vs 1.663 seconds baseline, and 278 MB
+current vs 220 MB baseline RSS. The complete default seed-1 run passed all
+gates:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  108.7 MB   108.7 MB    1.00x     0.489    0.485     1.01x     52       51
+photos       pass  150.8 MB   150.8 MB    1.00x     0.078    0.025     3.13x     146      146
+bigheader    pass  296.0 MB   296.5 MB    1.00x     0.123    0.034     3.67x     112      108
+needle       pass  244.1 MB   244.1 MB    1.00x     4.047    4.097     0.99x     305      304
+samesize     pass  348.2 MB   348.4 MB    1.00x     0.221    1.723     0.13x     284      284
+widegroup    pass  158.8 MB   158.8 MB    1.00x     0.103    0.058     1.76x     152      152
+```
+
+**Verdict:** REVERTED — the targeted `samesize` win was outweighed by large
+time regressions on `photos`, `bigheader`, and `widegroup`, and there was no
+new byte reduction beyond the already-kept stage-3 head skip.
+
+### 2026-08-22 — Lazy-load curses for noninteractive scans
+
+**Hypothesis:** Every benchmark subprocess imports `curses` even though the
+noninteractive harness path never opens the browser. Deferring that import
+until immediately before `curses.wrapper()` might reduce startup time without
+changing scan behavior or bytes.
+
+**Change:** Removed the module-level import and loaded `curses` only in the
+interactive branch in the WIP copy. No repository code from this attempt was
+retained.
+
+**Numbers:** Smoke seed 1 passed all gates:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  7.2 MB     7.2 MB      1.00x     0.028    0.029     1.00x     25       25
+photos       pass  33.5 MB    33.5 MB     1.00x     0.008    0.008     1.00x     50       50
+bigheader    pass  112.0 MB   112.5 MB    1.00x     0.018    0.017     1.03x     104      101
+needle       pass  23.4 MB    23.4 MB     1.00x     0.326    0.316     1.03x     46       46
+samesize     pass  75.8 MB    75.9 MB     1.00x     0.032    0.032     1.02x     84       84
+widegroup    pass  18.1 MB    18.1 MB     1.00x     0.011    0.011     1.04x     31       31
+```
+
+**Verdict:** REVERTED — no scenario produced a meaningful time win and bytes
+held on every scenario.
+
+### 2026-08-22 — Double the bulk directory metadata buffer
+
+**Hypothesis:** The macOS `getattrlistbulk` walker uses a 128 KiB buffer. A
+256 KiB buffer might reduce metadata syscalls for the 100k-file `needle`
+scenario without changing file contents or byte accounting.
+
+**Change:** Changed `BULK_BUF` to 256 KiB in the WIP copy only. No repository
+code from this attempt was retained.
+
+**Numbers:** Smoke seed 1 passed all gates:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  7.2 MB     7.2 MB      1.00x     0.029    0.029     1.00x     25       25
+photos       pass  33.5 MB    33.5 MB     1.00x     0.008    0.008     0.96x     51       50
+bigheader    pass  112.0 MB   112.5 MB    1.00x     0.018    0.018     1.01x     104      101
+needle       pass  23.4 MB    23.4 MB     1.00x     0.330    0.311     1.06x     46       46
+samesize     pass  75.8 MB    75.9 MB     1.00x     0.034    0.034     0.99x     86       83
+widegroup    pass  18.1 MB    18.1 MB     1.00x     0.011    0.011     1.02x     31       31
+```
+
+**Verdict:** REVERTED — no scenario produced a meaningful time win and bytes
+held on every scenario.

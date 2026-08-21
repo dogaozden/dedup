@@ -1,8 +1,11 @@
 # GOAL — autonomous optimization of `dedup`
 
-You are luna. You have a shell on this Mac and write access to this repository.
-You have no prior context about it. This file is the whole briefing: the
-mission, the machine, the harness, the rules, and the map of the code.
+You are an optimizer. You have a shell on this Mac and write access to this
+repository, and you have no prior context about it. This file is the whole
+briefing: the mission, the machine, the harness, the rules, and the map of the
+code. (Round one was run by two of you, on branches `opus` and `luna`; both
+journals are on `main` in `bench/LOG.md`. Those are names in the history now,
+not names for you.)
 
 Read it all before you touch anything.
 
@@ -47,7 +50,7 @@ for the whole run — section 3 defines it. It is a way of reporting where you
 have got to, not a target to aim at: there is still no number to hit, and a
 score is worthless the moment a gate is red or bytes have regressed anywhere,
 which is why the harness refuses to print one in either case. `main` currently
-scores **~0.880**.
+scores **~0.849**.
 
 ---
 
@@ -148,27 +151,47 @@ timings (`adversarial` still reports bytes, so it sits behind the bytes veto
 like everything else).
 
 `prefixtrap` is timed and gated but deliberately **not scored** — see "The
-score" below. It exists to punish one specific idea. ~180 files, all exactly
-2 MiB, in three bands sharing a common prefix of 8, 24 and 56 KiB and then
-diverging on the very next byte. At the current `HEAD_BYTES` of 64 KiB every
-band's prefix fits inside the head, so stage 3 separates the lot for 64 KiB a
-file. Shrink the head below a band's prefix and that whole band arrives at
-stage 5 in one bucket and gets read in full. That shape — same-size files
-with a shared header — is what a folder of camera raws actually is.
+score" below. It exists to punish one specific idea: reading less of the head.
+~180 files, all exactly 2 MiB, in four bands sharing a common prefix of 2, 8,
+24 and 48 KiB and then diverging on the very next byte, plus a few true
+duplicate pairs. That shape — same-size files with a shared header — is what a
+folder of camera raws actually is, and no other scenario contains it.
 
-It is worth knowing how badly this was needed. Setting `HEAD_BYTES = 4096` and
-running the harness gives **every gate green** and this:
+The bands are aimed at stage 3's two tiers. The 2 KiB band is under
+`HEAD_BYTES`, so tier 1 settles it for one page a file. The other three sit
+between `HEAD_BYTES` and `DEEP_HEAD`, so tier 1 leaves them crowded and tier 2
+separates them for the rest of the 64 KiB. Pull `DEEP_HEAD` in below a band's
+prefix and that band is not separated at all: it arrives at stage 5 as a
+single bucket and is read far past the head. How far depends on how wide the
+bucket is — `compare_chunk` shrinks the round as members are added — so the
+bill is large but not always the whole file.
+
+It is worth knowing how badly this was needed. Cutting `DEEP_HEAD` to 4 KiB
+leaves **every gate green** and improves bytes almost everywhere:
 
 ```
-typical      0.54x bytes   photos     0.98x   bigheader  1.00x
-needle       1.00x bytes   samesize   0.76x   widegroup  0.81x
-prefixtrap  10.69x bytes  ← 384.8 MB against 36.0 MB
+typical      0.54x bytes   photos      0.98x   bigheader  1.00x
+needle       1.00x bytes   samesize    0.76x   widegroup  0.81x
+prefixtrap   3.33x bytes  ← 147.2 MB against 44.2 MB
 ```
 
-Six scenarios out of six say it is a large win — it would have scored
-**0.7576** against `main`'s 0.8802 — and it is a disaster on real photo
-libraries. Before `prefixtrap` existed the benchmark had nothing to say about
-that at all.
+Every scored scenario says it is a large win — it would have scored **0.7736**
+against `main`'s 0.8489, the biggest single move anyone has made — and it is a
+disaster on real photo libraries. Before `prefixtrap` existed the benchmark
+had nothing to say about that at all.
+
+**What the 2 KiB band can and cannot do.** It is a marker, not a trap.
+Shrinking tier 1 below 2 KiB drops that band through to tier 2 and hands the
+saving back, which you will see in the table as bytes rising — but it cannot
+void your score, and the reason is worth understanding. Losing tier-1
+separation costs at most the whole deep head, and paying the whole head on
+every candidate is exactly what the pinned baseline already did. So the number
+walks back up to 1.00x and stops. Measured at smoke: tier 1 cut to 1 KiB reads
+18.0 MB against a baseline of 18.0 MB — no regression, no veto — while
+`DEEP_HEAD` cut to 4 KiB reads 52.1 MB against the same 18.0 MB. **Nothing
+measured against a fixed baseline can veto giving back a win that baseline
+never had.** If you want tier 1 defended, that has to come from somewhere
+other than this rule.
 
 ### Corpus layout
 
@@ -232,7 +255,7 @@ None of these three has its own line in the gates dict — they surface as a
 as the very last line:
 
 ```
-SCORE: 0.8802
+SCORE: 0.8489
 ```
 
 It is the geometric mean, over **exactly six** scenarios, of
@@ -348,6 +371,20 @@ on this machine at all, log the idea and move on.
 changes bundled together is two changes you cannot attribute — and when the pair
 is a small win, you will never know which half won and which half was a
 regression cancelling it out.
+
+**A rejection is only valid against the tree it was measured on. Re-test
+rejected ideas after anything lands near them.** This is not a hypothetical.
+Round one measured the two-tier head, found it cost `widegroup` 1.30x wall
+time, and parked it on a branch as a cross-scenario trade. A later, unrelated
+change — batching the reads handed to each stage-3 worker — removed the cause,
+which had never been the extra open and seek it looked like but the second
+pass paying per-file future overhead. Re-measured on the new tree, `widegroup`
+came back at 1.01x, the trade was gone, and the change landed. The same thing
+happened to dictionary grouping in `partition_blocks`: rejected outright by
+one optimizer, kept by another once a fan-out guard was put in front of it.
+So when you reject something, log *why* in terms of the mechanism, not just
+the number — and when you change something, look back through `bench/LOG.md`
+for rejections that named the thing you just moved.
 
 **Keep the byte accounting honest.** `dedup` counts what it reads in
 `ScanStats.hashed_bytes`, and that is what the "read X% of them" summary line
@@ -589,11 +626,21 @@ should still be able to use the whole disk queue.
 
 ### Already on `main` — do NOT re-do these
 
-Round one landed three changes. `main` scores **0.8802** against the baseline
-pinned in `bench/baseline.lock`, and that is the line round two starts from.
-Everything here is already in the tree you are reading; re-proposing any of it
-is a wasted idea.
+Round one ran as two optimizers in parallel, on branches `opus` and `luna`,
+and landed five changes between them. Both journals are on `main` in
+`bench/LOG.md`. Everything here is already in the tree you are reading;
+re-proposing any of it is a wasted idea.
 
+- **The two-tier stage-3 head.** `HEAD_BYTES` is no longer the head — it is
+  now 4 KiB, one page, and `DEEP_HEAD` (64 KiB) is how far stage 3 extends
+  for the files that page left in a bucket with someone else. Those files
+  read only the part they have not already read, so no byte is read twice
+  and the head's discriminating power is exactly what it was. `typical`
+  108.7 MB → 73.1 MB. **Note the two names**: code and scenarios that used to
+  mean "the head" by `HEAD_BYTES` now have to say which tier they mean.
+- **Skipping the head in the first deep sample** (`hash_sample`). Stage 3 has
+  already hashed the first `HEAD_BYTES`, so stage 4's first window starts
+  after it instead of reading it again. Landed from `luna`.
 - **The group-order tie-break.** The final sort is `(-size, name, keeper path)`.
   The known-bug entry the idea menu used to carry is fixed.
 - **The partition fan-out guard.** `partition_blocks` keeps its pivot loop, but
@@ -611,11 +658,12 @@ is a wasted idea.
   one task per file. On `needle`'s hundred thousand small files the queueing
   cost was larger than the reads.
 
-**Still parked, not merged: the two-tier head**, on branch `opus-head-twotier`.
-It reads the head in two tiers and buys a real bytes win on some scenarios at
-a cost on others — a cross-scenario trade, which section 4 rule 2 says is the
-user's call and not the optimizer's. It is left on its branch on purpose.
-Do not merge it, and do not re-derive it and present it as new.
+**Branch `opus-head-twotier` is superseded, not pending.** It holds the first
+form of the two-tier head, from before `hash_stage` was batched, when the idea
+still cost `widegroup` 1.30x wall time and was parked as a cross-scenario
+trade. Batching removed that cost and the change landed properly on `main`.
+The branch is kept only as the record of a rejection that stopped being true —
+see the rule about that in section 4. Do not merge it.
 
 ---
 
@@ -627,14 +675,24 @@ measured, not a known win. Several will turn out to be losses — log those too.
 - **Stage-4 sample count and placement.** Is 4 points × 1 MB the right shape? Is
   it right for every size class? Fewer, larger samples? More, smaller? Different
   offsets — the current spread is uniform, and real file formats are not.
-- **The head double-read.** Stage 3 reads the first 64 KiB. Stage 4's first
-  sample point starts at offset 0 and reads 1 MiB, covering those same 64 KiB
-  again. That is a real, countable duplicate read on every large candidate.
-- **Adaptive `HEAD_BYTES` by size class.** 64 KiB is one number for a 10 MB file
-  and a 10 GB file. Read the `prefixtrap` scenario before you start: making the
-  head *smaller* is not the free win the other scenarios make it look like, and
-  `prefixtrap` will veto your score if you try. Making it bigger, or making it
-  grow with the file, is still open.
+- **~~The head double-read.~~ DONE, on `main`, but only a quarter of it** —
+  and the rest is sitting there. `hash_sample` now starts its first window at
+  `HEAD_BYTES` instead of offset 0. That was worth 64 KiB a file when it was
+  measured, because `HEAD_BYTES` was the whole head. It is 4 KiB now, so it
+  saves 4 KiB a file: `bigheader` went 310,902,784 → 310,870,016 bytes,
+  exactly 8 files × 4 KiB, where the same change on the old tree was worth
+  8 × 64 KiB. **The obvious follow-up is to skip `DEEP_HEAD` rather than
+  `HEAD_BYTES`**, and the argument that it is safe is short: every file that
+  reaches stage 4 was crowded after tier 1, so it went through tier 2, so all
+  of `[0, DEEP_HEAD)` has already been hashed into its stage-3 digest.
+  Unmeasured — nobody has run it. Measure it before you believe it, and mind
+  that `sampled_bytes` has to move with it or the byte-honesty gate will
+  fire.
+- **Adaptive head size by size class.** 4 KiB then 64 KiB is one pair of
+  numbers for a 10 MB file and a 10 GB file. Read the `prefixtrap` scenario
+  before you start: pulling `DEEP_HEAD` *in* is not the free win the other
+  scenarios make it look like, and `prefixtrap` will veto your score for it.
+  Making either tier bigger, or making them grow with the file, is open.
 - **Chunk-size autotuning per device**, rather than the two hardcoded values.
 - **Walk parallelism on flash.** `walk_workers()` caps at 4. Verify that cap
   still holds on this CPU, both by measurement and via `-p`.
@@ -761,16 +819,16 @@ that apart from an honest repair. The user will look at it.
 cd /Users/dogaozden/AI_Projects/dedup
 git checkout -b <your-branch>
 python3 -m pytest tests/ -q          # expect: 119 passed
-python3 bench/run.py --score         # expect: exit 0, a table, SCORE: ~0.880
+python3 bench/run.py --score         # expect: exit 0, a table, SCORE: ~0.849
 ```
 
 If the pytest count is not 119, or the starting score is not somewhere around
-0.880 on an unmodified tree, you have an environment problem, not an
+0.849 on an unmodified tree, you have an environment problem, not an
 optimization problem. Log it and stop. ("Around" is doing real work there —
 see "How much it wobbles" in section 3. Observed: 0.8802 and 0.8791.)
 
-That ~0.880 is the line you are trying to get below. It is not the baseline —
+That ~0.849 is the line you are trying to get below. It is not the baseline —
 the baseline is the older `dedup.py` pinned in `bench/baseline.lock`, which is
 what scores 1.0000 and what every ratio in the table is against. `main` is
-already 12% under it. Round one got it there; the numbers are in
+already about 15% under it. Round one got it there; the numbers are in
 "Already on `main`" in section 6 and the working is in `bench/LOG.md`.
