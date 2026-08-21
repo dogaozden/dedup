@@ -6,6 +6,10 @@ mission, the machine, the harness, the rules, and the map of the code.
 
 Read it all before you touch anything.
 
+If this document ever contradicts the code or the harness, the code is right and
+this document is stale — log the discrepancy in `bench/LOG.md` and trust what
+runs.
+
 The repository is at `/Users/dogaozden/AI_Projects/dedup`. All paths below are
 relative to it unless written out in full.
 
@@ -187,7 +191,11 @@ A change counts as a win only when all of these hold:
 1. The full suite exits `0`.
 2. **Bytes read strictly improve or hold on every scenario.** Bytes are
    deterministic. There is no noise to hide behind. Any bytes regression on any
-   scenario is real, and it disqualifies the change.
+   scenario is real, and it disqualifies the change. If you believe a
+   cross-scenario trade is genuinely justified — a large win on one scenario
+   bought with a small regression on another — do not keep it. Log it in
+   `bench/LOG.md` with the full table and leave the change on an unmerged
+   branch for the user to judge. That is the only path for such a trade.
 3. A time win is only a time win at **≥5%**. Below that it is noise on this
    machine. Do not keep a change on the strength of a 2% timing improvement.
 4. The win reproduces at `--seed 2`. A win that only exists on seed 1 is a win
@@ -195,6 +203,22 @@ A change counts as a win only when all of these hold:
 5. Every number you write in a commit message or in `bench/LOG.md` is copied
    from harness output. Never estimate, never round from memory, never write
    "roughly 20% faster" because it felt faster.
+
+**When bytes and time disagree.** A change that reads fewer bytes but runs
+slower here will happen — sparser sampling costs seeks, and the RAM disk
+charges CPU for what a real disk charges in I/O. A bytes win at a small time
+cost (under ~10%) is still a win: the machines this tool exists for are
+disk-bound, and bytes are what they pay in. A bytes win that collapses wall
+time by more than that is a real trade — log it with both numbers and leave it
+uncommitted for the user, same as a cross-scenario trade.
+
+**No unmeasured wins.** If the path you optimized is not exercised by any
+scenario — the 8-reader flash profile, `_walk_bulk_threaded`, anything the
+conservative-profile caveat in this section says gets no coverage — the
+benchmark cannot see your change, and a win the harness cannot see is a claim,
+not a result. Add a scenario or a test that exercises the path first (additions
+are welcome; run `--selftest` after), then measure. If it cannot be exercised
+on this machine at all, log the idea and move on.
 
 **One optimization at a time.** Measure, change one thing, measure again. Two
 changes bundled together is two changes you cannot attribute — and when the pair
@@ -457,6 +481,13 @@ measured, not a known win. Several will turn out to be losses — log those too.
   pivot. That's on the order of n²/2 block comparisons — roughly 10⁶ here —
   and it accounts for most of `samesize`'s ~1.8s scan time. Comparison-only,
   no I/O: a CPU cost riding on top of bytes already being read.
+- **Group-level parallelism in stage 5.** `compare_stage()` runs groups one at
+  a time with members read in parallel — deliberate, so a single group of two
+  enormous files can use the whole reader pool. But a tree of thousands of
+  two-member groups leaves most of the pool idle: each group can occupy only
+  `len(members)` readers. Overlapping small groups (while keeping one big
+  group able to saturate) is a real scheduling idea. Watch the memory budget
+  — `COMPARE_BUDGET` is currently per-group.
 - **Anything else you find.** You have the whole file. But hold the priority:
   bytes-read wins beat time wins beat RSS wins.
 
