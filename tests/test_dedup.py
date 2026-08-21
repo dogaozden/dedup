@@ -60,11 +60,12 @@ class TestDetection:
         assert scan(tmp_path) == []
 
     def test_wide_bucket_of_near_misses_finds_the_one_real_pair(self, tmp_path):
-        # Same size and the same first 64 KiB, so all of these reach stage 5
-        # as one bucket, and every compare pass strips off only its pivot.
+        # Same size and the same head all the way out to DEEP_HEAD, so all of
+        # these reach stage 5 as one bucket, and every compare pass strips off
+        # only its pivot.
         # Past PARTITION_FANOUT that hands off to grouping on the block, and
         # the real pair still has to come back out of it — and only it.
-        head = b"h" * dedup.HEAD_BYTES
+        head = b"h" * dedup.DEEP_HEAD
         for i in range(dedup.PARTITION_FANOUT + 2):
             write(tmp_path / f"u{i:04d}.bin", head + f"{i:08d}".encode())
         write(tmp_path / "twin_a.bin", head + b"XXXXXXXX")

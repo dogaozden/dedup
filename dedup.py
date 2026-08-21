@@ -35,7 +35,10 @@ from pathlib import Path
 
 __version__ = "1.0.0"
 
-HEAD_BYTES = 64 * 1024          # stage-3 sample size
+HEAD_BYTES = 4 * 1024           # stage-3 first pass: one page, enough to
+                                # separate files that differ in their header
+DEEP_HEAD = 64 * 1024           # ...and how far stage 3 extends for the files
+                                # a single page could not tell apart
 SAMPLE_BYTES = 1024 * 1024      # per sample point in stage 4
 SAMPLE_POINTS = 4               # head, two middles, tail
 SAMPLE_SPAN = SAMPLE_BYTES * SAMPLE_POINTS * 2   # below this, just read it all
@@ -632,6 +635,23 @@ def hash_head(path: str, size: int) -> bytes | None:
         return None
 
 
+def hash_head_rest(path: str, size: int) -> bytes | None:
+    """Hash HEAD_BYTES..DEEP_HEAD — the part of the head not already read.
+
+    Only files that a one-page head left sitting in a bucket with someone
+    else get this far, and they read the remainder rather than the head
+    again, so no byte is read twice.
+    """
+    h = _digest()
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(HEAD_BYTES)
+            h.update(fh.read(DEEP_HEAD - HEAD_BYTES))
+        return h.digest()
+    except (PermissionError, OSError):
+        return None
+
+
 def hash_sample(path: str, size: int) -> bytes | None:
     """Hash a few chunks spread through the file instead of all of it.
 
@@ -697,6 +717,8 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
             stats.hashed_files += 1
             if fn is hash_head:
                 stats.hashed_bytes += min(rec.size, HEAD_BYTES)
+            elif fn is hash_head_rest:
+                stats.hashed_bytes += max(0, min(rec.size, DEEP_HEAD) - HEAD_BYTES)
             elif fn is hash_sample:
                 stats.hashed_bytes += sampled_bytes(rec.size)
             else:
@@ -922,6 +944,22 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if not pending:
         return []
 
+    # One page settles most candidates outright. Whatever it left sitting in
+    # a bucket with someone else reads the rest of the deep head — only those
+    # files pay for it, and only for the part not already read. A file no
+    # longer than the first pass has nothing left to read and skips this.
+    deep = [g for g in pending if g[0].size > HEAD_BYTES]
+    if deep:
+        pending = [g for g in pending if g[0].size <= HEAD_BYTES]
+        crowded = sorted((f for g in deep for f in g), key=by_layout)
+        say("head2", len(crowded))
+        rest_buckets = hash_stage(crowded, hash_head_rest, jobs, stats, tick)
+        if reporter:
+            reporter.finish_stage()
+        pending += [g for g in rest_buckets.values() if len(g) > 1]
+        if not pending:
+            return []
+
     # stage 4 — sample points spread through the file. Cheap way to settle
     # same-size files that only agree on their first 64 KiB.
     #
@@ -1057,6 +1095,7 @@ class Reporter:
         "scan": "Scanning",
         "sample": "Sampling deep",
         "head": "Sampling",
+        "head2": "Sampling further",
         "compare": "Comparing",
     }
 
