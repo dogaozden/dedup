@@ -157,6 +157,26 @@ clippy clean, unit tests for every module, and the conformance gate green
 before you call it done. A maintainer (Opus) line-reads each milestone's
 diff before the next begins — leave it reviewable.
 
+**The claim/review handshake — this is also your stop condition.** Each run
+of you is scoped to exactly ONE milestone; you are never asked to "implement
+the spec", only "implement M<n>". The protocol:
+
+1. Start of every run: if `REVIEW-M<previous>.md` exists in the repo root,
+   read it first. `CHANGES` items are binding — address every one and
+   re-claim the previous milestone before touching the new one. Only an
+   `APPROVED` verdict unlocks the next milestone.
+2. When your milestone's conformance gate exits 0: append a claim entry to
+   `MILESTONES.md` (milestone, commit SHA, the gate command and its final
+   lines verbatim), commit everything, and **STOP — your goal is complete.**
+   Never begin the next milestone in the same run.
+3. If the gate will not go green after honest effort: exhaustion note in
+   `LOG.md` per §8, and stop. That is also a completed run.
+
+A maintainer reviews each claim (line-reads the diff, independently re-runs
+the gate) and writes `REVIEW-M<n>.md` with `APPROVED` or `CHANGES`. The
+project as a whole is done when M4 is APPROVED; M5 happens only if
+separately commissioned.
+
 - **M1 — walk parity.** Repo scaffold, CLI skeleton, bulk walk + fallback,
   size grouping, hardlink collapse, filters. Gate: identical candidate sets
   (paths, sizes, inode groupings) vs oracle on the conformance trees;
