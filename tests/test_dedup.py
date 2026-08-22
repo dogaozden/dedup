@@ -1207,6 +1207,90 @@ class TestByteComparison:
         assert scan(tmp_path, verify=True) == scan(tmp_path, verify=False)
 
 
+class TestCompareStageWaves:
+    """compare_stage packs several small groups into one wave and runs each
+    as its own pool task instead of processing groups one at a time, so -j
+    isn't limited to one group's members. Every group in a wave still has
+    to settle correctly, on its own bytes, without disturbing its
+    neighbours' stats or results."""
+
+    def test_many_small_groups_in_shared_waves_all_settle_correctly(self, tmp_path):
+        # Bigger than DEEP_HEAD, so these reach compare_stage rather than
+        # settling in small_file_stage, and small enough (well under
+        # SAMPLE_SPAN) to skip stage 4 and land in compare_stage directly.
+        # 24 pairs x 2 members is far more than one group's worth, at
+        # jobs=4 (WAVE_MEMBERS=16) — several pairs have to share a wave.
+        body_len = dedup.DEEP_HEAD + 4096
+        pairs = 24
+        for p in range(pairs):
+            body = bytes([p % 256]) * body_len
+            write(tmp_path / f"pair{p:03d}-a.bin", body)
+            write(tmp_path / f"pair{p:03d}-b.bin", body)
+
+        stats = ScanStats()
+        groups = find_duplicates([str(tmp_path)], excludes=[], min_size=1,
+                                 jobs=4, verify=False, stats=stats, reporter=None)
+
+        assert len(groups) == pairs
+        for g in groups:
+            assert len(g.files) == 2
+            assert g.attested is False
+            names = sorted(os.path.basename(f.path) for f in g.files)
+            prefix = names[0].rsplit("-", 1)[0]
+            assert names == [f"{prefix}-a.bin", f"{prefix}-b.bin"]
+
+    def test_stats_from_wave_tasks_merge_back_without_loss(self, tmp_path):
+        """Direct compare_stage call: each wave task gets its own ScanStats
+        (stats isn't safe to update from several threads at once), folded
+        back into the shared one afterwards. That fold must not lose or
+        double-count anything, compared to settling the same groups one at
+        a time with a single shared ScanStats throughout."""
+        def rec(path):
+            st = os.stat(path)
+            return FileRec(str(path), st.st_size, st.st_mtime,
+                           st.st_dev, st.st_ino)
+
+        pairs, body_len = 12, 5000
+        groups = []
+        for p in range(pairs):
+            body = bytes([p]) * body_len
+            a = write(tmp_path / f"p{p}-a.bin", body)
+            b = write(tmp_path / f"p{p}-b.bin", body)
+            groups.append([rec(a), rec(b)])
+
+        reference = ScanStats()
+        for g in groups:
+            dedup.split_identical(list(g), dedup.compare_chunk(len(g), None),
+                                  reference)
+
+        from_waves = ScanStats()
+        matched = dedup.compare_stage(groups, 4, None, from_waves)
+
+        assert len(matched) == pairs
+        assert from_waves.hashed_bytes == reference.hashed_bytes
+        assert from_waves.hashed_files == reference.hashed_files
+
+    def test_wide_group_still_gets_the_whole_pool_alongside_small_ones(self, tmp_path):
+        # A single group already at the wave threshold is its own wave and
+        # keeps today's behaviour (the whole pool for its own members) —
+        # mixed in the same scan as ordinary small groups that do get
+        # packed together, so both paths run side by side in one compare
+        # stage rather than in isolation.
+        for p in range(6):
+            body = bytes([100 + p]) * (dedup.DEEP_HEAD + 4096)
+            write(tmp_path / f"pair{p}-a.bin", body)
+            write(tmp_path / f"pair{p}-b.bin", body)
+        wide_body = bytes([200]) * (dedup.DEEP_HEAD + 4096)
+        for i in range(20):
+            write(tmp_path / f"wide{i:03d}.bin", wide_body)
+
+        groups = scan(tmp_path, jobs=2)
+
+        assert len(groups) == 7          # 6 pairs + 1 wide group
+        sizes = sorted(len(g.files) for g in groups)
+        assert sizes == [2] * 6 + [20]
+
+
 class TestComparisonPrimitives:
     def test_partition_splits_three_ways(self):
         blocks = [("a", b"1"), ("b", b"2"), ("c", b"1"), ("d", b"3"), ("e", b"2")]

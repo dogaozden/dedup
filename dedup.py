@@ -1252,12 +1252,38 @@ def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
                   on_progress=None, cache=None) -> list[list]:
     """Run split_identical over every candidate group.
 
-    Groups go one at a time with their members read in parallel, rather than
-    the other way round: a folder whose duplicates are two enormous files is
-    one group, and it should still use the whole disk queue.
+    A group big enough on its own — WAVE_MEMBERS members or more — gets the
+    whole pool to itself, members read in parallel: a folder whose
+    duplicates are two enormous files is one group, and it should still use
+    the whole disk queue. That is the only case this changes nothing from.
+
+    Everything smaller is packed with its layout-sorted neighbours into a
+    wave holding at least WAVE_MEMBERS members between them, and every
+    group in the wave runs as its own pool task instead of the whole wave
+    waiting on one group's turn — a tree of thousands of two-file groups
+    used to leave most of `-j` idle, since only one group's handful of
+    members were ever being read at once. split_identical itself is
+    unchanged: each task gets `pool=None` and reads its own members
+    serially, so nothing here submits pool work from inside pool work, and
+    the byte-exact comparison logic is exactly the logic that already ran
+    one group at a time. compare_chunk is sized on the whole wave's member
+    count rather than one group's, so the wave's aggregate memory — not
+    just one group's — stays inside COMPARE_BUDGET.
+
+    stats is not safe to mutate from several threads at once (`+=` on a
+    plain attribute), so each wave task gets its own ScanStats and this
+    function folds the totals back in once the wave's tasks are all in —
+    the only reason a wave collects its groups before returning any of
+    them, rather than yielding them as they land.
     """
     out: list[list] = []
     last_tick = [0.0]
+    # A wave is worth spreading across the pool once it holds this many
+    # members between its groups — 4x the reader count so there's enough
+    # work to keep every reader busy even once a group or two settles
+    # early, floored at 16 so a low -j doesn't turn nearly everything into
+    # a wave of two.
+    WAVE_MEMBERS = max(4 * jobs, 16)
 
     def tick() -> None:
         if not on_progress:
@@ -1267,11 +1293,48 @@ def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
             on_progress(stats)
             last_tick[0] = now
 
+    def solo(pool, members: list) -> None:
+        """Today's behaviour, unchanged: one group, the whole pool."""
+        chunk = compare_chunk(len(members), solid)
+        out.extend(split_identical(members, chunk, stats,
+                                   pool if jobs > 1 else None, tick, cache))
+
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        for members in buckets:
-            chunk = compare_chunk(len(members), solid)
-            out.extend(split_identical(members, chunk, stats,
-                                       pool if jobs > 1 else None, tick, cache))
+        n = len(buckets)
+        i = 0
+        while i < n:
+            members = buckets[i]
+            if len(members) >= WAVE_MEMBERS:
+                solo(pool, members)
+                i += 1
+                continue
+
+            wave = [members]
+            total = len(members)
+            j = i + 1
+            while total < WAVE_MEMBERS and j < n and len(buckets[j]) < WAVE_MEMBERS:
+                wave.append(buckets[j])
+                total += len(buckets[j])
+                j += 1
+            i = j
+
+            if len(wave) == 1:
+                # Nothing left to pack it with (the tail of `buckets`) and
+                # it never reached the threshold alone either.
+                solo(pool, wave[0])
+                continue
+
+            wave_chunk = compare_chunk(total, solid)
+            local_stats = [ScanStats() for _ in wave]
+            futures = [pool.submit(split_identical, g, wave_chunk, ls,
+                                   None, None, cache)
+                      for g, ls in zip(wave, local_stats)]
+            for future, ls in zip(futures, local_stats):
+                out.extend(future.result())
+                stats.hashed_files += ls.hashed_files
+                stats.hashed_bytes += ls.hashed_bytes
+                stats.unreadable.extend(ls.unreadable)
+            tick()
     return out
 
 
