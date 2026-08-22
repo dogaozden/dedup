@@ -855,3 +855,56 @@ seeds agree, and no scenario moved toward its baseline.
 
 **Verdict:** KEPT. 0.4925 (seed 1) / 0.5037 (seed 2), `widegroup` 1.11x →
 1.05x, `samesize` 0.055 → 0.048 s.
+
+## 2026-08-22 — Sample points, not sample megabytes
+
+**Hypothesis:** Stage 4 reads 4 MB of every big candidate — four windows of a
+megabyte. But a window separates two files only when it lands on something
+they do not share, so what a sample buys is *coverage of the file's length*,
+and that is decided by how many windows there are and how far apart they sit,
+not by how fat each one is. A difference small enough to fall between windows
+is missed at 1 MB a window just as it is missed at 64 KiB; stage 5 is what
+catches that. Eight windows of 64 KiB should therefore separate everything
+four megabyte windows separate, for an eighth of the reading.
+
+**Change:** `SAMPLE_BYTES` 1 MiB → 64 KiB, `SAMPLE_POINTS` 4 → 8, and
+`SAMPLE_SPAN` pinned at 8 MB as its own number instead of being derived from
+those two — the threshold is "is this file worth an open of its own", which
+has not changed. `sample_points()` now spreads the windows over
+`[DEEP_HEAD, size - TAIL_BYTES)`: every file that reaches stage 4 has been
+through both end probes, so the sample no longer re-reads the 60 KiB of deep
+head it used to overlap. The window read also moved from `fh.read()` to
+`read_block()`; an unbuffered read is allowed to come back short, and two
+identical files that got different amounts back would hash differently and be
+missed — the same hole `read_block` exists to close in stage 5.
+
+**Numbers:** full suite, seed 1, exit 0, 119 passed:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.345    0.448     0.77x     103      53
+photos       pass  147.9 MB   150.8 MB    0.98x     0.018    0.024     0.78x     64       149
+bigheader    pass  146.2 MB   296.5 MB    0.49x     0.016    0.032     0.52x     97       109
+needle       pass  244.1 MB   244.1 MB    1.00x     2.739    3.953     0.69x     101      246
+samesize     pass  32.8 MB    348.4 MB    0.09x     0.045    1.586     0.03x     57       284
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.058    0.053     1.09x     161      152
+prefixtrap   pass  33.4 MB    44.2 MB     0.75x     0.011    0.015     0.76x     24       50
+adversarial  pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+SCORE: 0.4851
+```
+
+Seed 2, default scale, exit 0: typical 0.53x, photos 0.98x, bigheader 0.49x,
+needle 1.00x, samesize 0.10x, widegroup 0.80x, prefixtrap 0.75x, adversarial
+0.34x, `SCORE: 0.4955`.
+
+Only `bigheader` has files over `SAMPLE_SPAN`, and it moves 160.1 → 146.2 MB
+with wall time 0.021 → 0.016 s. Its four sampled files are the true pair and
+the `blind` pair, and sampling separates neither — the true pair because they
+are identical and the `blind` pair by construction — so on this corpus the
+change is 14 MB of pure waste removed. What it does *not* do is give up the
+case sampling exists for: `bigheader`'s `prefix` pair shares three quarters of
+itself and then diverges, and windows five through eight still land in the
+divergent part.
+
+**Verdict:** KEPT. 0.4925 → 0.4851 (seed 1) and 0.5037 → 0.4955 (seed 2), no
+bytes regression anywhere. **Both seeds are now under the 0.50 target.**

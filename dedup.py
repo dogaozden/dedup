@@ -43,9 +43,15 @@ TAIL_BYTES = 4 * 1024           # one page from the far end, read before any
                                 # more of the head: same-size files that share
                                 # a header are the ordinary case, and their
                                 # last page is where they differ
-SAMPLE_BYTES = 1024 * 1024      # per sample point in stage 4
-SAMPLE_POINTS = 4               # head, two middles, tail
-SAMPLE_SPAN = SAMPLE_BYTES * SAMPLE_POINTS * 2   # below this, just read it all
+SAMPLE_BYTES = 64 * 1024        # per sample point in stage 4. A window only
+                                # ever catches a difference that spans a
+                                # region, and for that it is how many windows
+                                # there are and how far apart they sit that
+                                # decides, not how fat each one is
+SAMPLE_POINTS = 8               # spread across the part stage 3 has not read
+SAMPLE_SPAN = 8 * 1024 * 1024   # below this, just read it all: sampling a
+                                # smaller file costs an open of its own and
+                                # saves less than that open is worth
 CHUNK = 4 * 1024 * 1024         # comparison chunk on flash
 SLOW_CHUNK = 16 * 1024 * 1024   # ...and on a spinning disk, where every extra
                                 # file in a group costs a seek per round
@@ -745,31 +751,44 @@ def keep_ends(path: str, size: int) -> tuple | None:
     return h.digest(), head, tail
 
 
+def sample_points(size: int) -> list:
+    """Where stage 4 looks.
+
+    Everything before DEEP_HEAD and everything from the tail page onward has
+    already been read by stage 3 — every file that reaches stage 4 went
+    through both — so the windows spread across what is left instead of
+    across the whole file, and no byte is read twice.
+    """
+    first = DEEP_HEAD
+    last = size - TAIL_BYTES - SAMPLE_BYTES
+    step = (last - first) // (SAMPLE_POINTS - 1)
+    return [first + i * step for i in range(SAMPLE_POINTS)]
+
+
 def hash_sample(path: str, size: int) -> bytes | None:
-    """Hash a few chunks spread through the file instead of all of it.
+    """Hash a few windows spread through the file instead of all of it.
 
     On a slow disk the full read is the whole cost of a scan, and most
     same-size files are not duplicates. Sampling settles those after a few
-    MB rather than after gigabytes. Survivors still get read in full, so
-    the result stays byte-exact. Stage 3 has already hashed the first
-    HEAD_BYTES of every candidate, so the first deep sample starts
-    immediately after that page instead of reading it a second time.
+    hundred KB rather than after gigabytes. Survivors still get read in
+    full, so the result stays byte-exact.
+
+    A window can only separate two files if it lands on something they do
+    not share, so what a sample is really buying is coverage of the file's
+    length. Eight windows of 64 KiB cover eight places; four of a megabyte
+    cover four, for eight times the reading. A difference small enough to
+    fall between windows is missed either way, and stage 5 is what catches
+    that.
     """
     if size <= SAMPLE_SPAN:
         return hash_full(path, size)
     h = _digest()
     h.update(str(size).encode())          # same samples, different length
-    step = (size - SAMPLE_BYTES) // (SAMPLE_POINTS - 1)
     try:
         with open(path, "rb", buffering=0) as fh:
-            for i in range(SAMPLE_POINTS):
-                offset = i * step
-                count = SAMPLE_BYTES
-                if i == 0:
-                    offset = HEAD_BYTES
-                    count -= HEAD_BYTES
+            for offset in sample_points(size):
                 fh.seek(offset)
-                block = fh.read(count)
+                block = read_block(fh, SAMPLE_BYTES)
                 if not block:
                     break
                 h.update(block)
@@ -780,8 +799,7 @@ def hash_sample(path: str, size: int) -> bytes | None:
 
 def sampled_bytes(size: int) -> int:
     """How much hash_sample actually reads — for honest progress accounting."""
-    return (size if size <= SAMPLE_SPAN else
-            SAMPLE_BYTES * SAMPLE_POINTS - HEAD_BYTES)
+    return size if size <= SAMPLE_SPAN else SAMPLE_BYTES * SAMPLE_POINTS
 
 
 def hash_full(path: str, size: int) -> bytes | None:
