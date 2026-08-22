@@ -78,6 +78,11 @@ PARTITION_FANOUT = 256          # a compare pass that strips off nothing but
 RETAIN_BUDGET = 128 * 1024 * 1024    # ceiling on head bytes carried from stage
                                 # 3 to stage 5 so the compare does not read
                                 # them a second time — see find_duplicates
+RETAIN_CHECK_SPAN = HASH_BATCH * 64  # how many small_file_stage candidates
+                                # ride between checks of RETAIN_BUDGET — wide
+                                # enough that the check's own bookkeeping
+                                # doesn't dominate, narrow enough that one
+                                # overshoot is still a small slice of it
 
 CACHE_SCHEMA = 3                # bump when the stored columns change meaning.
                                 # 2: stage 3 became one digest of both end
@@ -877,6 +882,28 @@ def hash_full(path: str, size: int) -> bytes | None:
         return None
 
 
+def read_whole(path: str, size: int) -> bytes | None:
+    """Read a file's entire contents in one open.
+
+    Used for stage-3 candidates at or under DEEP_HEAD: reading the whole
+    thing once costs no more than the head page stage 3 would read for a
+    bigger file, so there is nothing left to stage — see small_file_stage.
+
+    Buffered, like hash_ends and hash_head_rest, not unbuffered like
+    hash_full/hash_sample/split_identical: those loop over many large
+    chunks, where buffering only adds a redundant copy, but this is one
+    small read per file, and BufferedReader.read(n) already retries short
+    reads internally (in C) for a non-interactive stream — read_block's
+    Python-level retry loop would only add per-file overhead here, and
+    small_file_stage calls this once per candidate.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(size)
+    except (PermissionError, OSError):
+        return None
+
+
 def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
                on_progress=None, keep: tuple = (), cache=None) -> dict:
     """Hash `files` with `fn` and bucket them by size and digest.
@@ -1248,6 +1275,246 @@ def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
     return out
 
 
+def small_file_stage(candidates: list[FileRec], jobs: int, stats: ScanStats,
+                     on_progress=None, cache=None) -> tuple:
+    """Settle every stage-3 candidate at or under DEEP_HEAD without staging
+    a digest through a cache column, a retention budget, and compare_stage.
+
+    A file this small still needs the same cheap first probe stage 3 already
+    gives everything else — most same-size files are not duplicates, and a
+    HEAD_BYTES page proves that as well here as it does for a bigger file, at
+    the same one-page cost. Reading the whole thing unconditionally would
+    undo exactly that saving for the common case (a unique file settling
+    after one page), so this stays two tiers, the way stage 3 already is:
+
+      tier A — one page (or, for a file no longer than HEAD_BYTES, the whole
+               file — there is nothing else to read). A page unmatched by
+               anyone else its size settles right there: unique, done, one
+               open.
+      tier B — only for files tier A left crowded, the rest of the file, in
+               a second open, straight into the final grouping. There is no
+               tier C: the bytes read here are compared directly, byte for
+               byte, in a plain dict — no hash decides who matches whom, no
+               retention budget carries them to a later stage, and nothing
+               about them is read again. That is stronger than the digest
+               stage 3 and stage 5 would have produced for the same file, not
+               just cheaper. These candidates never reach hash_ends,
+               hash_head_rest, sampling, or compare_stage.
+
+    A size class is only settled from the cache when EVERY member of it
+    already carries a remembered whole-file digest; if even one does not,
+    the whole class is read and compared for real. That mirrors what the
+    general pipeline does when cache.attested_runs finds one member without
+    a full digest — the whole group goes back to being read — so a caller
+    can't tell which path settled a group from the attested/proven split
+    alone. That check is the only thing done per size class: every read
+    below is batched across every candidate this stage has to read,
+    regardless of which size it belongs to, the same way hash_stage batches
+    across files instead of one pool task per file — a wide class of small
+    same-size groups is exactly what this stage exists for, and one
+    ThreadPoolExecutor.map call per class would starve -j the same way
+    compare_stage does for many small groups. Reading a batch's remainder is
+    skipped, in favour of handing it to the staged pipeline instead, once
+    its distinct content would hold more than RETAIN_BUDGET at once; tier A
+    and tier B are each bounded against the same budget in turn, one held
+    dict at a time, never both at once.
+
+    Returns (proven, attested, fallback): proven and attested are lists of
+    FileRec groups shaped like compare_stage's and cache.attested_runs'
+    output, ready to merge into the same DupGroup list. fallback is the
+    candidates this stage declined to settle, for the caller to fold back
+    into the staged pipeline.
+    """
+    by_size: dict = defaultdict(list)
+    for rec in candidates:
+        by_size[rec.size].append(rec)
+
+    proven: list = []
+    attested: list = []
+    fallback: list = []
+    last_tick = 0.0
+
+    def maybe_tick() -> None:
+        nonlocal last_tick
+        if on_progress:
+            now = time.monotonic()
+            if now - last_tick > 0.1:
+                on_progress(stats)
+                last_tick = now
+
+    def read_rec_batch(items: list) -> list:
+        return [read_whole(r.path, r.size) for r in items]
+
+    def read_head_batch(items: list) -> list:
+        # Buffered, single read() per file — see read_whole's docstring.
+        out = []
+        for rec in items:
+            try:
+                with open(rec.path, "rb") as fh:
+                    out.append(fh.read(HEAD_BYTES))
+            except (PermissionError, OSError):
+                out.append(None)
+        return out
+
+    def read_rest_batch(items: list) -> list:
+        out = []
+        for rec in items:
+            try:
+                with open(rec.path, "rb") as fh:
+                    fh.seek(HEAD_BYTES)
+                    out.append(fh.read(rec.size - HEAD_BYTES))
+            except (PermissionError, OSError):
+                out.append(None)
+        return out
+
+    def pooled(pool, items: list, batch_fn) -> list:
+        """Read `items` through the pool, in order, batched the way
+        hash_stage batches hashing — one task per batch of files, not one
+        task per file, or the per-task Future/lock overhead dominates a
+        stage this many files pass through."""
+        span = max(1, min(HASH_BATCH, -(-len(items) // max(1, jobs * 4))))
+        out: list = []
+        for results in pool.map(batch_fn,
+                                (items[i:i + span]
+                                 for i in range(0, len(items), span))):
+            out.extend(results)
+        return out
+
+    # The cache check is in-memory and cheap, so it stays per size class —
+    # that is the unit a warm/cold decision has to be made at (see above).
+    # Everything that still needs reading is flattened across size classes
+    # from here on. Content length stands in for size when grouping tiny
+    # files or tier-B's full content: two different sizes can never read
+    # back equal bytes there. A tier-A page's length is fixed regardless of
+    # the file's total size, so that bucket alone carries size explicitly.
+    tiny: list = []          # size <= HEAD_BYTES: tier A alone is the file
+    headed: list = []        # size > HEAD_BYTES: tier A is one page
+    for size, recs in by_size.items():
+        digests = ([cache.get(rec, "full") for rec in recs]
+                  if cache is not None else None)
+        if digests is not None and all(d is not None for d in digests):
+            by_digest: dict = defaultdict(list)
+            for rec, digest in zip(recs, digests):
+                by_digest[digest].append(rec)
+            for group in by_digest.values():
+                stats.hashed_files += len(group)
+                if len(group) > 1:
+                    attested.append(group)
+            continue
+        (tiny if size <= HEAD_BYTES else headed).extend(recs)
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        # size <= HEAD_BYTES — tier A alone already reads the whole file;
+        # there is no tier B left to stage.
+        distinct: dict = {}
+        retained = 0
+        i = 0
+        while i < len(tiny):
+            if retained > RETAIN_BUDGET:
+                fallback.extend(tiny[i:])
+                break
+            piece = tiny[i:i + RETAIN_CHECK_SPAN]
+            i += RETAIN_CHECK_SPAN
+            for rec, content in zip(piece, pooled(pool, piece, read_rec_batch)):
+                if content is None:
+                    stats.unreadable.append(rec.path)
+                    stats.hashed_files += 1
+                    continue
+                stats.hashed_bytes += len(content)
+                stats.hashed_files += 1
+                existing = distinct.get(content)
+                if existing is None:
+                    distinct[content] = [rec]
+                    retained += len(content)
+                else:
+                    existing.append(rec)
+            maybe_tick()
+        for content, group in distinct.items():
+            if len(group) > 1:
+                proven.append(group)
+                if cache is not None:
+                    h = _digest()
+                    h.update(content)
+                    digest = h.digest()
+                    for rec in group:
+                        cache.remember(rec, "full", digest)
+        del distinct
+
+        # size > HEAD_BYTES — tier A, one page each.
+        by_head: dict = {}
+        retained = 0
+        i = 0
+        while i < len(headed):
+            if retained > RETAIN_BUDGET:
+                fallback.extend(headed[i:])
+                break
+            piece = headed[i:i + RETAIN_CHECK_SPAN]
+            i += RETAIN_CHECK_SPAN
+            for rec, head in zip(piece, pooled(pool, piece, read_head_batch)):
+                if head is None:
+                    stats.unreadable.append(rec.path)
+                    stats.hashed_files += 1
+                    continue
+                stats.hashed_bytes += len(head)
+                key = (rec.size, head)
+                existing = by_head.get(key)
+                if existing is None:
+                    by_head[key] = [rec]
+                    retained += len(head)
+                else:
+                    existing.append(rec)
+            maybe_tick()
+
+        # A page nobody its size shares is exactly as conclusive as it is in
+        # stage 3: unique, and settled without reading further.
+        flat: list = []
+        for (size, head), group in by_head.items():
+            if len(group) > 1:
+                flat.extend((head, rec) for rec in group)
+            else:
+                stats.hashed_files += len(group)
+        del by_head
+
+        # tier B — only the still-crowded remainder, batched across buckets
+        # (and across sizes) so -j isn't limited to one bucket's members.
+        distinct = {}
+        retained = 0
+        i = 0
+        while i < len(flat):
+            if retained > RETAIN_BUDGET:
+                fallback.extend(rec for _, rec in flat[i:])
+                break
+            piece = flat[i:i + RETAIN_CHECK_SPAN]
+            i += RETAIN_CHECK_SPAN
+            recs_piece = [rec for _, rec in piece]
+            for (head, rec), rest in zip(piece, pooled(pool, recs_piece, read_rest_batch)):
+                if rest is None:
+                    stats.unreadable.append(rec.path)
+                    stats.hashed_files += 1
+                    continue
+                stats.hashed_bytes += len(rest)
+                stats.hashed_files += 1
+                content = head + rest
+                existing = distinct.get(content)
+                if existing is None:
+                    distinct[content] = [rec]
+                    retained += len(content)
+                else:
+                    existing.append(rec)
+            maybe_tick()
+        for content, group in distinct.items():
+            if len(group) > 1:
+                proven.append(group)
+                if cache is not None:
+                    h = _digest()
+                    h.update(content)
+                    digest = h.digest()
+                    for rec in group:
+                        cache.remember(rec, "full", digest)
+
+    return proven, attested, fallback
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # the re-scan cache
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1610,6 +1877,24 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
 
     candidates.sort(key=by_layout)
 
+    # A file this small costs the same to read whole as stage 3's first page
+    # alone would cost for a bigger one, so there is nothing to stage for it:
+    # settle it in one pass and let everything below work on what's left.
+    small_candidates = [f for f in candidates if f.size <= DEEP_HEAD]
+    candidates = [f for f in candidates if f.size > DEEP_HEAD]
+
+    small_matched: list = []
+    small_attested: list = []
+    if small_candidates:
+        say("small", len(small_candidates))
+        small_matched, small_attested, fallback = small_file_stage(
+            small_candidates, jobs, stats, tick, cache)
+        if reporter:
+            reporter.finish_stage()
+        if fallback:
+            candidates.extend(fallback)
+            candidates.sort(key=by_layout)
+
     # Stage 5 has to see the bytes of the head to prove a group, and stage 3
     # is about to read them. Keeping them means stage 5 compares what is
     # already in hand instead of reading the same region a second time — a
@@ -1636,8 +1921,6 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     pending = [g for g in end_buckets.values() if len(g) > 1]
     if keep:
         release(candidates, pending)
-    if not pending:
-        return []
 
     # One page settles most candidates outright. Whatever it left sitting in
     # a bucket with someone else reads the rest of the deep head — only those
@@ -1660,8 +1943,6 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
         pending += [g for g in rest_buckets.values() if len(g) > 1]
         if keep:
             release(crowded, pending)
-        if not pending:
-            return []
 
     # stage 4 — sample points spread through the file. Cheap way to settle
     # same-size files that only agree on their first 64 KiB.
@@ -1681,8 +1962,6 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
             reporter.finish_stage()
         big = [g for g in sample_buckets.values() if len(g) > 1]
     pending = small + big
-    if not pending:
-        return []
 
     # stage 5 — compare what's left byte for byte, in step. Sampled agreement
     # is not proof and this tool deletes things, so the bytes get read; doing
@@ -1704,8 +1983,10 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
         reporter.finish_stage()
 
     groups: list[DupGroup] = []
-    for members, attested in [(m, False) for m in matched] + \
-                             [(m, True) for m in remembered]:
+    for members, attested in ([(m, False) for m in matched] +
+                              [(m, True) for m in remembered] +
+                              [(m, False) for m in small_matched] +
+                              [(m, True) for m in small_attested]):
         members.sort(key=lambda f: (len(f.path), f.path))
         groups.append(DupGroup(members[0].size, members, attested))
 
@@ -1807,6 +2088,7 @@ class Reporter:
 
     LABELS = {
         "scan": "Scanning",
+        "small": "Reading small files",
         "sample": "Sampling deep",
         "head": "Sampling",
         "head2": "Sampling further",

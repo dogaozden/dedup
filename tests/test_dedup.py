@@ -1810,3 +1810,135 @@ class TestCacheReporting:
 
         assert args.no_cache is True
         assert dedup.build_parser().parse_args([]).no_cache is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# small_file_stage — candidates at or under DEEP_HEAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSmallFileStage:
+    """Files at or under DEEP_HEAD skip stage 3 and stage 5 and settle from
+    one full read, grouped on the bytes themselves rather than a digest."""
+
+    def test_duplicate_pair_under_deep_head_is_found(self, tmp_path):
+        write(tmp_path / "a.bin", b"x" * 40000)
+        write(tmp_path / "b.bin", b"x" * 40000)
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+        assert len(groups[0].files) == 2
+        assert groups[0].attested is False
+
+    def test_same_size_non_pair_under_deep_head_is_not_a_duplicate(self, tmp_path):
+        # Same size, and share a head long enough that the old staged
+        # pipeline would have needed the deep-head tier to tell them apart —
+        # the new path has to get this right without that tier at all.
+        write(tmp_path / "a.bin", b"h" * 40000 + b"A")
+        write(tmp_path / "b.bin", b"h" * 40000 + b"B")
+
+        assert scan(tmp_path) == []
+
+    def test_last_byte_difference_is_caught(self, tmp_path):
+        body = bytearray(b"y" * dedup.DEEP_HEAD)
+        write(tmp_path / "a.bin", bytes(body))
+        body[-1] ^= 0xFF
+        write(tmp_path / "b.bin", bytes(body))
+
+        assert scan(tmp_path) == []
+
+    def test_boundary_size_exactly_deep_head_is_still_small_path(self, tmp_path):
+        write(tmp_path / "a.bin", b"z" * dedup.DEEP_HEAD)
+        write(tmp_path / "b.bin", b"z" * dedup.DEEP_HEAD)
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+        assert len(groups[0].files) == 2
+
+    def test_one_byte_over_deep_head_uses_the_staged_pipeline(self, tmp_path):
+        # Not a small_file_stage test on its own — a guard that the routing
+        # boundary is where the code says it is, so the tests above are
+        # testing what they claim to.
+        body = b"w" * (dedup.DEEP_HEAD + 1)
+        write(tmp_path / "a.bin", body)
+        write(tmp_path / "b.bin", body)
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+        assert len(groups[0].files) == 2
+
+    def test_unreadable_small_file_does_not_break_its_siblings(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root can read anything")
+        write(tmp_path / "a.bin", b"same content" * 100)
+        write(tmp_path / "b.bin", b"same content" * 100)
+        blocked = write(tmp_path / "c.bin", b"same content" * 100)
+        blocked.chmod(0o000)
+        try:
+            stats = ScanStats()
+            groups = find_duplicates([str(tmp_path)], excludes=[], min_size=1,
+                                     jobs=2, verify=False, stats=stats, reporter=None)
+        finally:
+            blocked.chmod(0o644)
+
+        assert len(groups) == 1
+        assert len(groups[0].files) == 2
+        assert str(blocked) in stats.unreadable
+
+    def test_overflowing_the_retain_budget_falls_back_instead_of_blowing_it(
+            self, tmp_path, monkeypatch):
+        """White-box: every candidate handed to small_file_stage is either
+        settled there or handed back in `fallback` — never both, never
+        neither — even when the budget can't hold everyone's content."""
+        monkeypatch.setattr(dedup, "RETAIN_BUDGET", 8 * 1024)
+        monkeypatch.setattr(dedup, "RETAIN_CHECK_SPAN", 20)
+        recs = []
+        for i in range(80):
+            p = write(tmp_path / f"f{i:03d}.bin", bytes([i % 256]) * 4096)
+            st = os.stat(p)
+            recs.append(FileRec(str(p), st.st_size, st.st_mtime,
+                                st.st_dev, st.st_ino))
+
+        stats = ScanStats()
+        proven, attested, fallback = dedup.small_file_stage(recs, 2, stats)
+
+        assert fallback                 # 80 x 4 KiB of distinct content
+        assert attested == []           # no cache, nothing can be attested
+        assert stats.hashed_files + len(fallback) == len(recs)
+
+    def test_a_size_class_over_budget_still_finds_its_real_pair(
+            self, tmp_path, monkeypatch):
+        """Black-box companion to the test above: whichever path settles the
+        overflow (fast path for what fits, the staged pipeline for the
+        rest), the real pair must not be lost."""
+        monkeypatch.setattr(dedup, "RETAIN_BUDGET", 8 * 1024)
+        monkeypatch.setattr(dedup, "RETAIN_CHECK_SPAN", 20)
+        for i in range(80):
+            write(tmp_path / f"unique{i:03d}.bin", bytes([i % 256]) * 4096)
+        write(tmp_path / "twin_a.bin", b"T" * 4096)
+        write(tmp_path / "twin_b.bin", b"T" * 4096)
+
+        groups = scan(tmp_path)
+
+        assert len(groups) == 1
+        assert sorted(os.path.basename(f.path) for f in groups[0].files) == [
+            "twin_a.bin", "twin_b.bin"]
+
+    def test_warm_scan_of_small_files_reads_nothing_and_is_attested(self, tmp_path):
+        twins(tmp_path)                 # 16 KiB pair, well under DEEP_HEAD
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cold_groups, cold = cached_scan(tmp_path, cache)
+        cache.close()
+        assert cold.hashed_bytes > 0
+        assert cold_groups[0].attested is False
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        warm_groups, warm = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert warm.hashed_bytes == 0
+        assert len(warm_groups) == 1
+        assert len(warm_groups[0].files) == 2
+        assert warm_groups[0].attested is True
