@@ -24,6 +24,9 @@ semantics, and canonical hardlink names. Fixed formatting and clippy issues.
 - `cargo test`: 4 passed, 0 failed.
 - `cargo clippy -- -D warnings`: clean.
 - Official gate: 13 checks, 0 failures, `gate m1: green`.
+- Post-claim gate rerun against implementation commit
+  `aca5a488a3eb488532ea3ae587ec9bd0976486eb`: 13 checks, 0 failures,
+  `gate m1: green`.
 
 No discrepancies between REWRITE.md and the oracle clone were observed during
 M1. The oracle remains authoritative.

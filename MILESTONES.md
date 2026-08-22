@@ -6,7 +6,7 @@ Implementation provides repository scaffolding, the CLI skeleton for the M1
 scan surface, portable bulk walking through directory traversal, size grouping,
 hardlink collapse, extension/name filters, and the JSON conformance report.
 
-- Commit: to be filled after this claim commit is created.
+- Commit: `aca5a488a3eb488532ea3ae587ec9bd0976486eb`
 - Gate command: `python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'`
 
 Final gate output:
