@@ -805,3 +805,53 @@ regression anywhere, 0.7791 → 0.4961 (seed 1) / 0.5064 (seed 2). `widegroup`
 wall time is 1.11x/1.15x: 519 files that are all true copies pay one extra
 `open` each for a probe that cannot settle them, and on this volume an `open`
 is 22 µs against a 4 KiB read that is nearly free. That is the next entry.
+
+## 2026-08-22 — Both end pages in one open
+
+**Hypothesis:** The entry above cost `widegroup` 1.11x/1.15x wall time, and the
+mechanism is measurable rather than guessable. On this volume, over the real
+`needle` corpus: `os.lstat` 1.7 µs/file, `open`+`close` **22.1 µs**, and
+`open`+`read(4096)`+`close` 32.8. The read is not what a probe costs — the
+`open` is. So a second pass over the same files to fetch their tail page costs
+one open each and cannot be worth it: fetch the far page in the *same* open as
+the head page, with a seek in between.
+
+**Change:** `hash_ends` / `keep_ends` replace the separate head and tail
+stages with a single pass that reads the head page and, when
+`size > DEEP_HEAD + TAIL_BYTES`, seeks and reads the tail page, hashing both
+into one digest. `hash_stage`'s `keep` becomes a tuple of attribute names so
+one reader can hand back both blocks.
+
+**Numbers:** full suite, seed 1, exit 0, 119 passed:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.343    0.463     0.74x     103      49
+photos       pass  147.9 MB   150.8 MB    0.98x     0.019    0.024     0.83x     64       149
+bigheader    pass  160.1 MB   296.5 MB    0.54x     0.021    0.035     0.59x     103      104
+needle       pass  244.1 MB   244.1 MB    1.00x     2.754    4.073     0.68x     104      303
+samesize     pass  32.8 MB    348.4 MB    0.09x     0.048    1.706     0.03x     57       219
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.060    0.057     1.05x     161      152
+prefixtrap   pass  33.4 MB    44.2 MB     0.75x     0.012    0.015     0.80x     24       50
+adversarial  pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+SCORE: 0.4925
+```
+
+Seed 2, default scale, exit 0: typical 0.53x, photos 0.98x, bigheader 0.54x,
+needle 1.00x, samesize 0.10x, widegroup 0.80x, prefixtrap 0.75x, adversarial
+0.34x, `SCORE: 0.5037`.
+
+Interleaved A/B on the corpora directly, two passes each, min of three runs:
+`samesize` 0.045 → 0.035 s, `widegroup` 0.049 → 0.045 s, `photos` flat.
+
+**The cost, stated plainly.** A file that the head page alone would have
+settled now reads a tail page it does not need. That is +0.2 MB on
+`prefixtrap` (33.2 → 33.4) and +0.2 MB on `adversarial` (1.2 → 1.4), both far
+under baseline, and nothing measurable elsewhere — the scenarios where most
+candidates are settled by their first page are the ones whose files are too
+short to have a tail page at all. Bytes bought time here, which is the wrong
+way round for this brief; it is 0.4 MB against 1,900 fewer `open` calls, both
+seeds agree, and no scenario moved toward its baseline.
+
+**Verdict:** KEPT. 0.4925 (seed 1) / 0.5037 (seed 2), `widegroup` 1.11x →
+1.05x, `samesize` 0.055 → 0.048 s.
