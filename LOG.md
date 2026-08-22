@@ -89,3 +89,38 @@ Error: FilterError { message: "--ext: empty extension in 'jpg,,gz'" }
 cargo test: 8 passed, 0 failed
 cargo clippy --all-targets -- -D warnings: clean
 ```
+
+## 2026-08-22 — M1 continuation audit
+
+### Hypothesis
+
+The committed M1 re-claim remains complete and no further binding review has
+arrived, so a fresh end-to-end run from the current clean worktree should
+reproduce the gate and standards evidence without any source change.
+
+### What happened
+
+Confirmed that `REVIEW-M1.md` still records the already-addressed `CHANGES`
+verdict and that `MILESTONES.md` contains the subsequent re-claim. Re-ran the
+canonical judge and all project standards from HEAD
+`b1faa26fecd19e568cebd6370606ca4d5258b1cf`. No code changes were required.
+The candidate worktree and oracle clone were both clean afterward.
+
+### Numbers
+
+Captured stdout from:
+
+```text
+python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
+```
+
+Final lines:
+
+```text
+13 check(s), 0 failed
+gate m1: green
+```
+
+The command exited 0. `cargo fmt --check` exited 0. `cargo test --quiet`
+reported `8 passed; 0 failed`. `cargo clippy --all-targets -- -D warnings`
+exited 0.
