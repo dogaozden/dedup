@@ -1115,3 +1115,33 @@ the read order becomes walk order. On this RAM disk that costs nothing and
 the benchmark would show a clean win, which is exactly the problem — the seek
 cost it trades away is invisible here and real on the disks this tool exists
 for.
+
+## 2026-08-22 — Final verification of the branch tip
+
+Run after merging `main` (its `bench/ROUND2.md` note) into this branch, so the
+numbers below are the tip and the harness is byte-identical to `main`'s.
+
+```text
+python3 -m pytest tests/ -q              119 passed
+python3 bench/run.py --selftest          selftest passed
+                                         (control clean; truncate-compare caught;
+                                          underreport-bytes caught at 50% against
+                                          a 20% tolerance)
+python3 bench/run.py --score             SCORE: 0.4822   exit 0
+python3 bench/run.py --score --seed 2    SCORE: 0.4875   exit 0
+```
+
+Referee, on the tip's `dedup.py`, from a clean checkout of `main` (`81fa031`):
+
+```text
+git worktree add --detach /tmp/dedup-referee main
+python3 bench/run.py --dedup .../dedup.py --score            SCORE: 0.4790
+python3 bench/run.py --dedup .../dedup.py --score --seed 2    SCORE: 0.4845
+```
+
+The `--selftest` line is worth more here than it usually is. This branch moved
+the proof of a duplicate out of stage 5's reads and into bytes kept from stage
+3, so the question "would this harness still notice if the proof stopped
+happening" is a live one rather than a formality. It notices: a compare stage
+truncated to skip its last round is caught as five wrong groups, and a tool
+under-reporting its own bytes by half is caught against the 20% tolerance.
