@@ -15,6 +15,9 @@ extensions are ignored, so `photo.jpg`, `photo.jpeg`, and `photo.backup` all
 match if the bytes are the same — which is what you want for folders full of
 rescued or re-downloaded files.
 
+To narrow what gets scanned in the first place, `--ext` and `--skip-ext`
+filter by extension before any of that — see Options below.
+
 Files under 10 MB are ignored, because they're rarely worth the screen space.
 Lower the floor with `--min-size` if you want them.
 
@@ -158,6 +161,8 @@ anything unless you passed `-y`.
                     spinning disk)
     --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
+    --ext LIST      only scan these extensions, comma-separated (repeatable)
+    --skip-ext LIST skip these extensions, comma-separated (repeatable)
     --verify        no-op; matches are always byte-compared now
     --hard          delete permanently instead of using the Trash
 -q, --quiet         no progress output
@@ -171,6 +176,7 @@ Useful exclusions:
 
 ```
 dedup -x '.DS_Store' -x 'node_modules' -x '.git'
+dedup --skip-ext log,tmp,cache
 ```
 
 ## Install
