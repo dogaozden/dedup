@@ -55,6 +55,11 @@ subprocess and compares it against the oracle on identical trees:
   with groups sorted by (-size, name, keeper-path) and paths relative to the
   scanned root. Same flags as the oracle otherwise (`--list`, `--min-size`,
   `-j`, `-x`, `--ext`, `--skip-ext`, `--auto`, `-y`, `--hard`, `--no-cache`).
+  Two details the harness pins down: a hardlinked inode contributes ONE path
+  per group — its canonical name, the shortest, ties broken lexicographically
+  (the same name `--auto shortest` keeps); and `unreadable` carries bare
+  relative paths with no error text. `opens` counts file opens inside the
+  scanned root only (the bulk walk's directory opens are excluded).
 - The harness checks: identical groups vs the oracle, bytes within declared
   bounds, opens within declared bounds, deletion outcomes identical
   (survivors, `.Trashes` placement), cache behavior (warm ≈ 0 bytes, poison
