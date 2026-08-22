@@ -26,16 +26,28 @@ The scan avoids reading files it doesn't have to:
 |-------|------|--------|
 | 1 | list every file's size | one bulk syscall per directory, no reads |
 | 2 | discard unique sizes | a file with a unique size can't have a twin |
-| 3 | hash the first 64 KiB | cheap, eliminates most survivors |
-| 4 | hash 4 MB spread through the file | settles big files that share a header |
-| 5 | compare the bytes, in step | only for what's left, and it stops early |
+| 3 | read one page from each end | one open apiece, and it settles most survivors |
+| 3b | read out to 64 KiB | only for files those two pages left crowded |
+| 4 | hash 8 windows of 64 KiB spread through the file | settles big files that share a header |
+| 5 | compare the bytes, in step | only for what's left, and never a byte twice |
+
+Stage 3 asks the far end first. Two files of one size that are still together
+after a page of header usually share that header — one camera, one encoder,
+one container format — and reading more of a header they agree on settles
+nothing, where their last page settles them at once. Both pages come out of a
+single open, because opening a file costs far more than reading a page out of
+one already open.
 
 Stage 4 matters on big files that begin identically — disk images, backups,
-container formats. Reading four megabytes from across the file settles them
-without reading all of it. On a set of 300 MB images sharing a 100 MB header
-it cut reads from 3.15 GB to 0.67 GB, 79% less, for the same answer. Files
-too small to be worth sampling skip it: below 8 MB there is nothing to sample
-without reading the whole file, and stage 5 would then read it all again.
+container formats. A window separates two files only when it lands on
+something they do not share, so what it buys is coverage of the file's
+length: eight windows spread across it cover eight places, and making each
+window fatter would not cover a ninth. Files too small to be worth sampling
+skip it: below 8 MB the extra open costs more than the sample saves.
+
+Nothing an earlier stage read is read again. The bytes are carried forward
+and compared in stage 5, so a file that really is a duplicate is read exactly
+once, end to end — which is the least any tool can read and still prove it.
 
 Stage 5 reads the survivors in step and splits them apart the moment their
 bytes differ, rather than hashing each one to the end and comparing digests.
@@ -208,13 +220,15 @@ would make every number a story about the page cache. Each corpus is written
 from a seeded PRNG, so the same `--seed` and `--scale` always produce the same
 bytes, and the answer key is written beside the tree — never inside it.
 
-Eight scenarios, each aimed at a different part of the pipeline: `typical`
+Nine scenarios, each aimed at a different part of the pipeline: `typical`
 (a mixed tree), `photos` (few files, all large), `bigheader` (long shared
 prefixes, where stage 4 earns its keep), `needle` (100k tiny files, so mostly
 the walk), `samesize` (every file the same length with the same first 64 KiB,
-so nothing before stage 5 separates anything), `widegroup` (one group of 500,
-plus the hardlink cases), `adversarial` (symlink loops, unreadable files, odd
-names) and `deletion` (the real command line, checked against the Trash).
+so the head separates nothing and only the far end does), `widegroup` (one
+group of 500, plus the hardlink cases), `prefixtrap` (same-size files sharing
+a short header and then diverging — the shape that punishes reading less of
+the head), `adversarial` (symlink loops, unreadable files, odd names) and
+`deletion` (the real command line, checked against the Trash).
 
 ### What the gates mean
 
