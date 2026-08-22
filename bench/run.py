@@ -67,6 +67,12 @@ ORDER = ["typical", "photos", "bigheader", "needle", "samesize", "widegroup",
 # not timed and not scored.
 CACHE_FREE = [n for n in ORDER if n != "rescan"]
 
+# `rescan` always builds at smoke scale whatever --scale the run asked for: it
+# is a gate, everything it checks is a ratio or a refusal, none of that depends
+# on corpus size, and its 430 MB at default scale is what tips the ten corpora
+# past what the RAM disk holds.
+GATE_SCALE = {"rescan": "smoke"}
+
 # A warm scan of a tree nobody has touched should read essentially nothing.
 # Five percent is a ceiling with room in it, not a target: the real figure on
 # an unchanged corpus is zero.
@@ -643,6 +649,20 @@ def rewrite(path: str, filler: bytes, keep_mtime: bool) -> None:
         raise Fatal("could not restore mtime_ns on {}".format(path))
 
 
+def next_tick() -> None:
+    """Block until the wall clock crosses a second boundary.
+
+    This volume is HFS+ and records mtime to the second, and dedup refuses to
+    trust a digest cached in the same second as its file's mtime. Without this
+    the cold scan can start in the tick that built the corpus, every entry it
+    writes is racily clean, and the warm scan re-reads all of it — a correct
+    answer to a real ambiguity, but not what this gate is here to measure.
+    """
+    edge = int(time.time())
+    while int(time.time()) == edge:
+        time.sleep(0.02)
+
+
 def rescan_gate(dedup_path: str, volume: str, base: str, manifest: dict) -> tuple:
     """-> (verdict, cold_bytes, warm_bytes)."""
     tree = os.path.join(base, "tree")
@@ -658,6 +678,7 @@ def rescan_gate(dedup_path: str, volume: str, base: str, manifest: dict) -> tupl
         return fail("setup", "corpus has fewer than two mutable groups")
 
     # ── phase 1: cold ────────────────────────────────────────────────────
+    next_tick()             # so the corpus is older than the scan that reads it
     cold = measure(dedup_path, tree, volume, min_size, cache_dir=cache)
     reason = check(manifest, cold)
     if reason:
@@ -874,6 +895,12 @@ def sabotaged_dedup(dedup_path: str, mode: str) -> str:
     return out
 
 
+def scenario_shape(name: str, scale: str, halve: bool) -> tuple:
+    """(scale, factor) this scenario's corpus is built at — see GATE_SCALE."""
+    scale = GATE_SCALE.get(name, scale)
+    return scale, corpus.SCALES[scale] * (0.5 if halve else 1.0)
+
+
 def ensure_corpus(volume: str, name: str, scale: str, seed: int, factor: float,
                   rebuild: bool = False) -> tuple:
     """(base directory, manifest), building the corpus if it is not usable."""
@@ -1031,25 +1058,27 @@ def _locked(args, root, dedup_path, volume_note, halve) -> int:
         if name not in corpus.SCENARIOS:
             raise Fatal("unknown scenario: {}".format(name))
     names = [n for n in ORDER if n in set(names)]
+    shapes = {n: scenario_shape(n, args.scale, halve) for n in names}
 
     print("bench: volume {} ({}), scale {} factor {:g}, seed {}, rounds {}"
           .format(root, volume_note, args.scale, factor, args.seed, args.rounds))
     print("bench: dedup {}".format(dedup_path))
 
-    keep = {corpus.corpus_dir(root, n, args.scale, args.seed) for n in names}
+    keep = {corpus.corpus_dir(root, n, shapes[n][0], args.seed) for n in names}
     manifests = {}
     for name in names:
-        base = corpus.corpus_dir(root, name, args.scale, args.seed)
-        manifest = corpus.load(root, name, args.scale, args.seed)
+        scale, shaped = shapes[name]
+        base = corpus.corpus_dir(root, name, scale, args.seed)
+        manifest = corpus.load(root, name, scale, args.seed)
         # deletion and rescan both destroy what they scan, so neither is reused.
-        if (manifest is None or manifest.get("factor") != factor
+        if (manifest is None or manifest.get("factor") != shaped
                 or name in ("deletion", "rescan")):
             # Out with the old first: the space it is holding is the space the
             # replacement needs.
             shutil.rmtree(base, ignore_errors=True)
-            ensure_space(root, int(corpus.estimated_bytes(name, factor) * 1.4), keep)
+            ensure_space(root, int(corpus.estimated_bytes(name, shaped) * 1.4), keep)
             started = time.monotonic()
-            manifest = corpus.build(root, name, args.seed, args.scale, factor)
+            manifest = corpus.build(root, name, args.seed, scale, shaped)
             print("  built {:<12} {:>7} files  {:>9}  in {:.1f}s".format(
                 name, manifest["file_count"], human(manifest["total_bytes"]),
                 time.monotonic() - started))
@@ -1071,7 +1100,7 @@ def _locked(args, root, dedup_path, volume_note, halve) -> int:
     profile = None
     for name in names:
         manifest = manifests[name]
-        base = corpus.corpus_dir(root, name, args.scale, args.seed)
+        base = corpus.corpus_dir(root, name, shapes[name][0], args.seed)
         tree = os.path.join(base, "tree")
         if name == "deletion":
             print("\nbench: deletion gate ...", end=" ", flush=True)
