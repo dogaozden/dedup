@@ -908,3 +908,65 @@ divergent part.
 
 **Verdict:** KEPT. 0.4925 → 0.4851 (seed 1) and 0.5037 → 0.4955 (seed 2), no
 bytes regression anywhere. **Both seeds are now under the 0.50 target.**
+
+## 2026-08-22 — Reader count, re-tested against this tree (rejected)
+
+**Hypothesis:** Round one measured `read_jobs()` = 2 as optimal on `needle`,
+but that was before `hash_stage` was batched and before stage 3 grew a second
+read per file. A rejection is only valid against the tree it was measured on,
+and a micro-benchmark over the real corpus said 3 threads beat 2 (16.8 vs 18.8
+µs/file) for open+read+digest.
+
+**Change:** none kept. `jobs` overridden per run over the real corpora, min of
+three runs each:
+
+```text
+needle      j=2 3.157s (1.00x)  j=3 3.147s (1.00x)  j=4 3.929s (1.24x)  j=6 4.532s (1.44x)
+photos      j=2 0.016s (1.00x)  j=3 0.019s (1.14x)  j=4 0.018s (1.10x)  j=6 0.018s (1.10x)
+samesize    j=2 0.047s (1.00x)  j=3 0.067s (1.43x)  j=4 0.069s (1.47x)  j=6 0.091s (1.94x)
+typical     j=2 0.350s (1.00x)  j=3 0.362s (1.03x)  j=4 0.533s (1.52x)  j=6 0.618s (1.77x)
+widegroup   j=2 0.057s (1.00x)  j=3 0.055s (0.96x)  j=4 0.049s (0.86x)  j=6 0.072s (1.26x)
+```
+
+**Verdict:** REJECTED, and the round-one number stands on the new tree. The
+micro-benchmark was measuring one stage in isolation; the whole pipeline says
+2 — the only scenario that wants more readers is `widegroup`, whose compare
+stage is one group of 519 members, and it is 0.05 s. The mechanism, so the
+next person does not have to re-run it: the extra thread wins in stage 3 where
+every task is a syscall that drops the GIL, and loses more than that in the
+compare stage, where `partition_blocks` holds the GIL for a whole block.
+
+## 2026-08-22 — Do not open a file whose bytes are already in hand
+
+**Hypothesis:** Once the head is kept, a group of short files arrives at stage
+5 with every byte already in memory — `typical` sends 1,533 files there, all
+of them under `DEEP_HEAD`. The stage still opens each one, seeks to EOF and
+reads nothing. On this volume that open is 22 µs and the `stat` that says the
+file has not changed is 1.7.
+
+**Change:** `split_identical` settles a group without opening anything when
+every member's kept head covers its whole length, after `unchanged()` confirms
+size and mtime still match what was read.
+
+**Numbers:** interleaved A/B over the `typical` corpus, two passes, min of
+three runs each: 0.306 / 0.311 s → 0.269 / 0.271 s. Full suite, seed 1, exit
+0, 119 passed:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.289    0.460     0.63x     103      52
+photos       pass  147.9 MB   150.8 MB    0.98x     0.018    0.024     0.78x     64       149
+bigheader    pass  146.2 MB   296.5 MB    0.49x     0.017    0.031     0.53x     97       109
+needle       pass  244.1 MB   244.1 MB    1.00x     2.740    4.122     0.66x     106      304
+samesize     pass  32.8 MB    348.4 MB    0.09x     0.046    1.553     0.03x     57       219
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.058    0.055     1.05x     161      152
+prefixtrap   pass  33.4 MB    44.2 MB     0.75x     0.011    0.015     0.77x     24       50
+adversarial  pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+SCORE: 0.4802
+```
+
+Seed 2, default scale, exit 0, same bytes as the entry above on every
+scenario, `typical` 0.63x wall: `SCORE: 0.4903`.
+
+**Verdict:** KEPT. Bytes identical — this removes syscalls, not reads —
+`typical` 0.77x → 0.63x, 0.4851 → 0.4802 (seed 1) and 0.4955 → 0.4903 (seed 2).

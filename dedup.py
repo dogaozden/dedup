@@ -953,6 +953,19 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
     disk. It is also exact by construction — there is no digest left to
     collide, so nothing is deleted on the strength of a guess.
     """
+    # A short file that stage 3 read to its end is already here in full.
+    # Opening it again to read nothing costs an open — 22 µs against the 1.7
+    # of the stat that says the file is still the one we read.
+    if (len(members) > 1 and all(len(r.head) >= r.size for r in members)
+            and unchanged(members)):
+        settled = []
+        for run in partition_blocks([(r, r.head) for r in members]):
+            recs = [r for r, _ in run]
+            stats.hashed_files += len(recs)
+            if len(recs) > 1:
+                settled.append(recs)
+        return settled
+
     handles, opened = {}, []
     for rec in members:
         try:
@@ -1047,6 +1060,22 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
         for fh in handles.values():
             fh.close()
     return matched
+
+
+def unchanged(members: list) -> bool:
+    """Whether every file is still the one whose bytes we kept.
+
+    Kept bytes are only a proof of anything while the file on disk has not
+    moved under us, and this tool deletes what it proves.
+    """
+    for rec in members:
+        try:
+            st = os.stat(rec.path)
+        except (PermissionError, OSError):
+            return False
+        if st.st_size != rec.size or st.st_mtime != rec.mtime:
+            return False
+    return True
 
 
 def release(files: list, pending: list) -> None:
