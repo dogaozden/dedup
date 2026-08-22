@@ -1145,3 +1145,167 @@ the proof of a duplicate out of stage 5's reads and into bytes kept from stage
 happening" is a live one rather than a formality. It notices: a compare stage
 truncated to skip its last round is caught as five wrong groups, and a tool
 under-reporting its own bytes by half is caught against the 20% tolerance.
+
+---
+
+# Integration — round two, the cache, and extension filtering onto `main`
+
+This is not an optimization entry. It is the record of merging three branches
+into `main`, what fought with what, and two things that came out of it that
+somebody has to decide.
+
+## 2026-08-22 — Merging `opus-round2`, `rescan-cache` and `ext-filter`
+
+**What went in, in order:**
+
+1. `opus-round2` (`07b7e05`) — the round-two winner. Merged clean; it branched
+   from the current `main`.
+2. `rescan-cache` (`fb81ee7`) — the persistent digest cache. Real conflicts,
+   below.
+3. `ext-filter` (`1a245fb`) — `--ext`/`--skip-ext` in both walkers. Small
+   conflicts, all in signatures the cache had already widened.
+
+**Why `rescan-cache` fought.** It branched from `93d7c11`, which predates the
+round-one merge entirely. It had never seen the two-tier head, the batched
+`hash_stage`, the `partition_blocks` fan-out guard or the group-order
+tie-break, let alone round two. Every one of those had to win its conflict,
+with the cache layered on afterwards rather than merged alongside.
+
+**Two correctness bugs the textual merge produced.** Both would have compiled,
+passed a casual reading, and been wrong:
+
+- `split_identical` learned its whole-file digest from a hasher fed only what
+  the call actually read — and round two makes that call seek past the kept
+  head and stop before the kept tail. The digest of a file's *middle* would
+  have been stored in the `full` column, and the next scan would have matched
+  two files that agree only in the middle. Fixed by feeding the kept bytes into
+  the hasher in their place: head first, then the streamed region, then the
+  tail as each run finishes. Where that cannot be done the digest is not
+  stored.
+- `hash_stage` appended each stage's kept block to the record's run without
+  checking that it *continued* that run. A file the cache answered at stage 3
+  was never read and carries nothing, so the deep head's block would have been
+  glued to the front of the gap, leaving `head` claiming to start at offset 0
+  while starting 4 KiB in — and stage 5 compares that against another file's
+  real prefix. Two files differing only in their first page could have been
+  called duplicates. `keep` now pairs each attribute with the length its run
+  must already have, and a block that does not continue the run is dropped.
+
+Neither is hypothetical: the second is reached by an ordinary sequence — a file
+settles alone at stage 3 on one scan, a new file with the same end pages
+arrives on the next, and the old file hits the `ends` column while missing
+`deep`.
+
+**Remapping the cache onto the new stages.** `CACHED_FIELD` keyed on
+`hash_head` and `hash_sample`; the pipeline calls neither of those at stage 3
+any more. It now keys on `hash_ends`/`keep_ends` (a new `ends` column), on
+`hash_head_rest`/`keep_head_rest` (a new `deep` column), and on `hash_sample`.
+`hash_head` is deliberately absent: no stage calls it, and a digest of the
+first page is not a digest of the two end pages. `CACHE_SCHEMA` went 1 → 2, so
+every database written before this is dropped and rebuilt cold — a version-1
+row's digests were taken over different bytes than the columns they sit in now
+name. A group that settles from bytes already in hand (round two's zero-open
+path) also learns its whole-file digest now, which is what lets a warm scan of
+short files attest anything at all.
+
+`CACHE_FREE` arrived unused, a list beside a string comparison that did the
+real work. It selects the gate now, so the law is expressed once.
+
+**luna's `ffefb02` — superseded, not applied.** It moved stage 4's first window
+past `DEEP_HEAD`. Round two's `sample_points()` already spreads all eight
+windows over `[DEEP_HEAD, size - TAIL_BYTES)`, which is strictly more, and
+applying `ffefb02` on top would now be a bug: it subtracts `DEEP_HEAD` from the
+first window's length, `SAMPLE_BYTES` is 64 KiB and `DEEP_HEAD` is 64 KiB, so
+the first window would read nothing and `sampled_bytes` would under-report by
+64 KiB. Superseded by the round-two restructure, recorded here by the
+integration.
+
+**Numbers.** 166 passed — 119 from `main`, 23 from the cache, 24 from
+`ext-filter`, none dropped or weakened. Full suite, in-tree, seed 1, exit 0:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.291    0.449     0.65x     104      53
+photos       pass  147.9 MB   150.8 MB    0.98x     0.019    0.023     0.83x     65       149
+bigheader    pass  146.2 MB   296.5 MB    0.49x     0.016    0.031     0.52x     98       103
+needle       pass  244.1 MB   244.1 MB    1.00x     2.843    4.151     0.69x     115      305
+samesize     pass  32.8 MB    348.4 MB    0.09x     0.048    1.577     0.03x     57       219
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.059    0.054     1.10x     162      152
+prefixtrap   pass  33.4 MB    44.2 MB     0.75x     0.012    0.015     0.80x     25       51
+adversarial  pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+SCORE: 0.4842
+```
+
+Seed 2, default scale, exit 0: `SCORE: 0.4901`, and `prefixtrap` measured
+separately at seed 2 reads 33.4 MB against 44.2 MB (0.75x), no regression.
+Bytes on every scored scenario are identical to round two's, to the byte, which
+is the thing that had to be true: the cache is off in all of them and it moved
+nothing.
+
+**Verdict:** MERGED. `opus-round2` at `8f25e79`, `rescan-cache` at `c31b5ab`,
+`ext-filter` at `aa0f611`.
+
+## 2026-08-22 — Two things the merge exposed, neither of them fixed here
+
+Logged rather than repaired, per section 9. Both need a decision.
+
+**1. The ten corpora no longer fit on the RAM disk.** Round one added
+`prefixtrap` (412 MB estimated at default scale) and `rescan-cache` added
+`rescan` (430 MB). Neither branch could see the other. Together the ten
+scenarios estimate 3171 MB against the 2816 MB `ram_disk_mb()` creates — a
+355 MB shortfall before the 1.4x headroom `ensure_space` wants for the corpus
+being built. A full default-scale run now dies:
+
+```text
+$ python3 bench/run.py --score
+bench: /Volumes/dedupbench needs 574.1 MB free, has 118.3 MB
+```
+
+Exit 2, an environment error rather than a gate failure, and `ensure_space`
+cannot help because every corpus it might evict is one this run needs. The
+scores above were taken by naming the nine scenarios that do fit; the six
+scored terms are unaffected and remain comparable with every score before them.
+`rescan` was verified separately with `--selftest`. Raising the RAM disk is the
+obvious repair and it is not mine to make: section 2 warns that an oversized
+RAM disk pushes this 16 GB machine into swap, onto a boot disk that is 94%
+full, and section 5 says not to edit `bench/` to make a failing check pass.
+
+**2. `rescan`'s edit phase is racy on this volume, and the cache is why.**
+The gate rewrites a file *without* restoring its mtime and requires the scan to
+notice. On this volume it often does not. `run.py` builds the corpus volume
+with `diskutil erasevolume HFS+`, and HFS+ records mtime to the second:
+
+```text
+$ python3 - <<'PY'   # on /Volumes/dedupbench, writing every 200 ms
+mtime_ns=1787372023000000000  (frac=0)
+mtime_ns=1787372023000000000  (frac=0)
+mtime_ns=1787372023000000000  (frac=0)
+mtime_ns=1787372023000000000  (frac=0)
+PY
+```
+
+The cache key is `(inode, size, mtime_ns)`, so an edit landing in the same
+second as the scan that cached the digest is invisible — no forgery required,
+unlike the poison case the gate tests deliberately. The failure reads:
+
+```text
+  control, no sabotage        UNEXPECTED FAILURE: fail: after an edit — groups
+  differ: 1 expected group(s) not found: 3224280B [album/set/five-1.jpg, ...] |
+  1 unexpected group(s): 3224280B [album/set/five-0.jpg, ...]
+```
+
+Measured at smoke scale: `rescan-cache`'s own tip fails this 2 runs in 5. The
+merged tree fails it 5 in 6 — not because anything broke, but because round
+two's scans are fast enough that the corpus build, both scans and the edit now
+land inside one tick. On a run that wins the race everything passes, including
+the two that matter most: warm reads **0 B against a cold 32.8 MB (0.00%)**,
+and `skip-attested-verify` is caught by the real deletion refusal
+("deleted album/copies/pair000.jpg out of a group whose copies do not match").
+
+This is a real limit of the tool, not an artifact of the bench — the same thing
+happens on any volume with coarse timestamps. It costs a wrong answer, never a
+wrong deletion, because deletion byte-verifies every attested group. The known
+fix is git's "racily clean" rule: distrust an entry whose mtime falls in the
+same tick as the scan that wrote it. It costs one extra warm-up scan, which the
+gate's two-scan cold/warm shape cannot express, so taking it means changing the
+gate — which section 5 puts out of an optimizer's hands. Left for the user.

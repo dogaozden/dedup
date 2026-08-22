@@ -502,6 +502,35 @@ drawn in four places that all have to hold:
   and it is reported in the table. Driving it down by skipping the deletion-time
   comparison is not an improvement to it; it is a different program.
 
+**KNOWN LIMIT, unresolved — the key is only as fine as the filesystem's clock.**
+The law above says the cache cannot see a file whose size and `mtime_ns` have
+been *forged* back. There is a second case, and it involves no forgery at all: on
+a filesystem that records mtime to the second rather than the nanosecond, any
+edit landing in the same second as the scan that cached the digest is invisible
+to `(inode, size, mtime_ns)` for exactly the same reason. **The benchmark's own
+RAM disk is such a filesystem** — `run.py` builds it with `diskutil erasevolume
+HFS+`, and HFS+ timestamps are whole seconds; four writes 200 ms apart report an
+identical `st_mtime_ns`. APFS, which is what a real Mac volume is, does not have
+this problem.
+
+This is why `rescan`'s "ordinary edit" phase is racy on this machine: it passes
+only when the corpus build and the edit happen to fall in different seconds.
+Measured at smoke scale, the branch that introduced the gate fails it 2 runs in 5
+on its own tree, and post-merge it fails more often still, because round two's
+scans are fast enough that the build, both scans and the edit now fit inside one
+tick. Nothing about the merge caused it and no gate was weakened to accommodate
+it.
+
+What it costs is a wrong *answer*, never a wrong deletion: deletion byte-verifies
+every attested group, so the poison bullet above still holds and files are still
+safe. But `--list` can report an edited file as a duplicate of what it used to
+match. The known-good fix is git's "racily clean" rule — refuse to trust an entry
+whose mtime falls in the same tick as the scan that recorded it — and it costs
+one extra warm-up scan, which the gate's two-scan cold/warm shape cannot express.
+**That is a decision for the user, not an optimisation to be taken unilaterally**,
+and until it is taken, do not tune anything against the edit phase of `rescan` on
+this volume.
+
 Be clear-eyed about the trap here, because it has not gone away: a cache
 **scores enormously** on a benchmark that runs the same corpus repeatedly. That
 is exactly why the scored scenarios do not get one. If you find yourself
@@ -545,7 +574,7 @@ breaking `_walk_scandir` is not a win.
 
 ## 6. Architecture map
 
-One file: `dedup.py`, about 1,700 lines. Entry point is `main()`; the pipeline
+One file: `dedup.py`, about 2,500 lines. Entry point is `main()`; the pipeline
 is `find_duplicates()`. Everything below names real functions and real
 constants — go read them.
 
@@ -553,15 +582,22 @@ constants — go read them.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `HEAD_BYTES` | 64 KiB | stage-3 sample size |
-| `SAMPLE_BYTES` | 1 MiB | bytes per sample point in stage 4 |
-| `SAMPLE_POINTS` | 4 | head, two middles, tail |
-| `SAMPLE_SPAN` | 8 MiB | `SAMPLE_BYTES * SAMPLE_POINTS * 2` — below this, sampling isn't worth it |
+| `HEAD_BYTES` | 4 KiB | one page from the front — stage 3's first tier |
+| `TAIL_BYTES` | 4 KiB | ...and one from the end, read in the same open |
+| `DEEP_HEAD` | 64 KiB | how far stage 3's second tier extends the head |
+| `SAMPLE_BYTES` | 64 KiB | bytes per sample point in stage 4 |
+| `SAMPLE_POINTS` | 8 | windows spread over what stage 3 has not read |
+| `SAMPLE_SPAN` | 8 MiB | below this, just read it all. Its own constant now, not derived from the two above |
 | `CHUNK` | 4 MiB | stage-5 comparison chunk on flash |
 | `SLOW_CHUNK` | 16 MiB | ...and on a spinning disk |
 | `COMPARE_BUDGET` | 128 MiB | ceiling on bytes held in memory for one group |
 | `MIN_CHUNK` | 128 KiB | floor the chunk shrinks toward in wide groups |
+| `RETAIN_BUDGET` | 128 MiB | ceiling on end bytes carried from stage 3 to stage 5 |
+| `HASH_BATCH` | 64 | files handed to a reader thread at a time |
+| `PARTITION_FANOUT` | 256 | the fan-out at which `partition_blocks` switches to a dict pass |
 | `BULK_BUF` | 128 KiB | `getattrlistbulk` buffer, per `DirReader` |
+| `CACHE_SCHEMA` | 2 | bump it and every stored digest is discarded |
+| `CACHE_TTL_DAYS` | 180 | cache entries not seen in this long are dropped |
 
 Note: the default `--min-size` is 10 MB, which is above `SAMPLE_SPAN`. With
 default flags every candidate is therefore big enough for stage 4. Scenarios
@@ -590,16 +626,28 @@ that has only one record left. A file with a unique size cannot have a twin, and
 this costs no reads at all. Survivors are sorted by `by_layout` — `(dev, ino)` —
 so the later stages read in roughly the order the volume laid the files down.
 
-**Stage 3 — hash the head.** `hash_stage(candidates, hash_head, ...)`.
-`hash_head()` SHA-256s the first `HEAD_BYTES` of each file. Buckets are keyed
-`(size, digest)` — size is part of the key because a partial digest says nothing
-about files of different lengths. Cheap, and it kills most of what stage 2 left.
-Anything in a bucket of one is done.
+**Stage 3 — hash both ends, then the rest of the head.** Two tiers, and a
+tier-and-a-half between them. `hash_stage(candidates, hash_ends, ...)` reads
+one page from the front and, for any file longer than `DEEP_HEAD + TAIL_BYTES`,
+one page from the end — **in a single open**, hashed into one digest. The far
+page is the point: same-size files that share a header are the ordinary case,
+and reading more of a header they agree on settles nothing. Buckets are keyed
+`(size, digest)`, because a partial digest says nothing about files of
+different lengths. Anything in a bucket of one is done.
+
+Whatever that leaves crowded, and is longer than `HEAD_BYTES`, then reads
+`HEAD_BYTES..DEEP_HEAD` — `hash_head_rest()`, the rest of the deep head and
+only the part not already read. `hash_head()` still exists but no stage calls
+it; it is not the head any more.
 
 **Stage 4 — sample across the file.** `hash_stage(survivors, hash_sample, ...)`,
 but only for groups whose size is greater than `SAMPLE_SPAN`. `hash_sample()`
-seeds the digest with the file's size, then reads `SAMPLE_POINTS` blocks of
-`SAMPLE_BYTES` at evenly spaced offsets: head, two middles, tail. Files at or
+seeds the digest with the file's size, then reads `SAMPLE_POINTS` windows of
+`SAMPLE_BYTES` spread by `sample_points()` across `[DEEP_HEAD, size -
+TAIL_BYTES)` — the part stage 3 has *not* read, so no byte is read twice.
+Eight windows of 64 KiB, not four of a megabyte: a window only ever catches a
+difference that spans a region, and for that it is how many windows there are
+and how far apart they sit that decides, not how fat each one is. Files at or
 below `SAMPLE_SPAN` skip this stage entirely, because `hash_sample()` would
 just read the whole file and then stage 5 would read the whole file again.
 Every bucket holds exactly one size, so a bucket is always entirely on one side
@@ -614,6 +662,16 @@ chunk from each in lockstep via `read_block()`, and hands the blocks to
 comparing against a pivot rather than hashing. Runs that fall to one member are
 settled and stop being read. Runs that reach EOF together are duplicates. This
 is exact by construction — there is no digest left to collide.
+
+Stage 3 hands it a head start, literally. When the whole candidate set's end
+bytes fit in `RETAIN_BUDGET`, `hash_stage` keeps the blocks it read on the
+record (`FileRec.head`, `FileRec.tail`) and stage 5 **compares those bytes**
+rather than reading the same region again — the bytes themselves, not a digest
+of them, so the proof is the same proof. An `fstat` per member first: a file
+whose size or mtime has moved since it was read puts the whole group back on
+reading from zero. A group whose kept head already covers every member settles
+with no `open` at all. `release()` drops kept bytes as soon as no later stage
+needs them.
 
 `read_block()` loops until it has the bytes it asked for, because an unbuffered
 `read(2)` is allowed to return short, and two identical files that happened to
@@ -663,6 +721,34 @@ should still be able to use the whole disk queue.
 - **Stage 4 skips files at or below `SAMPLE_SPAN`** specifically to avoid the
   double read. On a set of 300 MB images sharing a 100 MB header, sampling cut
   reads from 3.15 GB to 0.67 GB — 79% fewer — for the same answer.
+- **An `open` costs about twenty times what reading a page out of an already
+  open file costs.** Measured on this volume: `os.lstat` 1.7 µs, `open`+`close`
+  22.1 µs, `open`+`read(4096)`+`close` 32.8 µs. This is the number behind
+  three separate round-two decisions — reading both end pages in one open
+  rather than two, settling a fully-kept group without opening it, and keeping
+  `SAMPLE_SPAN` where it is. Do not re-measure it; do design around it.
+- **The far page separates what a deeper head cannot.** Round two's largest
+  single move. Probing one page from the end of the file *before* extending
+  the head took `samesize` from 348.4 MB to 32.8 MB (0.09x) and `bigheader`
+  from 296.5 MB to 160.1 MB, and took the score from 0.7791 to 0.4961 in one
+  step. The reasoning generalises and is worth holding on to: two same-size
+  files that are still together after one page agree on their header, because
+  sharing a header is *why* they are still together — so more of the header is
+  the least informative thing left to read.
+- **Eight 64 KiB windows beat four of a megabyte** in stage 4, for an eighth of
+  the reading. Coverage of the file's length is what a sample buys; window
+  width is not. `bigheader` 160.1 MB → 146.2 MB.
+- **Round two took the score from 0.8522 to 0.4802 (seed 1) / 0.4903 (seed 2)
+  in-tree**, referee 0.4790 / 0.4845, across five kept changes and two
+  rejections. The whole of it was one idea — do not read a byte twice, and
+  probe where files actually differ before reading more of where they agree.
+  It was audited afterwards and found clean.
+- **Unbuffered reads in `hash_ends` are a wash on this harness and a real cost
+  off it.** Rejected twice, in both rounds, for the same reason: buffered
+  `read(4096)` actually pulls 8192 bytes off the raw layer, so the harness —
+  which counts bytes from `.read()`'s return value — cannot see the doubling.
+  The A/B was 0.4811 against 0.4802, inside the noise. If you want this, you
+  need a measurement this bench cannot give you.
 
 ### Already on `main` — do NOT re-do these
 
@@ -678,9 +764,15 @@ re-proposing any of it is a wasted idea.
   and the head's discriminating power is exactly what it was. `typical`
   108.7 MB → 73.1 MB. **Note the two names**: code and scenarios that used to
   mean "the head" by `HEAD_BYTES` now have to say which tier they mean.
-- **Skipping the head in the first deep sample** (`hash_sample`). Stage 3 has
-  already hashed the first `HEAD_BYTES`, so stage 4's first window starts
-  after it instead of reading it again. Landed from `luna`.
+- **Stage 4 reads only what stage 3 did not.** This started in round one as
+  `luna`'s change to move stage 4's *first* window past `HEAD_BYTES`. Round two
+  replaced it wholesale: `sample_points()` now spreads all eight windows across
+  `[DEEP_HEAD, size - TAIL_BYTES)`, so every window avoids both the deep head
+  and the tail page, not just the first one. **`luna`'s `ffefb02` ("skip deep
+  head during sampling") is superseded and must not be applied** — it subtracts
+  `DEEP_HEAD` from the first window's length, and `SAMPLE_BYTES` is now 64 KiB,
+  exactly `DEEP_HEAD`, so on this tree it would read a zero-length first window
+  and under-report `sampled_bytes` by 64 KiB.
 - **The group-order tie-break.** The final sort is `(-size, name, keeper path)`.
   The known-bug entry the idea menu used to carry is fixed.
 - **The partition fan-out guard.** `partition_blocks` keeps its pivot loop, but
@@ -697,6 +789,21 @@ re-proposing any of it is a wasted idea.
 - **Batched `hash_stage`.** Readers get `HASH_BATCH` files per task instead of
   one task per file. On `needle`'s hundred thousand small files the queueing
   cost was larger than the reads.
+
+Round two landed five more, all on `opus-round2` and all in the tree you are
+reading. The stage descriptions in section 6 above already describe the result;
+this is the list so you do not re-propose one of them:
+
+- **`hash_ends`** — both end pages in one open, as stage 3's first tier.
+- **The tail probe before the deep head** — the far page is asked for before
+  any more of the head. This is the one that moved the score most.
+- **Eight 64 KiB sample windows**, spread over what stage 3 has not read.
+- **Kept end bytes** (`RETAIN_BUDGET`) — stage 5 compares the bytes stage 3
+  already read, behind an `fstat` revalidation guard.
+- **Settling a fully-kept group with no `open` at all.**
+
+And the re-scan cache and `--ext`/`--skip-ext` filtering landed alongside them;
+section 5 has the cache's law and it is not negotiable.
 
 **Branch `opus-head-twotier` is superseded, not pending.** It holds the first
 form of the two-tier head, from before `hash_stage` was batched, when the idea
@@ -777,6 +884,18 @@ measured, not a known win. Several will turn out to be losses — log those too.
   `len(members)` readers. Overlapping small groups (while keeping one big
   group able to saturate) is a real scheduling idea. Watch the memory budget
   — `COMPARE_BUDGET` is currently per-group.
+- **OPEN QUESTION — what the tail probe costs on a spinning disk.** `hash_ends`
+  seeks from the first page to the last one on every file long enough to have
+  both. On this bench that seek is free: the corpus is a RAM disk, which has no
+  heads to move and no rotational latency to wait for, so the measurement that
+  made the tail probe a large win charged nothing for the one thing it would
+  cost most on real slow media — and slow media is exactly what this tool
+  exists for. Nobody has measured it on a real device. **Do not gate it on
+  `is_solid_state()` on the strength of the argument alone**: that would be an
+  unmeasured change to the stage that carries the largest win in the tool, made
+  on a benchmark that cannot see either side of the trade. Measure it on a real
+  spinning disk first, and if the seek does cost more than the reads it saves,
+  that is the point at which a per-device split is worth writing.
 - **Anything else you find.** You have the whole file. But hold the priority:
   bytes-read wins beat time wins beat RSS wins.
 
