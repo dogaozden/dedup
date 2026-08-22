@@ -1,5 +1,6 @@
 """Tests for dedup's detection pipeline, trash handling, and marking rules."""
 import os
+import time
 
 import pytest
 
@@ -1088,3 +1089,394 @@ class TestDeviceAwareJobs:
         monkeypatch.setattr(dedup, "is_solid_state", lambda p: True)
         assert dedup.read_jobs(["/x"], 3) == 3
         assert dedup.read_jobs(["/x"], 0) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the re-scan cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cached_scan(path, cache, **kw):
+    """Run the pipeline with a cache attached; return (groups, stats)."""
+    stats = ScanStats()
+    opts = dict(excludes=[], min_size=1, jobs=2, verify=False)
+    opts.update(kw)
+    groups = find_duplicates([str(path)], stats=stats, reporter=None,
+                             cache=cache, **opts)
+    return groups, stats
+
+
+def twins(root, name="a.bin", other="b.bin", body=b"twin" * 4096):
+    """Two identical files big enough to travel through every stage."""
+    return write(root / name, body), write(root / other, body)
+
+
+def poison(path, body: bytes):
+    """Rewrite a file's contents but put its size and mtime back.
+
+    This is the attack the cache cannot see: the key it remembers is
+    (inode, size, mtime_ns), and all three still match.
+    """
+    st = os.stat(path)
+    assert len(body) == st.st_size, "a poisoned file must keep its size"
+    with open(path, "r+b") as fh:
+        fh.write(body)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    after = os.stat(path)
+    assert (after.st_size, after.st_mtime_ns) == (st.st_size, st.st_mtime_ns)
+
+
+class TestCacheKey:
+    """(inode, size, mtime_ns) decides whether a remembered digest applies."""
+
+    def test_warm_scan_reads_nothing(self, tmp_path):
+        twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cold_groups, cold = cached_scan(tmp_path, cache)
+        cache.close()
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        warm_groups, warm = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert cold.hashed_bytes > 0
+        assert warm.hashed_bytes == 0
+        assert len(cold_groups) == len(warm_groups) == 1
+        assert ({f.path for f in cold_groups[0].files}
+                == {f.path for f in warm_groups[0].files})
+
+    def test_warm_groups_are_attested_not_proven(self, tmp_path):
+        twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cold_groups, _ = cached_scan(tmp_path, cache)
+        cache.close()
+        assert cold_groups[0].attested is False
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        warm_groups, _ = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert warm_groups[0].attested is True
+
+    def test_changed_content_is_re_read(self, tmp_path):
+        a, b = twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        # a normal edit, same length so the two still meet in the size bucket
+        b.write_bytes(b"x" * len(b"twin" * 4096))
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert groups == []
+        assert stats.hashed_bytes > 0           # b's mtime moved, so b was read
+
+    def test_same_mtime_different_size_is_a_miss(self, tmp_path):
+        """Size is half the key, so a same-mtime resize still has to be read."""
+        a, b = twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        st = os.stat(b)
+        grown = b"grown" * 4096
+        b.write_bytes(grown)
+        os.utime(b, ns=(st.st_atime_ns, st.st_mtime_ns))
+        write(tmp_path / "c.bin", grown)
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        # b's remembered digests describe bytes it no longer holds. Reusing
+        # them would hide the b/c pair entirely.
+        assert len(groups) == 1
+        assert {f.path for f in groups[0].files} == {str(b), str(tmp_path / "c.bin")}
+        assert stats.hashed_bytes > 0
+
+    def test_a_third_copy_joins_a_remembered_group(self, tmp_path):
+        twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        write(tmp_path / "c.bin", b"twin" * 4096)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, _ = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert len(groups) == 1
+        assert len(groups[0].files) == 3
+        # one member had to be read, so the group was proved, not remembered
+        assert groups[0].attested is False
+
+
+class TestCacheStore:
+    """Where it lives, what happens when it is unusable."""
+
+    def test_env_var_chooses_the_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEDUP_CACHE_DIR", str(tmp_path / "elsewhere"))
+
+        assert dedup.cache_home() == str(tmp_path / "elsewhere")
+
+    def test_scanning_writes_one_database(self, tmp_path):
+        twins(tmp_path)
+        cache_dir = tmp_path / "cache"
+        cache = dedup.ScanCache(str(cache_dir))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        files = list(cache_dir.glob("*.db"))
+        assert len(files) == 1
+        assert files[0].stat().st_size > 0
+
+    def test_no_cache_writes_nothing_and_reads_everything(self, tmp_path):
+        twins(tmp_path)
+        cache_dir = tmp_path / "cache"
+
+        first = scan(tmp_path)
+        stats = ScanStats()
+        second = find_duplicates([str(tmp_path)], excludes=[], min_size=1, jobs=2,
+                                 verify=False, stats=stats, reporter=None)
+
+        assert len(first) == len(second) == 1
+        assert stats.hashed_bytes > 0
+        assert not cache_dir.exists()
+
+    def test_a_corrupt_database_is_ignored_not_fatal(self, tmp_path, capsys):
+        twins(tmp_path)
+        cache_dir = tmp_path / "cache"
+        cache = dedup.ScanCache(str(cache_dir))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        db = list(cache_dir.glob("*.db"))[0]
+        db.write_bytes(b"this is not a database" * 100)
+
+        cache = dedup.ScanCache(str(cache_dir))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert len(groups) == 1
+        assert stats.hashed_bytes > 0            # nothing was remembered
+        assert "cache" in capsys.readouterr().err.lower()
+
+    def test_an_older_schema_is_rebuilt(self, tmp_path):
+        twins(tmp_path)
+        cache_dir = tmp_path / "cache"
+        cache = dedup.ScanCache(str(cache_dir))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        import sqlite3
+        db = list(cache_dir.glob("*.db"))[0]
+        con = sqlite3.connect(str(db))
+        con.execute("PRAGMA user_version = 0")
+        con.commit()
+        con.close()
+
+        cache = dedup.ScanCache(str(cache_dir))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert len(groups) == 1
+        assert stats.hashed_bytes > 0            # the old rows were discarded
+        con = sqlite3.connect(str(db))
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        con.close()
+        assert version == dedup.CACHE_SCHEMA
+
+    def test_stale_entries_are_pruned(self, tmp_path):
+        twins(tmp_path)
+        cache_dir = tmp_path / "cache"
+        cache = dedup.ScanCache(str(cache_dir))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        import sqlite3
+        db = list(cache_dir.glob("*.db"))[0]
+        con = sqlite3.connect(str(db))
+        long_ago = int(time.time()) - (dedup.CACHE_TTL_DAYS + 1) * 86400
+        con.execute("UPDATE files SET last_seen = ?", (long_ago,))
+        con.commit()
+        assert con.execute("SELECT count(*) FROM files").fetchone()[0] > 0
+        con.close()
+
+        # a scan of an empty tree still opens the volume's cache and prunes it
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        cache = dedup.ScanCache(str(cache_dir))
+        cached_scan(empty, cache)
+        cache.close()
+
+        con = sqlite3.connect(str(db))
+        left = con.execute("SELECT count(*) FROM files").fetchone()[0]
+        con.close()
+        assert left == 0
+
+    def test_hardlinks_share_one_entry(self, tmp_path):
+        first = write(tmp_path / "first.bin", b"linked" * 4096)
+        os.link(str(first), str(tmp_path / "second.bin"))
+        write(tmp_path / "twin.bin", b"linked" * 4096)
+
+        cache_dir = tmp_path / "cache"
+        cache = dedup.ScanCache(str(cache_dir))
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        import sqlite3
+        con = sqlite3.connect(str(list(cache_dir.glob("*.db"))[0]))
+        rows = con.execute("SELECT count(*) FROM files").fetchone()[0]
+        con.close()
+        assert rows == 2                          # two inodes, three names
+
+
+class TestDeletionVerifies:
+    """The safety core: a remembered match is never good enough to delete on."""
+
+    def _attested(self, tmp_path, body=b"twin" * 4096):
+        """A warm scan of two identical files, returning (groups, cache)."""
+        twins(tmp_path, body=body)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cached_scan(tmp_path, cache)
+        cache.close()
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, _ = cached_scan(tmp_path, cache)
+        assert groups and groups[0].attested
+        return groups, cache
+
+    def test_verify_passes_when_the_bytes_really_match(self, tmp_path):
+        groups, cache = self._attested(tmp_path)
+
+        safe, refused = dedup.verify_attested(groups, cache=cache)
+        cache.close()
+
+        assert refused == []
+        assert safe == groups
+        assert groups[0].attested is False        # proved now, not remembered
+
+    def test_verify_refuses_a_poisoned_group(self, tmp_path):
+        groups, cache = self._attested(tmp_path)
+        poison(tmp_path / "b.bin", b"evil" * 4096)
+
+        safe, refused = dedup.verify_attested(groups, cache=cache)
+        cache.close()
+
+        assert safe == []
+        assert refused == groups
+
+    def test_auto_deletes_nothing_from_a_poisoned_group(self, tmp_path, capsys):
+        groups, cache = self._attested(tmp_path)
+        poison(tmp_path / "b.bin", b"evil" * 4096)
+
+        code = dedup.run_auto(groups, "shortest", hard=True, assume_yes=True,
+                              cache=cache)
+        cache.close()
+
+        assert (tmp_path / "a.bin").exists()
+        assert (tmp_path / "b.bin").exists()
+        assert (tmp_path / "b.bin").read_bytes() == b"evil" * 4096
+        out = capsys.readouterr()
+        assert "refus" in (out.out + out.err).lower()
+        assert code == 0
+
+    def test_auto_still_deletes_a_group_that_verifies(self, tmp_path):
+        groups, cache = self._attested(tmp_path)
+
+        dedup.run_auto(groups, "shortest", hard=True, assume_yes=True, cache=cache)
+        cache.close()
+
+        assert (tmp_path / "a.bin").exists()
+        assert not (tmp_path / "b.bin").exists()
+
+    def test_a_refused_group_forgets_what_it_remembered(self, tmp_path):
+        groups, cache = self._attested(tmp_path)
+        poison(tmp_path / "b.bin", b"evil" * 4096)
+
+        dedup.verify_attested(groups, cache=cache)
+        cache.close()
+
+        # the lie is gone, so the next scan reads the bytes and gets it right
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        after, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert after == []
+        assert stats.hashed_bytes > 0
+
+    def test_a_byte_proven_group_is_not_read_again(self, tmp_path, monkeypatch):
+        twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, _ = cached_scan(tmp_path, cache)
+        assert groups[0].attested is False
+
+        def refuse(*a, **kw):
+            raise AssertionError("a group compared this scan was compared again")
+
+        monkeypatch.setattr(dedup, "split_identical", refuse)
+        safe, refused = dedup.verify_attested(groups, cache=cache)
+        cache.close()
+
+        assert safe == groups and refused == []
+
+    def test_browser_apply_refuses_a_poisoned_group(self, tmp_path):
+        groups, cache = self._attested(tmp_path)
+        poison(tmp_path / "b.bin", b"evil" * 4096)
+
+        browser = Browser(groups, str(tmp_path), hard=True, cache=cache)
+        browser.gi, browser.fi = 0, 0
+        browser.keep_only_current()
+        assert browser.marked
+        removed = browser.apply_marks()
+        cache.close()
+
+        assert removed == 0
+        assert (tmp_path / "a.bin").exists()
+        assert (tmp_path / "b.bin").exists()
+        assert browser.refused
+
+    def test_browser_apply_removes_a_group_that_verifies(self, tmp_path):
+        groups, cache = self._attested(tmp_path)
+
+        browser = Browser(groups, str(tmp_path), hard=True, cache=cache)
+        browser.keep_only_current()
+        removed = browser.apply_marks()
+        cache.close()
+
+        assert removed == 1
+        assert browser.refused == []
+        assert (tmp_path / "a.bin").exists()
+        assert not (tmp_path / "b.bin").exists()
+
+
+class TestCacheReporting:
+    """The output says which groups were proved and which were remembered."""
+
+    def test_report_names_both_kinds(self, capsys):
+        proven = DupGroup(100, [FileRec("/a", 100, 1.0, 1, 1),
+                                FileRec("/b", 100, 2.0, 1, 2)])
+        remembered = DupGroup(100, [FileRec("/c", 100, 1.0, 1, 3),
+                                    FileRec("/d", 100, 2.0, 1, 4)],
+                              attested=True)
+
+        dedup.print_report([proven, remembered])
+
+        out = capsys.readouterr().out
+        assert "byte-compared" in out
+        assert "remembered" in out
+        assert "verif" in out.lower()
+
+    def test_report_stays_quiet_when_nothing_was_remembered(self, capsys):
+        proven = DupGroup(100, [FileRec("/a", 100, 1.0, 1, 1),
+                                FileRec("/b", 100, 2.0, 1, 2)])
+
+        dedup.print_report([proven])
+
+        assert "remembered" not in capsys.readouterr().out
+
+    def test_no_cache_flag_exists(self):
+        args = dedup.build_parser().parse_args(["--no-cache"])
+
+        assert args.no_cache is True
+        assert dedup.build_parser().parse_args([]).no_cache is False
