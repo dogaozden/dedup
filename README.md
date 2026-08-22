@@ -263,6 +263,9 @@ Needs Python 3.9 or newer. No third-party packages.
 python3 -m pytest tests/ -v
 ```
 
+`conformance/` judges another implementation of dedup against this one — see
+`conformance/README.md`.
+
 ## Benchmarks
 
 `bench/` measures a change to dedup against a fixed corpus, with correctness
