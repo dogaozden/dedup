@@ -1293,9 +1293,26 @@ def cached_scan(path, cache, **kw):
     return groups, stats
 
 
+def aged(*paths):
+    """Push these files' mtimes back a couple of ticks.
+
+    A remembered digest is only trusted while the file's mtime tick is
+    strictly older than the scan that recorded it — the racily-clean rule —
+    so a tree written microseconds before the scan is never trusted, and
+    rightly so. Real trees are older than the scan that reads them. A tree a
+    test just laid down has to be told to be.
+    """
+    for path in paths:
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns,
+                           st.st_mtime_ns - 2 * dedup.CACHE_TICK_NS))
+
+
 def twins(root, name="a.bin", other="b.bin", body=b"twin" * 4096):
     """Two identical files big enough to travel through every stage."""
-    return write(root / name, body), write(root / other, body)
+    a, b = write(root / name, body), write(root / other, body)
+    aged(a, b)
+    return a, b
 
 
 def poison(path, body: bytes):
@@ -1398,6 +1415,131 @@ class TestCacheKey:
         assert len(groups[0].files) == 3
         # one member had to be read, so the group was proved, not remembered
         assert groups[0].attested is False
+
+
+class TestRacilyClean:
+    """A digest is only trusted once the file is older than the scan that read it.
+
+    HFS+ records mtime to the second, so an edit landing in the same second as
+    the scan leaves (inode, size, mtime_ns) untouched and the key cannot see
+    it. Git calls such an entry racily clean and refuses to trust it; so does
+    this. The tests pin the clock rather than sleeping on it: `cached_at` is
+    the scan's own reading, and the file's mtime is set relative to that.
+    """
+
+    def _stamp(self, second, *paths):
+        for path in paths:
+            os.utime(path, ns=(second * dedup.CACHE_TICK_NS,
+                               second * dedup.CACHE_TICK_NS))
+
+    def test_an_entry_cached_in_the_files_own_tick_is_distrusted(self, tmp_path):
+        a, b = twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        self._stamp(cache.cached_at, a, b)      # written this very second
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert stats.hashed_bytes > 0           # re-read rather than believed
+        assert len(groups) == 1
+        assert groups[0].attested is False      # and proved on the way past
+
+    def test_an_entry_cached_in_a_later_tick_is_trusted(self, tmp_path):
+        a, b = twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        self._stamp(cache.cached_at - 1, a, b)  # a whole tick before the scan
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert stats.hashed_bytes == 0
+        assert len(groups) == 1
+        assert groups[0].attested is True
+
+    def test_an_edit_inside_the_caching_tick_is_not_reported_as_a_duplicate(
+            self, tmp_path):
+        """The bug the rule exists for, and no forgery in it anywhere.
+
+        On a whole-second filesystem an ordinary edit can land in the second
+        the scan cached the digest in, and size and mtime_ns come out of it
+        unchanged. Before this rule the next scan called the two files twins.
+        """
+        a, b = twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        second = cache.cached_at
+        self._stamp(second, a, b)
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        b.write_bytes(b"evil" * 4096)           # same length, same second
+        self._stamp(second, b)
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, stats = cached_scan(tmp_path, cache)
+        cache.close()
+
+        assert groups == []                     # they are not twins any more
+        assert stats.hashed_bytes > 0
+
+    def test_a_racy_row_is_dropped_whole_not_re_stamped(self, tmp_path):
+        """Every column of a racy row was taken by the same suspect scan.
+
+        Re-reading one stage's digest must not leave the other stages' digests
+        behind with a fresh timestamp on them, or the next scan would trust
+        bytes nobody re-read.
+        """
+        a, _ = twins(tmp_path)
+        st = os.stat(a)
+        rec = dedup.FileRec(str(a), st.st_size, st.st_mtime, st.st_dev,
+                            st.st_ino, mtime_ns=st.st_mtime_ns)
+        tick = st.st_mtime_ns // dedup.CACHE_TICK_NS
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cache.open_paths([str(tmp_path)])
+        cache.cached_at = tick                  # the scan ran in a's own tick
+        cache.remember(rec, "ends", b"ends-digest")
+        cache.remember(rec, "full", b"full-digest")
+        cache.close()
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        cache.open_paths([str(tmp_path)])
+        cache.cached_at = tick + 10
+        assert cache.get(rec, "ends") is None
+        cache.remember(rec, "ends", b"re-read")
+        assert cache.get(rec, "ends") == b"re-read"
+        assert cache.get(rec, "full") is None   # went out with the racy row
+        cache.close()
+
+    def test_a_racy_entry_is_still_byte_verified_before_deletion(self, tmp_path):
+        """The poison guarantee is untouched by any of this.
+
+        A trusted entry still proves nothing: the group it forms is attested,
+        and deletion reads the bytes anyway. The rule above narrows what gets
+        trusted; it does not become a second line of defence for deletion.
+        """
+        a, b = twins(tmp_path)
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        self._stamp(cache.cached_at - 1, a, b)
+        cached_scan(tmp_path, cache)
+        cache.close()
+
+        cache = dedup.ScanCache(str(tmp_path / "cache"))
+        groups, _ = cached_scan(tmp_path, cache)
+        assert groups[0].attested is True       # trusted, not racy
+        poison(b, b"evil" * 4096)               # ...and lying all the same
+
+        safe, refused = dedup.verify_attested(groups, cache=cache)
+        cache.close()
+
+        assert safe == []
+        assert refused == groups
+        assert b.read_bytes() == b"evil" * 4096
 
 
 class TestCacheStore:

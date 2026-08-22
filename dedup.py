@@ -79,14 +79,21 @@ RETAIN_BUDGET = 128 * 1024 * 1024    # ceiling on head bytes carried from stage
                                 # 3 to stage 5 so the compare does not read
                                 # them a second time — see find_duplicates
 
-CACHE_SCHEMA = 2                # bump when the stored columns change meaning.
+CACHE_SCHEMA = 3                # bump when the stored columns change meaning.
                                 # 2: stage 3 became one digest of both end
                                 # pages plus a separate deep-head tier, and
                                 # stage 4 changed where it looks — every
                                 # digest a version-1 file holds was taken over
                                 # different bytes than the column it sits in
                                 # now names
+                                # 3: every row carries the time it was written,
+                                # which is what the racily-clean rule reads
 CACHE_TTL_DAYS = 180            # entries not seen in this long are dropped
+CACHE_TICK_NS = 1_000_000_000   # the coarsest granularity any target
+                                # filesystem records mtime at — HFS+ stores
+                                # whole seconds — so racily-clean is judged at
+                                # whole seconds on every volume, rather than
+                                # asking each one how fine its clock is
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1261,6 +1268,7 @@ def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
 # "deep" the rest of the head behind them, "sample" the windows stage 4
 # spreads over what is left, "full" the whole file.
 CACHE_COLUMNS = {"ends": 2, "deep": 3, "sample": 4, "full": 5}
+CACHE_CACHED_AT = 6             # and the slot holding when the row was written
 
 
 def cache_home() -> str:
@@ -1305,6 +1313,14 @@ class ScanCache:
     only applies while its size and mtime_ns still match, so an edited file is
     a miss and gets read.
 
+    That key is only as fine as the filesystem's clock, and HFS+ records mtime
+    to the second: an edit landing in the same second as the scan that read the
+    file leaves size and mtime_ns untouched, and the digest would be believed.
+    So each row also carries the time the scan that wrote it started, and a row
+    is trusted only while the file's mtime tick is strictly older than that —
+    git's "racily clean" rule. A racy row is not a disaster, only a cost: it is
+    dropped and the file re-read as though nothing had been remembered.
+
     Forging an mtime defeats the key, and that is allowed to be true, because
     nothing here is trusted at deletion time.
     """
@@ -1312,10 +1328,15 @@ class ScanCache:
     def __init__(self, directory: str | None = None):
         self.directory = directory or cache_home()
         self.paths: dict = {}      # dev -> database file
-        self.entries: dict = {}    # dev -> {ino: [size, mtime_ns, head, sample, full]}
+        self.entries: dict = {}    # dev -> {ino: [size, mtime_ns, ends, deep,
+                                   #              sample, full, cached_at]}
         self.touched: dict = {}    # dev -> inodes whose row changed
         self.seen: dict = {}       # dev -> inodes this scan recognised
         self.warned = False
+        # Read once, before anything is: every digest this scan stores is taken
+        # from bytes read after this moment, so a file whose mtime reaches this
+        # tick could have changed behind the read.
+        self.cached_at = int(time.time())
 
     # ── opening ──────────────────────────────────────────────────────────
     def _warn(self, message: str) -> None:
@@ -1331,7 +1352,8 @@ class ScanCache:
         con.execute("CREATE TABLE IF NOT EXISTS files ("
                     "ino INTEGER PRIMARY KEY, size INTEGER NOT NULL, "
                     "mtime_ns INTEGER NOT NULL, ends BLOB, deep BLOB, "
-                    "sample BLOB, full BLOB, last_seen INTEGER NOT NULL)")
+                    "sample BLOB, full BLOB, cached_at INTEGER NOT NULL, "
+                    "last_seen INTEGER NOT NULL)")
         con.execute(f"PRAGMA user_version = {CACHE_SCHEMA}")
 
     def _read(self, dev: int, db: str) -> None:
@@ -1346,7 +1368,7 @@ class ScanCache:
                 return
             self._prepare(con)
             for row in con.execute("SELECT ino, size, mtime_ns, ends, deep, "
-                                   "sample, full FROM files"):
+                                   "sample, full, cached_at FROM files"):
                 self.entries[dev][row[0]] = list(row[1:])
         finally:
             con.close()
@@ -1394,6 +1416,15 @@ class ScanCache:
         entry = self.entries.get(rec.dev, {}).get(rec.ino)
         if entry is None or entry[0] != rec.size or entry[1] != rec.mtime_ns:
             return None
+        if rec.mtime_ns // CACHE_TICK_NS >= entry[CACHE_CACHED_AT]:
+            # Racily clean: the file's clock reached the tick the writing scan
+            # started in, so an edit could have slipped under the key. Every
+            # column of the row was taken in that same scan and is suspect
+            # together, so the row goes and the file is read as if new.
+            self.entries[rec.dev].pop(rec.ino, None)
+            self.touched[rec.dev].add(rec.ino)
+            self.seen[rec.dev].discard(rec.ino)
+            return None
         self.seen[rec.dev].add(rec.ino)
         return entry[CACHE_COLUMNS[field]]
 
@@ -1404,7 +1435,11 @@ class ScanCache:
         entry = volume.get(rec.ino)
         if entry is None or entry[0] != rec.size or entry[1] != rec.mtime_ns:
             entry = volume[rec.ino] = [rec.size, rec.mtime_ns,
-                                       None, None, None, None]
+                                       None, None, None, None, self.cached_at]
+        # This scan read the bytes, so this scan's clock is what the row is
+        # judged against next time — without this a racy row, whose key still
+        # matches, would keep its old timestamp and never become trustworthy.
+        entry[CACHE_CACHED_AT] = self.cached_at
         entry[CACHE_COLUMNS[field]] = digest
         self.touched[rec.dev].add(rec.ino)
 
@@ -1461,7 +1496,7 @@ class ScanCache:
                     gone.append((ino,))
                 else:
                     rows.append((ino, entry[0], entry[1], entry[2], entry[3],
-                                 entry[4], entry[5], now))
+                                 entry[4], entry[5], entry[6], now))
             try:
                 con = sqlite3.connect(db)
                 try:
@@ -1469,7 +1504,8 @@ class ScanCache:
                     con.executemany(
                         "INSERT OR REPLACE INTO files "
                         "(ino, size, mtime_ns, ends, deep, sample, full, "
-                        "last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                        "cached_at, last_seen) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
                     con.executemany("DELETE FROM files WHERE ino = ?", gone)
                     con.execute("DELETE FROM files WHERE last_seen < ?", (cutoff,))
                     con.commit()
