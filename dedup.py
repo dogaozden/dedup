@@ -39,6 +39,10 @@ HEAD_BYTES = 4 * 1024           # stage-3 first pass: one page, enough to
                                 # separate files that differ in their header
 DEEP_HEAD = 64 * 1024           # ...and how far stage 3 extends for the files
                                 # a single page could not tell apart
+TAIL_BYTES = 4 * 1024           # one page from the far end, read before any
+                                # more of the head: same-size files that share
+                                # a header are the ordinary case, and their
+                                # last page is where they differ
 SAMPLE_BYTES = 1024 * 1024      # per sample point in stage 4
 SAMPLE_POINTS = 4               # head, two middles, tail
 SAMPLE_SPAN = SAMPLE_BYTES * SAMPLE_POINTS * 2   # below this, just read it all
@@ -104,6 +108,7 @@ class FileRec:
     links: list = field(default_factory=list)   # every name we found for this inode
     head: bytes = b""       # bytes stage 3 read from offset 0, kept so stage 5
                             # can compare them instead of reading them again
+    tail: bytes = b""       # ...and the same for the page at the far end
 
     @property
     def display(self) -> str:
@@ -691,6 +696,39 @@ def keep_head_rest(path: str, size: int) -> tuple | None:
     return h.digest(), block
 
 
+def hash_tail(path: str, size: int) -> bytes | None:
+    """SHA-256 the last TAIL_BYTES of the file.
+
+    Same-size files that share a header are the ordinary case — one camera,
+    one encoder, one backup format — and reading more of a header they have
+    in common tells you nothing. The page at the other end is where they
+    part. It costs one read of one page and it is asked before stage 3
+    extends the head, because it settles far more per byte than the head
+    does.
+    """
+    h = _digest()
+    try:
+        with open(path, "rb", buffering=0) as fh:
+            fh.seek(max(0, size - TAIL_BYTES))
+            h.update(read_block(fh, TAIL_BYTES))
+        return h.digest()
+    except (PermissionError, OSError):
+        return None
+
+
+def keep_tail(path: str, size: int) -> tuple | None:
+    """hash_tail, and the block it read, for hash_stage to keep."""
+    try:
+        with open(path, "rb", buffering=0) as fh:
+            fh.seek(max(0, size - TAIL_BYTES))
+            block = read_block(fh, TAIL_BYTES)
+    except (PermissionError, OSError):
+        return None
+    h = _digest()
+    h.update(block)
+    return h.digest(), block
+
+
 def hash_sample(path: str, size: int) -> bytes | None:
     """Hash a few chunks spread through the file instead of all of it.
 
@@ -745,16 +783,17 @@ def hash_full(path: str, size: int) -> bytes | None:
 
 
 def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
-               on_progress=None, keep: bool = False) -> dict:
+               on_progress=None, keep: str = "") -> dict:
     """Hash `files` with `fn` and bucket them by size and digest.
 
     Size is part of the key because a head or sample digest covers only part
     of the file: two files of different lengths can easily agree on their
     first 64 KiB and never be duplicates.
 
-    With `keep`, `fn` returns its block alongside the digest and the block is
-    appended to the record's `head`. Stages read strictly forward, so what
-    the record ends up carrying is one contiguous run from offset 0.
+    `keep` names the record attribute — "head" or "tail" — that `fn`'s block
+    is appended to; `fn` then returns the block alongside the digest. Stages
+    read each end strictly outward, so what a record ends up carrying is one
+    contiguous run from offset 0 and one that ends at EOF.
     """
     buckets: dict = defaultdict(list)
     last_tick = 0.0
@@ -776,11 +815,13 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
                     continue
                 if keep:
                     digest, block = digest
-                    rec.head += block
+                    setattr(rec, keep, getattr(rec, keep) + block)
                 buckets[(rec.size, digest)].append(rec)
                 stats.hashed_files += 1
                 if fn is hash_head or fn is keep_head:
                     stats.hashed_bytes += min(rec.size, HEAD_BYTES)
+                elif fn is hash_tail or fn is keep_tail:
+                    stats.hashed_bytes += min(rec.size, TAIL_BYTES)
                 elif fn is hash_head_rest or fn is keep_head_rest:
                     stats.hashed_bytes += max(
                         0, min(rec.size, DEEP_HEAD) - HEAD_BYTES)
@@ -893,19 +934,26 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
     # bytes we are about to delete something over, so the first stat that
     # disagrees puts the whole group back on reading from zero.
     prefix = min([len(r.head) for r in opened], default=0)
-    if prefix:
+    tail = min([len(r.tail) for r in opened], default=0)
+    if tail and any(prefix + tail > r.size for r in opened):
+        tail = 0                        # the two kept runs would overlap
+    if prefix or tail:
         for rec in opened:
             st = os.fstat(handles[id(rec)].fileno())
             if st.st_size != rec.size or st.st_mtime != rec.mtime:
-                prefix = 0
+                prefix = tail = 0
                 break
     if prefix:
         for rec in opened:
             handles[id(rec)].seek(prefix)
+    # Read up to where the kept tail begins; the tail settles the rest.
+    limit = min([r.size - tail for r in opened], default=0) if tail else None
+
+    span = chunk
 
     def grab(rec):
         try:
-            return rec, read_block(handles[id(rec)], chunk)
+            return rec, read_block(handles[id(rec)], span)
         except (PermissionError, OSError):
             return rec, None
 
@@ -924,7 +972,12 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
                     live.append(recs)
         else:
             live = [opened]
+        pos = prefix
         while live:
+            span = chunk if limit is None else min(chunk, limit - pos)
+            if span <= 0:
+                break               # everything up to the kept tail agrees
+            pos += span
             following = []
             for group in live:
                 blocks = list(pool.map(grab, group)) if pool else [grab(r) for r in group]
@@ -948,6 +1001,12 @@ def split_identical(members: list, chunk: int, stats: ScanStats,
                     tick()          # two huge files are one group and many
                                     # rounds; the bar has to move meanwhile
             live = following
+        for group in live:          # only reached with a kept tail in hand
+            for run in partition_blocks([(r, r.tail[-tail:]) for r in group]):
+                recs = [r for r, _ in run]
+                stats.hashed_files += len(recs)
+                if len(recs) > 1:
+                    matched.append(recs)        # same bytes to EOF
     finally:
         for fh in handles.values():
             fh.close()
@@ -959,7 +1018,7 @@ def release(files: list, pending: list) -> None:
     live = {id(f) for g in pending for f in g}
     for f in files:
         if id(f) not in live:
-            f.head = b""
+            f.head = f.tail = b""
 
 
 def compare_stage(buckets: list, jobs: int, solid, stats: ScanStats,
@@ -1040,7 +1099,8 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     # this only happens when the whole set fits in RETAIN_BUDGET: a hundred
     # thousand small files do not fit, and would gain nothing anyway, since
     # hardly any of them reach stage 5.
-    keep = sum(min(f.size, HEAD_BYTES) for f in candidates) <= RETAIN_BUDGET
+    keep = ("head" if sum(min(f.size, HEAD_BYTES) for f in candidates)
+            <= RETAIN_BUDGET else "")
 
     # stage 3 — sample the head
     say("head", len(candidates))
@@ -1055,6 +1115,27 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if not pending:
         return []
 
+    # stage 3b — one page from the far end, for anything long enough that the
+    # two pages cannot meet. It is asked before the head is extended because
+    # a shared header is the ordinary reason two files of one size are still
+    # together here, and reading more of a header they agree on settles
+    # nothing: on the samesize corpus this page settles what 86 MB of deeper
+    # head could not.
+    far = sorted((f for g in pending if g[0].size > DEEP_HEAD + TAIL_BYTES
+                  for f in g), key=by_layout)
+    if far:
+        near = [g for g in pending if g[0].size <= DEEP_HEAD + TAIL_BYTES]
+        keep_far = "tail" if len(far) * TAIL_BYTES <= RETAIN_BUDGET else ""
+        say("tail", len(far))
+        tail_buckets = hash_stage(far, keep_tail if keep_far else hash_tail,
+                                  jobs, stats, tick, keep_far)
+        if reporter:
+            reporter.finish_stage()
+        pending = near + [g for g in tail_buckets.values() if len(g) > 1]
+        release(far, pending)
+        if not pending:
+            return []
+
     # One page settles most candidates outright. Whatever it left sitting in
     # a bucket with someone else reads the rest of the deep head — only those
     # files pay for it, and only for the part not already read. A file no
@@ -1063,8 +1144,9 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
     if deep:
         pending = [g for g in pending if g[0].size <= HEAD_BYTES]
         crowded = sorted((f for g in deep for f in g), key=by_layout)
-        keep_rest = keep and sum(min(f.size, DEEP_HEAD) - HEAD_BYTES
-                                 for f in crowded) <= RETAIN_BUDGET
+        keep_rest = ("head" if keep and sum(min(f.size, DEEP_HEAD) - HEAD_BYTES
+                                            for f in crowded) <= RETAIN_BUDGET
+                     else "")
         say("head2", len(crowded))
         rest_buckets = hash_stage(
             crowded, keep_head_rest if keep_rest else hash_head_rest,
@@ -1212,6 +1294,7 @@ class Reporter:
         "scan": "Scanning",
         "sample": "Sampling deep",
         "head": "Sampling",
+        "tail": "Sampling the end",
         "head2": "Sampling further",
         "compare": "Comparing",
     }

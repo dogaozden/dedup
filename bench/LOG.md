@@ -755,3 +755,53 @@ That is the next entry's problem.
 regression anywhere, 0.8522 → 0.7791 (seed 1) and 0.7919 (seed 2). RSS rises
 where bytes are kept (typical 53→106, samesize 219→342): metric 3 paying for
 metric 1, which is the order the brief asks for.
+
+## 2026-08-22 — One page from the far end, asked before more of the head
+
+**Hypothesis:** Stage 3's answer to "these two files of one size are still
+together" is to read more of the head. But the ordinary reason two same-size
+files are still together is that they share a header — one camera, one
+encoder, one container format — and reading more of a header they agree on
+settles nothing. The page at the *other* end is where they part. On
+`samesize` that is 86 MB of deep head buying nothing; one 4 KiB page should
+settle almost the whole corpus.
+
+**Change:** `hash_tail` / `keep_tail` read the last `TAIL_BYTES` (4 KiB), as a
+stage between the two head tiers, for buckets whose size is over
+`DEEP_HEAD + TAIL_BYTES` so the two kept runs cannot overlap. The block is
+kept the same way the head is; `split_identical` reads up to where the kept
+tail begins and lets the tail settle the last round, so a file read to EOF
+pays for that page once, not twice.
+
+**Numbers:** full suite, seed 1, exit 0, 119 passed:
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.341    0.471     0.72x     103      53
+photos       pass  147.9 MB   150.8 MB    0.98x     0.019    0.026     0.76x     64       147
+bigheader    pass  160.1 MB   296.5 MB    0.54x     0.020    0.032     0.62x     101      109
+needle       pass  244.1 MB   244.1 MB    1.00x     2.746    4.077     0.67x     108      305
+samesize     pass  32.8 MB    348.4 MB    0.09x     0.055    1.689     0.03x     57       219
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.061    0.055     1.11x     161      152
+prefixtrap   pass  33.2 MB    44.2 MB     0.75x     0.012    0.015     0.82x     24       50
+adversarial  pass  1.2 MB     4.2 MB      0.30x     -        -         -         -        -
+SCORE: 0.4961
+```
+
+Seed 2, default scale, exit 0: typical 0.53x, photos 0.98x, bigheader 0.54x,
+needle 1.00x, samesize 0.10x, widegroup 0.80x, prefixtrap 0.75x, adversarial
+0.30x, `SCORE: 0.5064`.
+
+Per-stage, seed 1: `samesize` 365.6 → 34.8 MB against a floor of 24.1 — the
+deep head drops from 86.1 MB to 7 MB and the compare from 265.0 to 17.7,
+because 1,300 files that share their whole 64 KiB head do not share their last
+page. `bigheader` 310.9 → 167.9: its `lastbyte` pair differs in the final byte
+and used to cost two 60 MiB reads to prove it. `widegroup` stays at 126.3 MB —
+the probe costs 519 pages and the kept tail gives all 519 back, so a corpus
+that is nothing but true copies pays nothing for it.
+
+**Verdict:** KEPT. Bytes improve on six scenarios and hold on one, no
+regression anywhere, 0.7791 → 0.4961 (seed 1) / 0.5064 (seed 2). `widegroup`
+wall time is 1.11x/1.15x: 519 files that are all true copies pay one extra
+`open` each for a probe that cannot settle them, and on this volume an `open`
+is 22 µs against a 4 KiB read that is nearly free. That is the next entry.
