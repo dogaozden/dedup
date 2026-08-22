@@ -5,13 +5,21 @@ Scans the current directory (or given paths) recursively, groups files whose
 contents are identical, and opens an interactive browser for choosing which
 copies to keep.
 
-Speed comes from never reading a file it doesn't have to:
+Speed comes from never reading a file it doesn't have to, and never reading
+the same bytes twice:
 
   1. list every file's size   — one bulk syscall per directory, no reads
   2. discard unique sizes     — a file with a unique size cannot have a twin
-  3. hash the first 64 KiB    — cheap, kills most remaining candidates
-  4. hash 4 MB spread through — settles files that share a header but diverge
+  3. a page from each end     — one open apiece, and it settles most of them;
+                                then the rest of the first 64 KiB, for
+                                whatever those two pages left crowded
+  4. hash 8 windows across it — settles big files that share a header
   5. compare the bytes        — in step, stopping the moment two files differ
+
+What an earlier stage read is kept and compared in stage 5 rather than read
+again, so a file that turns out to be a duplicate is read exactly once, end
+to end. That is also why stage 5 can be trusted: it compares bytes, never a
+digest of them.
 
 On a typical tree this reads a low single-digit percentage of the bytes on disk.
 
@@ -671,25 +679,8 @@ def hash_head_rest(path: str, size: int) -> bytes | None:
         return None
 
 
-def keep_head(path: str, size: int) -> tuple | None:
-    """hash_head, and the block it read, for hash_stage to keep.
-
-    Stage 5 has to see the bytes of the head to prove a group — a digest only
-    narrows. Handing it the block that stage 3 already read is the difference
-    between reading the head once and reading it twice.
-    """
-    try:
-        with open(path, "rb") as fh:
-            block = fh.read(HEAD_BYTES)
-    except (PermissionError, OSError):
-        return None
-    h = _digest()
-    h.update(block)
-    return h.digest(), block
-
-
 def keep_head_rest(path: str, size: int) -> tuple | None:
-    """hash_head_rest, and the block it read. Appended to what keep_head kept,
+    """hash_head_rest, and the block it read. Appended to what keep_ends kept,
     so the record carries one contiguous run of bytes from offset 0."""
     try:
         with open(path, "rb") as fh:
@@ -856,7 +847,7 @@ def hash_stage(files: list[FileRec], fn, jobs: int, stats: ScanStats,
                 stats.hashed_files += 1
                 if fn is hash_ends or fn is keep_ends:
                     stats.hashed_bytes += ends_bytes(rec.size)
-                elif fn is hash_head or fn is keep_head:
+                elif fn is hash_head:
                     stats.hashed_bytes += min(rec.size, HEAD_BYTES)
                 elif fn is hash_head_rest or fn is keep_head_rest:
                     stats.hashed_bytes += max(

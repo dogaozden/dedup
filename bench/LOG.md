@@ -671,6 +671,90 @@ Target: `SCORE ≤ 0.50` at seed 1 and seed 2. Starting point, measured on this
 branch before any change (`python3 bench/run.py --score`, unmodified tree at
 `main` `0661a5e`): **SCORE: 0.8522**, exit 0, 119 passed.
 
+## Summary — 2026-08-22
+
+**Target met, and checked from outside.** Five changes kept, two ideas
+measured and rejected, two more declined with reasons. Every run below exited
+0 with 119 tests passing and no scenario's bytes regressed.
+
+| `--score` run | seed 1 | seed 2 |
+|---|---|---|
+| in this tree | 0.4820 | 0.4913 |
+| **referee** — clean `bench/` from `main` (`81fa031`), `--dedup` this branch's `dedup.py` | **0.4790** | **0.4845** |
+
+Starting point on this branch, unmodified: **0.8522**.
+
+**Cumulative, seed 1, against the pinned baseline `012acc4`:**
+
+```text
+scenario     gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical      pass  52.5 MB    108.7 MB    0.48x     0.286    0.467     0.61x     103      53
+photos       pass  147.9 MB   150.8 MB    0.98x     0.018    0.022     0.83x     64       149
+bigheader    pass  146.2 MB   296.5 MB    0.49x     0.016    0.030     0.52x     97       109
+needle       pass  244.1 MB   244.1 MB    1.00x     2.725    3.929     0.69x     110      303
+samesize     pass  32.8 MB    348.4 MB    0.09x     0.047    1.565     0.03x     57       284
+widegroup    pass  126.3 MB   158.8 MB    0.80x     0.057    0.054     1.06x     161      152
+prefixtrap   pass  33.4 MB    44.2 MB     0.75x     0.012    0.014     0.83x     24       50
+adversarial  pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+SCORE: 0.4820
+```
+
+**One idea, applied four times.** Every kept change is the same sentence: *do
+not read a byte twice, and probe where files actually differ before reading
+more of where they agree.*
+
+- `d9e260c` — keep the head stage 3 reads and **compare** those bytes in stage
+  5 instead of reading them again. A digest may narrow, never prove, so the
+  bytes themselves are carried. `typical` 0.67x → 0.48x, `widegroup` 1.00x →
+  0.80x, which is its floor to the byte.
+- `ac69219` — probe one page of the **tail** before extending the head. Files
+  of one size that survive a page of header usually share that header;
+  reading more of it settles nothing. `samesize` 348.4 → 32.8 MB, `bigheader`
+  296.5 → 160.1 MB.
+- `ee3d8c2` — take **both end pages in one open**. `open` is 22 µs on this
+  volume against ~10 for a page read, so a second pass for the tail was
+  costing more than it read. Cost 0.4 MB of bytes across two unscored
+  scenarios; bought 1,900 opens.
+- `0a24651` — **eight 64 KiB sample windows** instead of four of a megabyte.
+  A window separates two files only when it lands on something they do not
+  share, so a sample buys coverage of the file's length, not weight.
+  `bigheader` 160.1 → 146.2 MB.
+- `aed953d` — do not open a file whose bytes are already in hand. `typical`
+  0.77x → 0.63x wall.
+
+**How close to the floor this leaves things.** The harness's own floor — Σ
+size × members over the true groups — beside what the tool now reads, seed 1:
+
+```text
+scenario     floor      reads      what the gap is
+typical      24.2 MB    52.5 MB    one 4 KiB page for each of ~7,500 candidates
+                                   that turn out to be nothing
+photos      155.0 MB   147.9 MB    at the floor (the two disagree because they
+                                   count partial reads differently)
+bigheader   117.4 MB   146.2 MB    the blind pair, which must be read to the
+                                   byte where it differs, plus 2 MB of sample
+needle        0.3 MB   244.1 MB    the real floor, not the manifest's: 100,000
+                                   files of 1-4 KB, one page each, and a page
+                                   is the smallest thing a disk can return
+samesize     24.1 MB    32.8 MB    two pages for each of 1,402 candidates
+widegroup   132.5 MB   126.3 MB    at the floor: every file is a true copy and
+                                   is now read exactly once
+```
+
+There is no large bytes win left in this pipeline. What remains is wall time,
+and the two biggest levers are both blocked — see "Two ideas not attempted"
+at the end of this log.
+
+**Where I would look next.** (1) The 100,000 `open` calls in `needle`: 22 µs
+each on this volume and 2.2 s of CPU, unreachable without either
+multiprocessing or a harness that can count bytes read in a child. (2)
+`widegroup` is the one scenario slower than baseline, 1.06x, and the reason
+is structural: it now compares 33 MB of kept head bytes in memory instead of
+reading 34 MB off a RAM disk, which is a wash here and a large win on a real
+device. (3) Retaining the sample windows the way the head and tail are
+retained would give `bigheader` back another ~10 MB, and needs `split_identical`
+to compare around holes rather than around one prefix and one suffix.
+
 **Where the bytes actually are.** Before touching anything I instrumented the
 pipeline per stage against the default corpora and put the harness's own byte
 floor (Σ size × members over the manifest's true groups) beside it. Every
@@ -970,3 +1054,64 @@ scenario, `typical` 0.63x wall: `SCORE: 0.4903`.
 
 **Verdict:** KEPT. Bytes identical — this removes syscalls, not reads —
 `typical` 0.77x → 0.63x, 0.4851 → 0.4802 (seed 1) and 0.4955 → 0.4903 (seed 2).
+
+## 2026-08-22 — Unbuffered reads for the end pages (rejected)
+
+**Hypothesis:** `hash_ends` opens buffered, and a buffered `read(4096)` does
+not ask the device for 4096. Instrumenting the raw layer under
+`io.BufferedReader` shows what it really asks for:
+
+```text
+buffered   open().read(4096)   -> raw reads: [8192]
+buffered   head page + tail page -> raw reads: [8192, 8192]
+```
+
+Every candidate at least 8 KiB long therefore costs twice the device read its
+head page needs. `hash_sample` and `split_identical` already open with
+`buffering=0`; stage 3 was the one path that did not.
+
+**Change:** `buffering=0` in `hash_ends` / `keep_ends`, with `read_block` around
+both reads — an unbuffered read may come back short, and two identical files
+that got different amounts back would hash differently and be missed.
+
+**Numbers:** interleaved A/B over the corpora, two passes, min of three runs:
+`needle` 2.644 / 2.616 → 2.599 / 2.565 s, `typical` 0.265 / 0.270 → 0.261 /
+0.262 s — a consistent 2%. The full scored run disagreed: `SCORE: 0.4811`
+against 0.4802 for the same tree without it, which is a wash inside the ~0.3%
+the score wobbles by.
+
+**Verdict:** REVERTED. Rule 3 puts the floor for a time win at 5% and this is
+2% at best on a micro-benchmark and 0% on the harness. **The reason it looks
+like nothing here is worth writing down:** the harness counts bytes by
+wrapping `open()` and adding up what `.read()` returns, so 4096 is counted
+whether the device was asked for 4096 or 8192, and the RAM disk charges
+almost nothing for the difference. On a slow disk this is 4 KiB of real I/O
+per candidate — 37 MB on `typical` alone — that no number in this benchmark
+can see. Left out because the rules say a change is kept on a measurement,
+and recorded here because the effect is real and the next harness may be able
+to see it.
+
+## 2026-08-22 — Two ideas not attempted, and why
+
+Neither is a measurement, so neither is an entry above; both are places
+someone will otherwise go.
+
+**Reads in child processes are invisible to this harness.** `bench/_measure.py`
+wraps `builtins.open` *in the measuring process* and counts what `.read()`
+returns there. Anything read in a `multiprocessing` child — or through
+`os.open`/`os.read`, or `io.FileIO` — is counted as zero, so the byte-honesty
+check and the byte floor both fail the run. Stage 3 is GIL-bound at two reader
+threads and multiprocessing is the obvious way out of that; it is not
+available while the measurement works this way. `needle` spends 2.7 s doing
+100,000 opens at 22 µs each, and that is the largest single number left in
+the suite.
+
+**Overlapping the walk with stage 3.** A size bucket is known to be a
+candidate the moment it holds two files, so heads could be read while the walk
+is still running, with no wasted read — worth up to 0.5 s of `needle` and
+0.09 s of `typical`. It is not taken because `find_duplicates` sorts
+candidates by `(dev, ino)` before reading them, and streaming gives that up:
+the read order becomes walk order. On this RAM disk that costs nothing and
+the benchmark would show a clean win, which is exactly the problem — the seek
+cost it trades away is invisible here and real on the disks this tool exists
+for.
