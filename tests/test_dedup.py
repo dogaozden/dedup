@@ -12,8 +12,12 @@ from dedup import (
     ScanStats,
     drop_hardlinks,
     elide_left,
+    ext_allowed,
+    file_ext,
     find_duplicates,
     human_size,
+    normalize_ext,
+    resolve_ext_filters,
     send_to_trash,
     unique_destination,
     volume_root,
@@ -234,6 +238,173 @@ class TestDetection:
             assert len(groups[0].files) == 2
         finally:
             blocked.chmod(0o644)
+
+
+class TestExtFilter:
+    """--ext (whitelist) and --skip-ext (blacklist)."""
+
+    def test_file_ext_takes_the_final_suffix(self):
+        assert file_ext("photo.JPG") == "jpg"
+        assert file_ext("archive.tar.gz") == "gz"
+        assert file_ext("noext") == ""
+
+    def test_file_ext_dotfile_with_no_other_dot_has_no_extension(self):
+        # A leading dot marks a hidden file, not an extension — same rule
+        # pathlib's .suffix uses.
+        assert file_ext(".DS_Store") == ""
+        assert file_ext(".bashrc") == ""
+
+    def test_file_ext_trailing_dot_has_no_extension(self):
+        assert file_ext("weird.") == ""
+
+    def test_normalize_ext_strips_dot_case_and_whitespace(self):
+        assert normalize_ext("jpg") == "jpg"
+        assert normalize_ext(".jpg") == "jpg"
+        assert normalize_ext("JPG") == "jpg"
+        assert normalize_ext(" .JPG ") == "jpg"
+
+    def test_resolve_ext_filters_defaults_to_no_filtering(self):
+        include, exclude = resolve_ext_filters([], [])
+
+        assert include is None
+        assert exclude == frozenset()
+
+    def test_resolve_ext_filters_splits_commas_and_merges_repeats(self):
+        include, _ = resolve_ext_filters(["jpg,png", "raw"], [])
+
+        assert include == {"jpg", "png", "raw"}
+
+    def test_resolve_ext_filters_normalizes_case_and_dot(self):
+        include, _ = resolve_ext_filters([".JPG, Png"], [])
+
+        assert include == {"jpg", "png"}
+
+    def test_resolve_ext_filters_rejects_empty_token_between_commas(self):
+        with pytest.raises(ValueError):
+            resolve_ext_filters(["jpg,,png"], [])
+
+    def test_resolve_ext_filters_rejects_whitespace_only_token(self):
+        with pytest.raises(ValueError):
+            resolve_ext_filters(["   "], [])
+
+    def test_resolve_ext_filters_rejects_extension_in_both_lists(self):
+        with pytest.raises(ValueError):
+            resolve_ext_filters(["jpg,png"], ["png"])
+
+    def test_ext_allowed_whitelist_only(self):
+        include = frozenset({"jpg"})
+
+        assert ext_allowed("a.jpg", include, frozenset())
+        assert not ext_allowed("a.png", include, frozenset())
+        assert not ext_allowed("noext", include, frozenset())
+
+    def test_ext_allowed_blacklist_only(self):
+        exclude = frozenset({"tmp"})
+
+        assert not ext_allowed("a.tmp", None, exclude)
+        assert ext_allowed("a.jpg", None, exclude)
+        assert ext_allowed("noext", None, exclude)
+
+    def test_ext_allowed_blacklist_narrows_whitelist(self):
+        include, exclude = frozenset({"jpg", "png"}), frozenset({"png"})
+
+        assert ext_allowed("a.jpg", include, exclude)
+        assert not ext_allowed("a.png", include, exclude)   # whitelisted, then removed
+        assert not ext_allowed("a.gif", include, exclude)   # never whitelisted
+
+    def test_cli_ext_and_skip_ext_are_repeatable_and_comma_split(self):
+        args = dedup.build_parser().parse_args(
+            ["--ext", "jpg,png", "--ext", "raw", "--skip-ext", "tmp"])
+
+        assert args.ext == ["jpg,png", "raw"]
+        assert args.skip_ext == ["tmp"]
+
+    def test_whitelist_only_scans_matching_extension(self, tmp_path):
+        write(tmp_path / "a.jpg", b"same photo bytes")
+        write(tmp_path / "b.jpg", b"same photo bytes")
+        write(tmp_path / "a.txt", b"same text bytes!!")
+        write(tmp_path / "b.txt", b"same text bytes!!")
+
+        groups = scan(tmp_path, include_ext=frozenset({"jpg"}))
+
+        assert len(groups) == 1
+        assert all(f.path.endswith(".jpg") for f in groups[0].files)
+
+    def test_blacklist_only_skips_matching_extension(self, tmp_path):
+        write(tmp_path / "a.jpg", b"same photo bytes")
+        write(tmp_path / "b.jpg", b"same photo bytes")
+        write(tmp_path / "a.tmp", b"same temp bytes!")
+        write(tmp_path / "b.tmp", b"same temp bytes!")
+
+        groups = scan(tmp_path, exclude_ext=frozenset({"tmp"}))
+
+        assert len(groups) == 1
+        assert all(f.path.endswith(".jpg") for f in groups[0].files)
+
+    def test_whitelist_and_blacklist_together(self, tmp_path):
+        # Proves the combined case end to end: a duplicate pair in a skipped
+        # extension is not reported, while an allowed pair is.
+        write(tmp_path / "a.jpg", b"keep these bytes")
+        write(tmp_path / "b.jpg", b"keep these bytes")
+        write(tmp_path / "a.png", b"drop these bytes!")
+        write(tmp_path / "b.png", b"drop these bytes!")
+        write(tmp_path / "a.txt", b"never in whitelist")
+        write(tmp_path / "b.txt", b"never in whitelist")
+
+        groups = scan(tmp_path, include_ext=frozenset({"jpg", "png"}),
+                     exclude_ext=frozenset({"png"}))
+
+        assert len(groups) == 1
+        assert all(f.path.endswith(".jpg") for f in groups[0].files)
+
+    def test_extensionless_files_excluded_under_whitelist(self, tmp_path):
+        write(tmp_path / "a", b"identical content!")
+        write(tmp_path / "b", b"identical content!")
+
+        assert scan(tmp_path, include_ext=frozenset({"jpg"})) == []
+
+    def test_extensionless_files_included_without_whitelist(self, tmp_path):
+        write(tmp_path / "a", b"identical content!")
+        write(tmp_path / "b", b"identical content!")
+
+        groups = scan(tmp_path, exclude_ext=frozenset({"tmp"}))
+
+        assert len(groups) == 1
+
+    def test_ext_filter_interacts_with_min_size(self, tmp_path):
+        write(tmp_path / "small.jpg", b"tiny")
+        write(tmp_path / "small2.jpg", b"tiny")
+        write(tmp_path / "big.jpg", b"x" * 2000)
+        write(tmp_path / "big2.jpg", b"x" * 2000)
+
+        groups = scan(tmp_path, include_ext=frozenset({"jpg"}), min_size=1000)
+
+        assert len(groups) == 1
+        assert groups[0].size == 2000
+
+    def test_ext_filter_interacts_with_exclude_glob(self, tmp_path):
+        write(tmp_path / "keep.jpg", b"same photo bytes")
+        write(tmp_path / "sub" / "keep.jpg", b"same photo bytes")
+        write(tmp_path / ".DS_Store", b"noise noise noise")
+        write(tmp_path / "sub" / ".DS_Store", b"noise noise noise")
+
+        groups = scan(tmp_path, include_ext=frozenset({"jpg"}), excludes=[".DS_Store"])
+
+        assert len(groups) == 1
+
+    def test_filtered_files_are_not_counted_in_stats(self, tmp_path):
+        # Must match -x's existing behavior: a filtered file never becomes a
+        # candidate and never appears in files_seen/bytes_seen.
+        write(tmp_path / "a.jpg", b"jpg content here")
+        write(tmp_path / "a.tmp", b"tmp content here")
+
+        stats = ScanStats()
+        find_duplicates([str(tmp_path)], excludes=[], min_size=1, jobs=2,
+                        verify=False, stats=stats, reporter=None,
+                        exclude_ext=frozenset({"tmp"}))
+
+        assert stats.files_seen == 1
+        assert stats.bytes_seen == len(b"jpg content here")
 
 
 class TestHardlinks:
@@ -605,6 +776,23 @@ class TestBulkWalker:
 
         a = dedup._walk_scandir([str(tmp_path)], excludes, min_size, sa)
         b = dedup._walk_bulk([str(tmp_path)], excludes, min_size, sb)
+
+        assert self._keys(a) == self._keys(b)
+        assert sa.files_seen == sb.files_seen
+        assert sa.bytes_seen == sb.bytes_seen
+
+    @pytest.mark.parametrize("include_ext,exclude_ext", [
+        (frozenset({"bin"}), frozenset()),
+        (None, frozenset({"bin"})),
+    ])
+    def test_matches_portable_walk_with_ext_filter(self, tmp_path, include_ext, exclude_ext):
+        self._tree(tmp_path)
+        sa, sb = ScanStats(), ScanStats()
+
+        a = dedup._walk_scandir([str(tmp_path)], [], 1, sa, None,
+                                include_ext, exclude_ext)
+        b = dedup._walk_bulk([str(tmp_path)], [], 1, sb, None, 1,
+                             include_ext, exclude_ext)
 
         assert self._keys(a) == self._keys(b)
         assert sa.files_seen == sb.files_seen

@@ -15,6 +15,9 @@ extensions are ignored, so `photo.jpg`, `photo.jpeg`, and `photo.backup` all
 match if the bytes are the same — which is what you want for folders full of
 rescued or re-downloaded files.
 
+To narrow what gets scanned in the first place, `--ext` and `--skip-ext`
+filter by extension before any of that — see Options below.
+
 Files under 10 MB are ignored, because they're rarely worth the screen space.
 Lower the floor with `--min-size` if you want them.
 
@@ -109,11 +112,12 @@ learned, so the next scan of the same volume can skip every file that hasn't
 changed since. On an untouched tree the second scan reads **nothing at all** —
 it's just the directory walk.
 
-**What's remembered.** For each file: its three digests (the 64 KiB head, the
-4 MB sample, and the whole-file hash once that's known), against a key of
-inode, size, and modification time to the nanosecond. Change a file and the key
-stops matching, so it gets read again. Filenames aren't part of the key, so
-renaming a file costs nothing.
+**What's remembered.** For each file: one digest per set of bytes a stage
+reads — the two end pages, the rest of the 64 KiB head behind them, the sample
+windows, and the whole-file hash once that's known — against a key of inode,
+size, and modification time at the finest resolution the filesystem records.
+Change a file and the key stops matching, so it gets read again. Filenames
+aren't part of the key, so renaming a file costs nothing.
 
 **Where.** One small SQLite file per volume, in `~/Library/Caches/dedup/`
 (`~/.cache/dedup/` off macOS), named after the volume's UUID. Entries not seen
@@ -215,6 +219,8 @@ anything unless you passed `-y`.
                     spinning disk)
     --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
+    --ext LIST      only scan these extensions, comma-separated (repeatable)
+    --skip-ext LIST skip these extensions, comma-separated (repeatable)
     --verify        no-op; matches are always byte-compared now
     --no-cache      read every file; don't reuse or record anything
     --hard          delete permanently instead of using the Trash
@@ -229,6 +235,7 @@ Useful exclusions:
 
 ```
 dedup -x '.DS_Store' -x 'node_modules' -x '.git'
+dedup --skip-ext log,tmp,cache
 ```
 
 ## Install
@@ -266,7 +273,7 @@ would make every number a story about the page cache. Each corpus is written
 from a seeded PRNG, so the same `--seed` and `--scale` always produce the same
 bytes, and the answer key is written beside the tree — never inside it.
 
-Nine scenarios, each aimed at a different part of the pipeline: `typical`
+Ten scenarios, each aimed at a different part of the pipeline: `typical`
 (a mixed tree), `photos` (few files, all large), `bigheader` (long shared
 prefixes, where stage 4 earns its keep), `needle` (100k tiny files, so mostly
 the walk), `samesize` (every file the same length with the same first 64 KiB,

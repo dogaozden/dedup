@@ -287,8 +287,31 @@ def read_jobs(roots: list[str], requested) -> int:
     return 2
 
 
+def file_ext(name: str) -> str:
+    """The extension --ext/--skip-ext match on: the final suffix, lowercased,
+    no dot. A dotfile with no other dot (.bashrc, .DS_Store) counts as having
+    none — same as a name with no dot at all, and the same rule pathlib's
+    .suffix uses."""
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        return ""
+    return ext.lower()
+
+
+def ext_allowed(name: str, include_ext, exclude_ext) -> bool:
+    """Whether `name` survives --ext/--skip-ext. `include_ext` is None when
+    no whitelist was given, so that stage always passes; a file with no
+    extension fails a whitelist but can never match a blacklist."""
+    ext = file_ext(name)
+    if include_ext is not None and ext not in include_ext:
+        return False
+    return ext not in exclude_ext
+
+
 def walk_files(roots: list[str], excludes: list[str], min_size: int,
-               stats: ScanStats, on_progress=None, workers=None) -> list[FileRec]:
+               stats: ScanStats, on_progress=None, workers=None,
+               include_ext: frozenset[str] | None = None,
+               exclude_ext: frozenset[str] = frozenset()) -> list[FileRec]:
     """Collect every regular file under `roots`. Symlinks are never followed.
 
     Uses the bulk directory-metadata syscall where it's available, which is
@@ -298,16 +321,20 @@ def walk_files(roots: list[str], excludes: list[str], min_size: int,
     """
     if bulk_available():
         return _walk_bulk(roots, excludes, min_size, stats, on_progress,
-                          walk_workers(roots, workers))
-    return _walk_scandir(roots, excludes, min_size, stats, on_progress)
+                          walk_workers(roots, workers), include_ext, exclude_ext)
+    return _walk_scandir(roots, excludes, min_size, stats, on_progress,
+                         include_ext, exclude_ext)
 
 
 def _walk_scandir(roots: list[str], excludes: list[str], min_size: int,
-                  stats: ScanStats, on_progress=None) -> list[FileRec]:
+                  stats: ScanStats, on_progress=None,
+                  include_ext: frozenset[str] | None = None,
+                  exclude_ext: frozenset[str] = frozenset()) -> list[FileRec]:
     """Portable walk: one stat() per file."""
     out: list[FileRec] = []
     stack = [os.path.abspath(r) for r in roots]
     last_tick = 0.0
+    ext_filtering = include_ext is not None or exclude_ext
 
     while stack:
         current = stack.pop()
@@ -328,6 +355,8 @@ def _walk_scandir(roots: list[str], excludes: list[str], min_size: int,
                     stack.append(entry.path)
                     continue
                 if not entry.is_file(follow_symlinks=False):
+                    continue
+                if ext_filtering and not ext_allowed(name, include_ext, exclude_ext):
                     continue
                 st = entry.stat(follow_symlinks=False)
             except (PermissionError, OSError) as e:
@@ -399,7 +428,9 @@ class DirReader:
     Holds its own buffer, so each thread needs its own reader.
     """
 
-    def __init__(self, excludes: list[str], min_size: int):
+    def __init__(self, excludes: list[str], min_size: int,
+                include_ext: frozenset[str] | None = None,
+                exclude_ext: frozenset[str] = frozenset()):
         import ctypes
         import struct
 
@@ -412,6 +443,8 @@ class DirReader:
         self._ctypes = ctypes
         self.excludes = excludes
         self.min_size = min_size
+        self.include_ext = include_ext
+        self.exclude_ext = exclude_ext
         self.attrs = attrlist(ATTR_BIT_MAP_COUNT, 0,
                               ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
                               0, 0, ATTR_FILE_DATALENGTH, 0)
@@ -425,6 +458,8 @@ class DirReader:
         ctypes = self._ctypes
         buf, view, u32, i64 = self.buf, self.view, self.u32, self.i64
         excludes, min_size = self.excludes, self.min_size
+        include_ext, exclude_ext = self.include_ext, self.exclude_ext
+        ext_filtering = include_ext is not None or exclude_ext
 
         files: list[FileRec] = []
         subdirs: list[str] = []
@@ -479,6 +514,12 @@ class DirReader:
                     else:
                         name_str = None
 
+                    if objtype == VREG and ext_filtering:
+                        if name_str is None:
+                            name_str = name.decode("utf-8", "surrogateescape")
+                        if not ext_allowed(name_str, include_ext, exclude_ext):
+                            continue
+
                     if objtype == VREG:
                         seen += 1
                         nbytes += size
@@ -510,14 +551,17 @@ class DirReader:
 
 
 def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
-               stats: ScanStats, on_progress=None, workers: int = 1) -> list[FileRec]:
+               stats: ScanStats, on_progress=None, workers: int = 1,
+               include_ext: frozenset[str] | None = None,
+               exclude_ext: frozenset[str] = frozenset()) -> list[FileRec]:
     if not bulk_available():
-        return _walk_scandir(roots, excludes, min_size, stats, on_progress)
+        return _walk_scandir(roots, excludes, min_size, stats, on_progress,
+                             include_ext, exclude_ext)
     if workers > 1:
         return _walk_bulk_threaded(roots, excludes, min_size, stats,
-                                   on_progress, workers)
+                                   on_progress, workers, include_ext, exclude_ext)
 
-    reader = DirReader(excludes, min_size)
+    reader = DirReader(excludes, min_size, include_ext, exclude_ext)
     out: list[FileRec] = []
     stack = [os.path.abspath(r) for r in roots]
     last_tick = 0.0
@@ -540,7 +584,9 @@ def _walk_bulk(roots: list[str], excludes: list[str], min_size: int,
 
 
 def _walk_bulk_threaded(roots: list[str], excludes: list[str], min_size: int,
-                        stats: ScanStats, on_progress, workers: int) -> list[FileRec]:
+                        stats: ScanStats, on_progress, workers: int,
+                        include_ext: frozenset[str] | None = None,
+                        exclude_ext: frozenset[str] = frozenset()) -> list[FileRec]:
     """Same walk, several directories at a time.
 
     Worth it on flash, where the queue depth is free. On a spinning disk the
@@ -566,7 +612,7 @@ def _walk_bulk_threaded(roots: list[str], excludes: list[str], min_size: int,
     outstanding = [pending.qsize()]
 
     def work():
-        reader = DirReader(excludes, min_size)
+        reader = DirReader(excludes, min_size, include_ext, exclude_ext)
         # Results accumulate per thread and are merged once at the end; taking
         # the lock for every directory costs more than the parallelism wins.
         mine: list[FileRec] = []
@@ -1476,7 +1522,9 @@ def verify_attested(groups: list, solid=None, cache=None) -> tuple:
 
 def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
                     jobs: int, stats: ScanStats, verify: bool = False,
-                    reporter=None, walkers=None, cache=None) -> list[DupGroup]:
+                    reporter=None, walkers=None, cache=None,
+                    include_ext: frozenset[str] | None = None,
+                    exclude_ext: frozenset[str] = frozenset()) -> list[DupGroup]:
     """Run the five-stage narrowing described in the module docstring.
 
     `verify` is accepted so older commands keep working. It no longer changes
@@ -1497,7 +1545,8 @@ def find_duplicates(roots: list[str], *, excludes: list[str], min_size: int,
         cache.open_paths(roots)
 
     say("scan")
-    files = walk_files(roots, excludes, min_size, stats, tick, walkers)
+    files = walk_files(roots, excludes, min_size, stats, tick, walkers,
+                       include_ext, exclude_ext)
     if reporter:
         reporter.finish_stage()
 
@@ -2313,6 +2362,42 @@ def print_report(groups: list[DupGroup], limit: int | None = None) -> None:
 # cli
 # ─────────────────────────────────────────────────────────────────────────────
 
+def normalize_ext(raw: str) -> str:
+    """One --ext/--skip-ext token: strip whitespace, drop an optional leading
+    dot, lowercase. 'jpg', '.jpg', and 'JPG' all normalize the same."""
+    token = raw.strip()
+    if token.startswith("."):
+        token = token[1:]
+    return token.lower()
+
+
+def resolve_ext_filters(ext_args: list[str], skip_ext_args: list[str]):
+    """Turn repeated, comma-splittable --ext/--skip-ext arguments into
+    (include_ext, exclude_ext). include_ext is None when --ext was never
+    given — no whitelist, everything passes that stage. Raises ValueError on
+    an empty token or an extension named by both flags."""
+    def collect(raw_args: list[str], flag: str) -> frozenset[str]:
+        tokens: set[str] = set()
+        for raw in raw_args:
+            for piece in raw.split(","):
+                ext = normalize_ext(piece)
+                if not ext:
+                    raise ValueError(f"{flag}: empty extension in {raw!r}")
+                tokens.add(ext)
+        return frozenset(tokens)
+
+    include_ext = collect(ext_args, "--ext") if ext_args else None
+    exclude_ext = collect(skip_ext_args, "--skip-ext")
+
+    if include_ext is not None:
+        conflict = sorted(include_ext & exclude_ext)
+        if conflict:
+            raise ValueError(
+                "in both --ext and --skip-ext: " + ", ".join(conflict))
+
+    return include_ext, exclude_ext
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="dedup",
@@ -2340,6 +2425,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignore files smaller than this (default: 10485760, 10 MB)")
     p.add_argument("-x", "--exclude", action="append", default=[], metavar="GLOB",
                    help="skip names matching GLOB (repeatable)")
+    p.add_argument("--ext", action="append", default=[], metavar="LIST",
+                   help="only scan these extensions, comma-separated (repeatable)")
+    p.add_argument("--skip-ext", action="append", default=[], metavar="LIST",
+                   help="skip these extensions, comma-separated (repeatable)")
     p.add_argument("--verify", action="store_true",
                    help="no-op; matches are always byte-compared now")
     p.add_argument("--no-cache", action="store_true",
@@ -2360,18 +2449,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"dedup: not a directory: {path}", file=sys.stderr)
             return 2
 
+    try:
+        include_ext, exclude_ext = resolve_ext_filters(args.ext, args.skip_ext)
+    except ValueError as e:
+        print(f"dedup: {e}", file=sys.stderr)
+        return 2
+
     stats = ScanStats()
     reporter = Reporter(enabled=not args.quiet)
     started = time.monotonic()
     cache = None if args.no_cache else ScanCache()
     try:
-        return _scan_and_act(args, stats, reporter, started, cache)
+        return _scan_and_act(args, stats, reporter, started, cache,
+                             include_ext, exclude_ext)
     finally:
         if cache is not None:
             cache.close()
 
 
-def _scan_and_act(args, stats: ScanStats, reporter, started: float, cache) -> int:
+def _scan_and_act(args, stats: ScanStats, reporter, started: float, cache,
+                  include_ext, exclude_ext) -> int:
     try:
         groups = find_duplicates(
             args.paths,
@@ -2383,6 +2480,8 @@ def _scan_and_act(args, stats: ScanStats, reporter, started: float, cache) -> in
             reporter=reporter,
             walkers=args.parallel,
             cache=cache,
+            include_ext=include_ext,
+            exclude_ext=exclude_ext,
         )
     except KeyboardInterrupt:
         reporter.finish_stage()
