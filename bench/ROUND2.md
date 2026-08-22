@@ -48,3 +48,13 @@ harness serializes benchmark runs through an advisory lock on
 `/Volumes/dedupbench` — if it is held, wait; never delete the lockfile.
 Nothing outside the repo and `/Volumes/dedupbench`, never
 `/Volumes/My New Passport`, no sudo.
+
+**One working tree per contestant.** Do not work in the main checkout at
+`/Users/dogaozden/AI_Projects/dedup` — it is shared. Make your own worktree
+and stay in it:
+
+    git -C /Users/dogaozden/AI_Projects/dedup worktree add \
+        /Users/dogaozden/AI_Projects/dedup-BRANCH -b BRANCH main
+
+Uncommitted changes left in the shared checkout will be discarded without
+notice.
