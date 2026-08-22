@@ -1488,3 +1488,254 @@ be true: the six scored scenarios run cache-off and neither fix reaches them.
 ```
 
 **Verdict:** both fixed, on `main`.
+
+---
+
+# Branch `smallfile`, off `main` at `69cd794`
+
+Two ideas from an outside analysis (against `fclones`): small files were
+opened up to three times where one or two would do, and `compare_stage`
+ran candidate groups strictly one at a time, so a tree of many small
+groups left most of `-j` idle.
+
+## 2026-08-22 — Read small files once instead of ~3x (with a bytes
+regression caught and fixed along the way)
+
+**Hypothesis:** A candidate at or under `DEEP_HEAD` (64 KiB) can be opened
+up to three times: `hash_ends` (stage 3 tier 1), `hash_head_rest` (tier 2,
+for anything tier 1 left crowded), and `split_identical` (stage 5) — the
+third one only when `RETAIN_BUDGET` can't hold the whole candidate set, so
+the head/tail read in stage 3 never gets kept for stage 5 to reuse. `needle`
+is exactly this: 100,000 files of 1-4 KB whose combined `ends_bytes` blows
+the 128 MiB budget, so every duplicate in it pays for a real stage-5 open
+that a kept head would have made free.
+
+**Attempt 1 (rejected, on measurement): read the whole file, always,
+unconditionally.** One open, group on the actual bytes in a plain dict —
+no hash decides who matches whom, byte-exact by construction. Passed every
+gate. It was still wrong: `typical`'s dominant population is unique small
+files, and today's tier 1 already settles a unique file for the cost of
+one `HEAD_BYTES` page — reading the *whole* file to reach the same verdict
+throws that away. Measured: `typical` 52.5 MB → 88.1 MB, a real bytes
+regression, `SCORE: 0.5265` against the pre-branch ~0.4847. Rule 2 is not
+negotiable regardless of how clean the idea is elsewhere. Caught by running
+the full suite before believing the design, not by inspection — the
+byte-honesty and per-scenario tables exist for exactly this.
+
+**Attempt 2 (kept): two tiers, the same shape stage 3 already has.** Tier A
+is one `HEAD_BYTES` page (the whole file, for anything no longer than that
+— there is no tier B left to stage). A page nobody else its size shares
+settles right there, unique, one open, at the same cost tier 1 always
+charged. Only a page that stays crowded pays for tier B: the rest of the
+file, in a second open, straight into a plain dict keyed on the full bytes
+— no retention budget carries it anywhere, nothing about it is read again.
+A size class settles from the cache only when *every* member already
+carries a remembered whole-file digest; one cold member and the whole
+class is read for real, mirroring what `cache.attested_runs` already does
+for the general pipeline when one group member lacks a full digest.
+
+**Attempt 2a (a second regression, also caught by measurement): one pool
+task per file.** The first working version called `pool.map` once per
+size class (or, in a still-worse draft, once per file). `needle`-shaped
+input — a few very wide size classes — reproduced `df8f3f7`'s exact
+lesson from round one, at 100,000-file scale: `Future`/lock overhead
+dominates a stage this many files pass through. Interleaved A/B against
+the pre-branch tree, real corpora, `_measure.py` directly:
+
+```text
+typical   pre 0.281s  post 0.391s   1.39x  (bytes identical)
+needle    pre 2.750s  post 3.256s   1.18x  (bytes identical, RSS 118→320 MB)
+```
+
+Fixed by batching hash_stage-style: every read in the stage is flattened
+across size classes into one list, sliced into `HASH_BATCH`-sized pieces
+inside a `RETAIN_CHECK_SPAN`-file budget-check window, and each slice goes
+through the pool as one task per `HASH_BATCH` files, not one per file.
+Re-measured, same corpora:
+
+```text
+typical   pre 0.285s  post 0.268s   0.94x
+needle    pre 2.737s  post 2.907s   1.06x
+```
+
+**Numbers (final):** full suite, seed 1, exit 0, 183 passed (171 unmodified
++ 9 new — see the tests below):
+
+```text
+scenario          gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical           pass  52.5 MB    108.7 MB    0.48x     0.264    0.456     0.58x     95       53
+photos            pass  147.9 MB   150.8 MB    0.98x     0.018    0.021     0.87x     65       149
+bigheader         pass  146.2 MB   296.5 MB    0.49x     0.016    0.030     0.52x     98       109
+needle            pass  243.8 MB   244.1 MB    1.00x     2.834    3.860     0.73x     405      303
+samesize          pass  32.8 MB    348.4 MB    0.09x     0.048    1.510     0.03x     57       284
+widegroup         pass  126.3 MB   158.8 MB    0.80x     0.056    0.052     1.07x     161      152
+prefixtrap        pass  33.4 MB    44.2 MB     0.75x     0.012    0.014     0.81x     24       51
+adversarial       pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+rescan warm/cold  pass  0 B        32.8 MB     0.00x     -        -         -         -        -
+SCORE: 0.4849
+```
+
+Seed 2, exit 0: `SCORE: 0.4913`, every scenario's bytes matching or
+improving (`typical` 64.8 MB, `needle` 244.0 MB, both ≤ their seed-2
+baseline-comparison numbers from before this branch). `--selftest`: passed,
+every sabotage still caught, `rescan` still 0 B warm against a 32.8 MB
+cold.
+
+**`typical` improved further than the pre-branch tree** (0.58x here vs.
+~0.63x before this branch) — the two-tier small-file path costs one fewer
+open than tier-1-alone-plus-a-kept-stage-5-open used to for a small file
+that turns out unique but shares its size with something. `needle`'s bytes
+hold (243.8 MB vs. 244.1 MB, actually a hair better: some real small
+duplicates no longer pay for a third open now that they settle inside
+`small_file_stage`) with wall time reproduced within noise.
+
+**`needle`'s peak RSS rose, 117 MB → ~300-400 MB, and is not chasing it
+further.** The two-tier design groups cold content on the actual bytes —
+no hash decides who matches whom — which means holding up to
+`RETAIN_BUDGET` of real file content at once for a population that is
+almost entirely unique, where the general pipeline holds a 32-byte SHA-256
+digest per file instead. RSS is bounded (by the same `RETAIN_BUDGET` the
+brief asked for) and is not part of `bench/run.py`'s score or any of its
+gates — GOAL.md section 3 lists it as the lowest-priority metric, worth
+improving, never worth trading against the other two. Trading it against
+bytes-exactness here (falling back to a hash for the narrowing decision)
+would be the wrong trade for what this metric is worth.
+
+**Not literally "one open" for every small file, and why.** A true
+duplicate whose size is over `HEAD_BYTES` (4 KiB) still costs two opens —
+tier A's page necessarily finds it crowded (real duplicates share
+everything, including their head), so tier B always runs for it. Making
+tier A read further to reach one open unconditionally is exactly attempt
+1's rejected regression restated. Verified directly, real local SSD,
+`-j 8`, interleaved against the pre-branch tree, a corpus of 40,000 8 KiB
+files (100 duplicate groups of 390 copies + 1,000 uniques, corpus and
+driver kept outside the repo):
+
+```text
+opens/file    pre 2.950   post 1.975   (0.669x)
+bytes         pre 643.1 MB post 323.6 MB (0.503x)
+wall time     pre 5.200s  post 2.460s  (0.473x)
+```
+
+...and the same corpus at 4 KiB a file (at or under `HEAD_BYTES`, where
+tier A alone *is* the whole file and there is no tier B to pay for):
+
+```text
+opens/file    pre 1.975   post 1.000   (0.506x)
+bytes         pre 323.6 MB post 163.8 MB (0.506x)
+wall time     pre 3.694s  post 1.467s  (0.397x)
+```
+
+Every run in both corpora found exactly the 100 true groups of 390, byte
+for byte, on both sides of the change.
+
+**New tests (`TestSmallFileStage`, 9):** a duplicate pair and a same-size
+non-pair under `DEEP_HEAD`, a last-byte-only difference, the routing
+boundary at exactly `DEEP_HEAD` and one byte over it, an unreadable small
+file among readable siblings, `RETAIN_BUDGET` overflow (a white-box
+accounting check via `small_file_stage` directly, and a black-box check
+that the real pair still comes out correctly once the staged pipeline
+takes over the overflow), and warm-scan attestation. Most of the
+pre-existing cache suite (`TestCacheKey`, `TestRacilyClean`, `TestCacheStore`,
+`TestDeletionVerifies`) already exercises this path unmodified, since the
+suite's `twins()` fixture is 16 KiB — including
+`test_a_third_copy_joins_a_remembered_group`, which is what pinned down
+that a size class with even one cold member has to be read and compared
+for real, matching the general pipeline's `cache.attested_runs` behaviour
+exactly.
+
+**Verdict:** KEPT (commit `eb061d3`).
+
+## 2026-08-22 — Let `-j` span stage-5 groups instead of one at a time
+
+**Hypothesis:** `compare_stage` walks candidate groups one at a time, with
+only that group's own members read in parallel — deliberate, so a group of
+two enormous files can still use the whole pool. But a tree of thousands of
+small groups leaves most of `-j` idle: a two-member group can only ever
+occupy two readers, whatever `-j` is set to. `typical` reaches stage 5 with
+roughly 640 groups of about 2.4 members each (round one's own numbers), and
+this machine's RAM-disk profile measures at `-j 2` regardless (section 2:
+"not flash" reads `-j 2`), so the effect is real but this harness has
+almost nothing to show it with — the honest test for this one is a real
+SSD at `-j 8`.
+
+**Change considered and not taken: round-synchronize `split_identical`
+itself** — read one chunk per member across every group in a wave, per
+round, so a group that settles early frees its slice of the pool for
+whichever group is still going. This is what the brief specified, and it
+would very likely win more than what landed. Not attempted: it requires
+restructuring `split_identical`'s multi-round loop into something that can
+be driven externally per group per round, and that function carries the
+tool's entire byte-exactness guarantee — the retention/prefix/tail
+handling, the cache hashers, the zero-open fast path. This file's own
+integration entry above is the record of what a textual merge did to that
+exact logic once, gluing a kept block onto the wrong offset and nearly
+merging two files that differed only in their first page. A stage-5
+rewrite is not somewhere to take that risk for a scheduling change alone.
+
+**Change (kept): dispatch whole, unmodified groups as pool tasks.**
+Layout-sorted, consecutive small groups are packed into a wave once their
+combined membership reaches `max(4 × jobs, 16)`; a group already that wide
+alone is still its own wave, unchanged, whole pool to itself. Every group
+in a multi-group wave runs `split_identical` — completely untouched — as
+its own pool task, with `pool=None` passed in (so nothing here submits
+pool work from inside pool work: no nested-executor deadlock risk).
+`compare_chunk` is sized on the wave's total membership rather than one
+group's, so a wave's aggregate memory stays inside `COMPARE_BUDGET` the
+same way one group's already did. `ScanStats` is not safe to mutate from
+several threads at once (`+=` on a plain attribute) — each wave task gets
+its own `ScanStats`, folded into the shared one once every task in the
+wave has returned; a new test drives `compare_stage` directly, with and
+without wave packing, over the same groups, and checks the totals come out
+identical either way.
+
+This is a lower-risk simplification of what was asked for, not the thing
+itself — logged here as a deliberate, considered substitution rather than
+an oversight, per the brief's own instruction to say so plainly rather than
+land a risky total.
+
+**Numbers.** Full suite, seed 1, on top of the small-file-stage commit,
+exit 0, 183 tests (180 + 3 new — a many-small-groups-in-shared-waves
+correctness check, a wide-group-alongside-small-groups mix, and the stats-
+conservation check above):
+
+```text
+scenario          gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical           pass  52.5 MB    108.7 MB    0.48x     0.272    0.451     0.60x     95       53
+photos            pass  147.9 MB   150.8 MB    0.98x     0.018    0.022     0.81x     59       149
+bigheader         pass  146.2 MB   296.5 MB    0.49x     0.018    0.032     0.58x     98       109
+needle            pass  243.8 MB   244.1 MB    1.00x     2.885    3.888     0.74x     359      303
+samesize          pass  32.8 MB    348.4 MB    0.09x     0.046    1.507     0.03x     57       284
+widegroup         pass  126.3 MB   158.8 MB    0.80x     0.056    0.053     1.06x     161      152
+prefixtrap        pass  33.4 MB    44.2 MB     0.75x     0.011    0.014     0.79x     28       51
+adversarial       pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+rescan warm/cold  pass  0 B        32.8 MB     0.00x     -        -         -         -        -
+SCORE: 0.4859
+```
+
+Seed 2, exit 0: `SCORE: 0.4964`. **Every byte column on both seeds is
+identical to the small-file-stage-only commit's, to the byte** — this
+change only reschedules reads, it never changes what gets read.
+`--selftest`: passed, `truncate-compare` still caught (`split_identical`
+itself is untouched, so the sabotage lands in exactly the same place it
+always did).
+
+**Real-SSD micro-benchmark, `-j 8`, isolated from fix 1.** 2,000
+independent duplicate pairs, 100 KB a file — above `DEEP_HEAD` so none of
+them touch `small_file_stage`, and sized so retention keeps the head and
+tail but leaves a real ~32 KB middle gap, so stage 5 does an actual read
+rather than settling on kept bytes alone. Interleaved against the
+pre-branch tree, min of 6 rounds each:
+
+```text
+wall time   pre 0.706s   post 0.643s   0.911x
+bytes       655.4 MB both sides — identical
+```
+
+An 8.9% wall-time win at zero bytes cost, past the 5% noise floor from
+section 4 rule 3, and every one of the 2,000 pairs still comes out
+correct on both sides. Modest next to what the round-synchronized version
+would likely have shown, and it is the number this specific change earns,
+not the number the fuller rewrite might have.
+
+**Verdict:** KEPT (commit `fdc1ec9`).
