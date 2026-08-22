@@ -119,6 +119,13 @@ size, and modification time at the finest resolution the filesystem records.
 Change a file and the key stops matching, so it gets read again. Filenames
 aren't part of the key, so renaming a file costs nothing.
 
+Some filesystems only record modification time to the whole second, and an
+edit landing in the same second as the scan that read the file leaves that key
+looking untouched. So a remembered digest is only trusted once the file is
+older than the scan that took it: anything modified in the same second gets
+read again, and settles on the scan after that. It costs a re-read, never a
+wrong answer.
+
 **Where.** One small SQLite file per volume, in `~/Library/Caches/dedup/`
 (`~/.cache/dedup/` off macOS), named after the volume's UUID. Entries not seen
 for 180 days are dropped. Delete the folder any time — the next scan is just a

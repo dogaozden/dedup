@@ -73,6 +73,12 @@ scores **~0.85**.
 - 16 GB of RAM total, and the RAM disk consumes it. An oversized RAM disk pushes
   the machine into swap, and swap lands on the nearly-full boot disk. If you
   ever change corpus scale, watch memory.
+- The ten corpora leave roughly 150 MB spare on the 2816 MB volume, so anything
+  else living there matters. `.fseventsd` — macOS's own event spool, which
+  every corpus build feeds — reached 88 MB across one day of runs and was
+  enough on its own to fail `ensure_space`. It is regenerable log data, not
+  corpus and not results: clear it (`rm -rf /Volumes/dedupbench/.fseventsd/*`)
+  before concluding a run cannot fit. Do not resize the RAM disk instead.
 - **Absolute timings on this machine drift by 2–3× depending on what else is
   running.** A number you measured an hour ago is not comparable to a number you
   measure now. Only the harness's interleaved min-of-N comparison is
@@ -159,6 +165,14 @@ edits a file, then forges one — and finishes by driving the real deletion path
 at a group the cache is wrong about. It reports one number, the warm/cold byte
 ratio, in the `cur/base` column: those two columns are its own two scans, not a
 baseline comparison, because the baseline has no cache to compare against.
+
+`rescan` always builds at **smoke scale**, whatever `--scale` the run asked for
+(`GATE_SCALE` in `run.py`). It is a gate and nothing it checks is a size: the
+warm/cold ratio, the attestation, and the deletion refusal all read the same at
+any corpus size. At default scale its 430 MB was what tipped the ten corpora
+past what the 2816 MB RAM disk holds, and a full `--score` run died before it
+started. This is the one scale exception in the harness; do not add another
+without the same argument behind it.
 
 `prefixtrap` is timed and gated but deliberately **not scored** — see "The
 score" below. It exists to punish one specific idea: reading less of the head.
@@ -502,34 +516,40 @@ drawn in four places that all have to hold:
   and it is reported in the table. Driving it down by skipping the deletion-time
   comparison is not an improvement to it; it is a different program.
 
-**KNOWN LIMIT, unresolved — the key is only as fine as the filesystem's clock.**
-The law above says the cache cannot see a file whose size and `mtime_ns` have
-been *forged* back. There is a second case, and it involves no forgery at all: on
-a filesystem that records mtime to the second rather than the nanosecond, any
-edit landing in the same second as the scan that cached the digest is invisible
-to `(inode, size, mtime_ns)` for exactly the same reason. **The benchmark's own
-RAM disk is such a filesystem** — `run.py` builds it with `diskutil erasevolume
-HFS+`, and HFS+ timestamps are whole seconds; four writes 200 ms apart report an
-identical `st_mtime_ns`. APFS, which is what a real Mac volume is, does not have
-this problem.
+**The key is only as fine as the filesystem's clock — and the racily-clean rule
+is what covers that.** The law above says the cache cannot see a file whose size
+and `mtime_ns` have been *forged* back. There is a second case, and it involves
+no forgery at all: on a filesystem that records mtime to the second rather than
+the nanosecond, any edit landing in the same second as the scan that cached the
+digest is invisible to `(inode, size, mtime_ns)` for exactly the same reason.
+**The benchmark's own RAM disk is such a filesystem** — `run.py` builds it with
+`diskutil erasevolume HFS+`, and HFS+ timestamps are whole seconds; four writes
+200 ms apart report an identical `st_mtime_ns`. APFS, which is what a real Mac
+volume is, does not have this problem.
 
-This is why `rescan`'s "ordinary edit" phase is racy on this machine: it passes
-only when the corpus build and the edit happen to fall in different seconds.
-Measured at smoke scale, the branch that introduced the gate fails it 2 runs in 5
-on its own tree, and post-merge it fails more often still, because round two's
-scans are fast enough that the build, both scans and the edit now fit inside one
-tick. Nothing about the merge caused it and no gate was weakened to accommodate
-it.
+Every row therefore carries `cached_at` as well, the second the scan that wrote
+it started, and a row is trusted only while the file's mtime tick is **strictly
+older** than that — git's "racily clean" rule. The comparison is made at whole
+seconds on every volume (`CACHE_TICK_NS`), the coarsest granularity any target
+filesystem uses; asking each volume how fine its clock is would be one more
+thing to get wrong for no safety gained. A racy row is not a miss disaster: it
+is dropped whole — every column of it was taken by the same suspect scan — and
+the file is read as though nothing had been remembered. The cost is re-reading
+a file edited in the same second as the scan that recorded it, and one further
+scan before it settles.
 
-What it costs is a wrong *answer*, never a wrong deletion: deletion byte-verifies
-every attested group, so the poison bullet above still holds and files are still
-safe. But `--list` can report an edited file as a duplicate of what it used to
-match. The known-good fix is git's "racily clean" rule — refuse to trust an entry
-whose mtime falls in the same tick as the scan that recorded it — and it costs
-one extra warm-up scan, which the gate's two-scan cold/warm shape cannot express.
-**That is a decision for the user, not an optimisation to be taken unilaterally**,
-and until it is taken, do not tune anything against the edit phase of `rescan` on
-this volume.
+That closes the wrong-*answer* hole. The wrong-*deletion* hole was never open:
+deletion byte-verifies every attested group, so the poison bullet above holds
+whatever the clock does, and the rule above is a narrowing of what gets trusted,
+never a second line of defence for deletion. Do not weaken it into one.
+
+`rescan`'s "ordinary edit" phase used to be racy on this machine for the same
+reason and is not any more. The gate now waits for the wall clock to cross a
+second boundary before its cold scan, so the corpus is genuinely older than the
+scan that reads it; without that the cold scan can land in the tick that built
+the corpus, every entry it writes is racily clean, and the warm scan honestly
+re-reads all of it. Measured at smoke scale on the merged tree, the edit phase
+failed 3 runs in 10 before the rule and 0 in 10 after it.
 
 Be clear-eyed about the trap here, because it has not gone away: a cache
 **scores enormously** on a benchmark that runs the same corpus repeatedly. That

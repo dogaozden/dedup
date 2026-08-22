@@ -1309,3 +1309,182 @@ fix is git's "racily clean" rule: distrust an entry whose mtime falls in the
 same tick as the scan that wrote it. It costs one extra warm-up scan, which the
 gate's two-scan cold/warm shape cannot express, so taking it means changing the
 gate — which section 5 puts out of an optimizer's hands. Left for the user.
+
+## 2026-08-22 — Both of the merge's leftovers, repaired
+
+The two things the last entry logged rather than fixed. The first is a product
+bug and its fix is in `dedup.py`; the second is the harness's own capacity and
+its fix is in `bench/`, authorised for that reason.
+
+### 1. Racily-clean cache entries
+
+`(inode, size, mtime_ns)` is only as fine as the filesystem's clock, and HFS+
+records mtime to the second. An edit landing in the same second as the scan
+that read the file leaves all three unchanged, so the next scan believes a
+digest taken over bytes that are gone. No forgery anywhere in it — an ordinary
+edit at an ordinary moment.
+
+Every row now carries `cached_at`, the second the writing scan started, and a
+row is trusted only while the file's mtime tick is **strictly older** than it:
+git's racily-clean rule. The comparison is made at whole seconds on every
+volume (`CACHE_TICK_NS`), the coarsest granularity any target filesystem uses;
+asking each volume how fine its clock is would be one more thing to get wrong
+for no safety gained. `CACHE_SCHEMA` went 2 → 3, so every database written
+before this is dropped and rebuilt cold.
+
+Three details that are not obvious from the rule:
+
+- **The timestamp is read once, in `__init__`, before anything else is.** Every
+  digest the scan stores comes from bytes read after that moment, so any file
+  whose mtime reaches that tick could have changed behind the read. Stamping at
+  store time instead would leave a hole open: a read at 10.9 and a store at
+  11.1 are different ticks, and an edit at 10.95 would be trusted.
+- **A distrusted row is dropped whole, not re-stamped.** Every column of it was
+  taken by the same suspect scan. Re-reading stage 3's digest and leaving stage
+  4's behind under a fresh timestamp would turn one racy row into a trusted
+  lie — the file would be re-read where it settles and believed where it does
+  not.
+- **`remember` always writes this scan's timestamp.** A racy row's key still
+  matches, which is the whole problem; without this it would keep its old
+  timestamp and never become trustworthy again.
+
+The cost is re-reading a file edited in the same second as the scan that
+recorded it, plus one further scan before it settles. The poison guarantee is
+untouched, and was never what this was about: a trusted row still proves
+nothing, and deletion still byte-verifies every attested group.
+
+**At the CLI, before and after.** Two 16 MB twins, both stamped to the exact
+second the cold scan runs in; then one is rewritten to the same length and
+stamped back to that same second. Size and `mtime_ns` come out of the edit
+unchanged — `16777216 1787374177` before and after — and no forgery is
+involved, only a clock too coarse to show what happened. On `main` at `9fb25e1`:
+
+```text
+--- re-scan after the same-second edit ---
+  1 duplicate groups · 16.0 MB reclaimable
+  0 byte-compared just now · 1 remembered from an earlier scan
+  16.0 MB × 2  (reclaims 16.0 MB)
+      .../tree/a.bin
+      .../tree/b.bin
+VERDICT: WRONG — the edited file is still reported as a duplicate
+```
+
+With the rule in place:
+
+```text
+--- re-scan after the same-second edit ---
+  No duplicates found.
+VERDICT: correct — the edit was seen, nothing is reported as duplicate
+```
+
+Five tests cover it (`TestRacilyClean`): an entry cached in the file's own tick
+is distrusted, one cached a tick later is trusted, the same-second edit is no
+longer reported as a duplicate, a racy row loses every column and not just the
+one re-read, and a trusted-but-lying group is still refused at deletion. They
+pin the clock rather than sleeping on it — `cached_at` is the scan's own
+reading and the file's mtime is set relative to it — so none of them is timing
+dependent. The suite's own corpus helper (`twins`) now backdates what it writes
+by two ticks, because a tree written microseconds before the scan is one the
+tool is now right to distrust, and every test that wants a warm hit has to
+describe a tree that is genuinely older than the scan. 171 passed.
+
+### 2. Bench capacity, and a gate that no longer races
+
+**`rescan` builds at smoke scale now, at any `--scale`.** It is gate-only,
+everything it checks is a ratio or a refusal, and none of that depends on
+corpus size — while at default scale its 430 MB was what tipped the ten corpora
+past the 2816 MB RAM disk and killed a full `--score` run before it started.
+One entry in `GATE_SCALE`, read by `scenario_shape`. The RAM disk was not
+resized; section 2's warning about swap on a 94%-full boot disk stands.
+
+**The gate waits for a tick boundary before its cold scan.** With the rule
+above in place, a cold scan starting in the second that built the corpus writes
+nothing but racily-clean entries, and the warm scan honestly re-reads all of
+it — a correct answer to a real ambiguity, but not what the gate measures.
+`next_tick()` costs at most 1.1 s and makes the phase deterministic. The
+ordinary-edit phase deliberately does *not* get one: the edit always lands at or
+after the cold scan's own tick, so `mtime >= cached_at` holds by construction
+and the re-read is already deterministic. Ten runs confirm it rather than
+argument alone.
+
+**Flake, measured the same way on both sides** — the `rescan` scenario at smoke
+scale, ten consecutive runs, quiet machine:
+
+```text
+BEFORE (main 9fb25e1)                AFTER (this branch)
+run 1: FAILED  after an edit         run 1..10: pass
+run 2: pass                          [warm 0 B against cold 32.8 MB, 0.00%]
+run 3: pass
+run 4: pass
+run 5: FAILED  after an edit
+run 6: FAILED  after an edit
+run 7..10: pass
+BEFORE: 7 passed, 3 failed out of 10
+AFTER: 10 passed, 0 failed out of 10
+```
+
+Three in ten rather than the five in six the last entry recorded, and the
+difference is machine load, not code: the tighter the machine, the more of the
+build, both scans and the edit fit inside one tick. Either way the failure mode
+is gone, not made rarer — the rule removes the race rather than dodging it.
+
+### Capacity, honestly
+
+The ten corpora now estimate 2671 MB against the 2816 MB disk and land at about
+2530 MB actual. That fits, but the margin is thin and it is worth writing down
+where it went: `ensure_space` asks for 1.4× a corpus's estimate before building
+it, and with nine corpora already on the volume the tenth's headroom is the
+binding constraint. The first attempt at a full run still died —
+
+```text
+bench: /Volumes/dedupbench needs 627.5 MB free, has 598.3 MB
+```
+
+— on `bigheader`, 29 MB short, because 88 MB of accumulated `.fseventsd` spool
+had built up on the volume across every agent's corpus churn. That is
+regenerable OS log data on a scratch RAM disk, not corpus and not results;
+clearing it freed 88 MB and the run went through. Nothing in `bench/` was
+changed to make that check pass. If a future run dies the same way, clear the
+spool before touching anything else — and note that the volume now finishes a
+full run with roughly 150 MB free, so a scenario added at default scale will
+need this arithmetic redone.
+
+### Numbers
+
+Full suite, in-tree, seed 1, default scale, `--score`, exit 0:
+
+```text
+scenario          gate  bytes cur  bytes base  cur/base  sec cur  sec base  cur/base  rss cur  rss base
+typical           pass  52.5 MB    108.7 MB    0.48x     0.286    0.455     0.63x     104      53
+photos            pass  147.9 MB   150.8 MB    0.98x     0.018    0.021     0.86x     65       149
+bigheader         pass  146.2 MB   296.5 MB    0.49x     0.015    0.030     0.52x     98       109
+needle            pass  244.1 MB   244.1 MB    1.00x     2.696    3.889     0.69x     115      304
+samesize          pass  32.8 MB    348.4 MB    0.09x     0.047    1.512     0.03x     57       284
+widegroup         pass  126.3 MB   158.8 MB    0.80x     0.057    0.053     1.08x     162      152
+prefixtrap        pass  33.4 MB    44.2 MB     0.75x     0.011    0.015     0.77x     24       51
+adversarial       pass  1.4 MB     4.2 MB      0.34x     -        -         -         -        -
+deletion          pass  -          -           -         -        -         -         -        -
+rescan warm/cold  pass  0 B        32.8 MB     0.00x     -        -         -         -        -
+SCORE: 0.4847
+```
+
+Ten scenarios, which is the first full run since the merge — the last entry
+could only name the nine that fit. Run twice: `0.4827` and `0.4847` against the
+integrator's `0.4842`, the spread being the time terms on a machine that drifts
+2–3× with load. **Every byte column is identical to the integrator's, to the
+byte**, on all eight scenarios that report one, which is the thing that had to
+be true: the six scored scenarios run cache-off and neither fix reaches them.
+
+`--selftest`, exit 0, every sabotage still caught:
+
+```text
+  control, no sabotage        clean       byte gap 0.0%, 4 group(s) found
+  truncate-compare            caught      groups differ: 5 unexpected group(s)
+  underreport-bytes           caught      byte gap 50.0% against a 20% tolerance
+  control, no sabotage        clean       warm read 0 B against a cold 32.8 MB
+  skip-attested-verify        caught      fail: deletion — deleted
+                                          album/copies/pair000.jpg out of a
+                                          group whose copies do not match
+```
+
+**Verdict:** both fixed, on `main`.
