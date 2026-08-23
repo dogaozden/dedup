@@ -1426,5 +1426,76 @@ Every scenario improved; nothing traded against anything. Bytes are unchanged
 and still exactly at the ceiling on every scenario, because this reads nothing
 — it only stops running a program to ask a question.
 
+**Confirmed at `--seed 2`**, pinned to the commit rather than the worktree
+(`--candidate fce09bf`), same scale and rounds, load average 5.14 4.94 4.76:
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.7520 | 1.6984 | 0.9782 | ±4.5% |
+| typical | 0.1951 | 0.1376 | 0.7092 | ±3.4% |
+| samesize | 0.0859 | 0.0283 | 0.3213 | ±1.2% |
+| widegroup | 0.1172 | 0.0537 | 0.4784 | ±3.5% |
+| photos | 0.0831 | 0.0246 | 0.2944 | ±1.0% |
+| bigheader | 0.0790 | 0.0227 | 0.2868 | ±0.8% |
+| rescan | 0.1218 | 0.0654 | 0.5296 | ±1.7% |
+
+```
+SCORE: 0.4659
+```
+
+**Verdict:** KEPT (commit `fce09bf`). Evidence:
+`evidence/r1-change2-seed1-default.txt`,
+`evidence/r1-change2-seed2-default.txt`,
+`evidence/r1-selftest-change2.txt`.
+
+## 2026-08-23 — the volume UUID, asked without a subprocess either
+
+**Hypothesis:** the second `diskutil`. The cache names its database after the
+volume's UUID, and `volume_uuid` was running the same subprocess a second time
+to learn it. Only `rescan` runs with the cache on, which is why it was still
+at 0.5271 when everything around it had halved twice. The kernel will answer
+this one directly: `getattrlist` has an attribute for it.
+
+**Change:** `sys::volume_uuid` — one `getattrlist` for
+`ATTR_VOL_INFO | ATTR_VOL_UUID`, formatted the way `diskutil` formats it.
+`device::volume_uuid` calls it and keeps the hashed-mount-point fallback for a
+volume that has no UUID. `ask_diskutil` and `plist_value` had no callers left
+and went with it, along with the plist test — nothing in the tool shells out to
+`diskutil` any more.
+
+**The spelling is the whole risk, so it has a test.** This string names a file
+in the cache directory. Sixteen correct bytes spelled differently would not be
+wrong in any way a gate could see; it would just quietly orphan every existing
+cache and make the next scan of every volume cold. So `sys.rs` asserts the
+formatted UUID equals what `diskutil info` prints, on every volume mounted:
+
+```
+/: getattrlist=Some("6E4E494E-ED93-489D-AA3F-E8B3A187B1E5") diskutil=Some("6E4E494E-...")
+/Volumes/dedupbench: getattrlist=Some("CB9A058D-2E3F-36E5-817E-7D30D7D9E025") diskutil=Some("CB9A058D-...")
+```
+
+**Numbers:** seed 1, `--scale default`, 9 rounds, load average as recorded in
+the evidence file. Noise floor ±4.3%. `--selftest` passed first — 4 of 4
+sabotages caught.
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.6886 | 1.6358 | 0.9720 | ±2.7% |
+| typical | 0.1903 | 0.1341 | 0.6933 | ±2.2% |
+| samesize | 0.0810 | 0.0241 | 0.2974 | ±0.5% |
+| widegroup | 0.1075 | 0.0472 | 0.4434 | ±2.1% |
+| photos | 0.0886 | 0.0234 | 0.2813 | ±6.0% |
+| bigheader | 0.0814 | 0.0242 | 0.2944 | ±1.8% |
+| rescan | 0.1224 | 0.0055 | **0.0448** | ±0.1% |
+
+```
+SCORE: 0.3181
+```
+
+Only `rescan` was expected to move and only `rescan` moved: a warm scan that
+found nothing to do now takes 5.5 ms instead of 122 ms, because the 122 ms was
+never the scan. The other six sit where change two left them, inside the
+noise.
+
 **Verdict:** KEPT (commit below).
-`evidence/r1-change2-seed1-default.txt`.
+`evidence/r1-change3-seed1-default.txt`.

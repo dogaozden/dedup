@@ -11,7 +11,6 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread::JoinHandle;
 
 #[derive(Clone, Copy, Debug)]
@@ -137,13 +136,8 @@ fn is_solid_state(path: &Path) -> Option<bool> {
 /// and guessing wrong only ever costs one cold scan.
 pub fn volume_uuid(path: &Path) -> String {
     let root = mount_point(path);
-    if let Some(uuid) = ask_diskutil(&root, "VolumeUUID")
-        .as_deref()
-        .and_then(|value| value.strip_prefix("<string>"))
-        .and_then(|value| value.split('<').next())
-        .filter(|value| !value.is_empty())
-    {
-        return uuid.to_string();
+    if let Some(uuid) = crate::sys::volume_uuid(&root) {
+        return uuid;
     }
     let digest = crate::stages::sha256(root.as_os_str().as_encoded_bytes());
     digest
@@ -153,42 +147,9 @@ pub fn volume_uuid(path: &Path) -> String {
         .to_string()
 }
 
-fn ask_diskutil(root: &Path, key: &str) -> Option<String> {
-    let output = Command::new("diskutil")
-        .args(["info", "-plist"])
-        .arg(root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    plist_value(&text, key).map(ToString::to_string)
-}
-
-/// Whatever element follows `<key>name</key>`. Enough of a plist reader for
-/// two boolean-or-string lookups, and it keeps the crate list short.
-fn plist_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let marker = format!("<key>{key}</key>");
-    let rest = text.split_once(&marker)?.1;
-    Some(rest.trim_start())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plist_lookup_finds_the_element_after_the_key() {
-        let text = "<dict>\n\t<key>SolidState</key>\n\t<true/>\n\t<key>VolumeUUID</key>\n\t<string>ABC-123</string>\n</dict>";
-        assert!(plist_value(text, "SolidState")
-            .expect("key present")
-            .starts_with("<true"));
-        assert!(plist_value(text, "VolumeUUID")
-            .expect("key present")
-            .starts_with("<string>ABC-123<"));
-        assert!(plist_value(text, "Missing").is_none());
-    }
 
     #[test]
     fn an_explicit_j_overrides_both_pools() {

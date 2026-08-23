@@ -221,6 +221,39 @@ mod agreement {
         Some(rest.starts_with("<true"))
     }
 
+    /// Whatever `diskutil info` prints for a key, as text.
+    fn diskutil_string(mount: &str, key: &str) -> Option<String> {
+        let out = Command::new("diskutil")
+            .args(["info", "-plist", mount])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let rest = text
+            .split_once(&format!("<key>{key}</key>"))?
+            .1
+            .trim_start();
+        let value = rest.strip_prefix("<string>")?.split('<').next()?;
+        Some(value.to_string())
+    }
+
+    /// The UUID names a file in the cache directory, so getting the same
+    /// sixteen bytes is not enough — it has to be spelled the way the
+    /// subprocess spelled it, or every volume silently starts again from cold.
+    #[test]
+    fn the_volume_uuid_is_spelled_the_way_diskutil_spells_it() {
+        for mount in ["/", "/Volumes/dedupbench"] {
+            let path = Path::new(mount);
+            if !path.exists() {
+                continue;
+            }
+            let (ours, theirs) = (volume_uuid(path), diskutil_string(mount, "VolumeUUID"));
+            println!("{mount}: getattrlist={ours:?} diskutil={theirs:?}");
+            if theirs.is_some() {
+                assert_eq!(ours, theirs, "{mount}: disagreed with diskutil");
+            }
+        }
+    }
+
     /// The replacement has to give the answer it replaced, on whatever volumes
     /// this machine happens to have mounted. A faster way to a different answer
     /// would be a different tool, not a faster one.
@@ -236,4 +269,71 @@ mod agreement {
             assert_eq!(ours, theirs, "{mount}: disagreed with diskutil");
         }
     }
+}
+
+/// The UUID of the volume `path` sits on — one syscall, where this used to be
+/// a second `diskutil`.
+///
+/// The spelling matters as much as the value: it names a file in the cache
+/// directory, so a version that spelled it differently would silently start
+/// every volume again from cold. `getattrlist` hands back the same sixteen
+/// bytes `diskutil` prints, and this prints them the same way — uppercase,
+/// hyphenated 8-4-4-4-12.
+pub fn volume_uuid(path: &Path) -> Option<String> {
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_VOL_INFO: u32 = 0x8000_0000;
+    const ATTR_VOL_UUID: u32 = 0x0004_0000;
+
+    /// What the kernel writes back: its own length, then the UUID. `length`
+    /// is how the "this volume has no UUID" case is told apart from a filled
+    /// buffer — an unsupported attribute is simply not written.
+    #[repr(C)]
+    struct Answer {
+        length: u32,
+        uuid: [u8; 16],
+    }
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `attrlist` is a plain C struct of integers, for which all-zero
+    // is the documented "ask for nothing" state; the two fields set below are
+    // the request.
+    let mut request: libc::attrlist = unsafe { std::mem::zeroed() };
+    request.bitmapcount = ATTR_BIT_MAP_COUNT;
+    request.volattr = ATTR_VOL_INFO | ATTR_VOL_UUID;
+
+    let mut answer = std::mem::MaybeUninit::<Answer>::uninit();
+    // SAFETY: `c_path` is NUL-terminated and outlives the call; `request` is a
+    // fully initialised attrlist; `answer` is writable storage of exactly the
+    // size passed. A nonzero return means nothing was written and the
+    // uninitialised buffer is dropped unread.
+    if unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            std::ptr::addr_of_mut!(request).cast::<c_void>(),
+            answer.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of::<Answer>(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    // SAFETY: getattrlist returned 0, so it wrote at least `length`.
+    let answer = unsafe { answer.assume_init() };
+    if answer.length as usize != std::mem::size_of::<Answer>() {
+        return None; // the volume does not carry a UUID
+    }
+    let hex: String = answer
+        .uuid
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
