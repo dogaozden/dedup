@@ -19,7 +19,16 @@ pub const SAMPLE_POINTS: usize = 8;
 /// own and saves less than that open is worth.
 pub const SAMPLE_SPAN: u64 = 8 * 1024 * 1024;
 /// Comparison chunk on flash.
-pub const CHUNK: usize = 4 * 1024 * 1024;
+///
+/// Four megabytes was the obvious size and it is not the fast one. A narrow
+/// group takes the whole of this — eight members of `bigheader` get 4 MB each,
+/// 32 MB in flight — and neither the read nor the compare that follows it can
+/// keep that in cache, so both go to DRAM. Measured in C at the comparison's
+/// own shape, eight files read in lockstep and compared against a pivot:
+/// 23.82 ms at 4 MB, 18.02 at 1 MB, **17.76 at 512 KB**, 18.60 at 256 KB.
+/// Wide groups are unaffected — `COMPARE_BUDGET / members` already puts a
+/// 227-member group at 564 KB, which is why this was invisible there.
+pub const CHUNK: usize = 512 * 1024;
 /// ...and on a spinning disk, where every extra file in a group costs a seek.
 pub const SLOW_CHUNK: usize = 16 * 1024 * 1024;
 /// Ceiling on bytes held for one group (or one wave) of the comparison.

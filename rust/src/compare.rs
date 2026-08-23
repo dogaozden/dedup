@@ -804,7 +804,11 @@ mod tests {
         let flash = Profile::Flash;
         assert_eq!(compare_chunk(flash, 2, true), CHUNK);
         assert_eq!(compare_chunk(flash, 2, false), SLOW_CHUNK);
-        assert_eq!(compare_chunk(flash, 64, true), COMPARE_BUDGET / 64);
+        // The budget only starts biting past COMPARE_BUDGET / CHUNK members;
+        // below that the chunk is what flash prefers.
+        assert_eq!(compare_chunk(flash, 64, true), CHUNK);
+        assert_eq!(compare_chunk(flash, 512, true), COMPARE_BUDGET / 512);
+        assert!(COMPARE_BUDGET / 512 < CHUNK, "512 members must shrink it");
         assert_eq!(compare_chunk(flash, 100_000, true), MIN_CHUNK);
     }
 
