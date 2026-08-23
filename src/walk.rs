@@ -5,7 +5,6 @@
 //! counted after the name filters and before the size filter, which is the
 //! order `dedup.py`'s walkers use and the order the protocol asks for.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -144,81 +143,88 @@ pub fn walk(
     survivors
 }
 
-/// Collapse each (device, inode) to a single record listing all its names.
-fn drop_hardlinks(root: &Path, entries: Vec<Entry>) -> Vec<FileRec> {
-    let mut order: Vec<(u64, u64)> = Vec::new();
-    let mut by_inode: HashMap<(u64, u64), FileRec> = HashMap::new();
-    for entry in entries {
-        let key = (entry.dev, entry.ino);
-        let record = by_inode.entry(key).or_insert_with(|| {
-            order.push(key);
-            FileRec {
-                names: Vec::new(),
-                size: entry.size,
-                dev: entry.dev,
-                ino: entry.ino,
-                mtime_ns: entry.mtime_ns,
-                head: Vec::new(),
-                tail: Vec::new(),
-            }
-        });
-        // Overlapping roots hand us the same name twice; keeping both would
-        // overstate the link count and try to delete one file two times.
+/// Fold one inode's directory entries into a single record.
+///
+/// Several names for one inode is normally a hardlink, and those are separate
+/// directory entries that all have to go together. But overlapping roots or a
+/// symlinked root can hand us two spellings of a single entry, and deleting it
+/// twice would report a failure for work already done — so only multi-name
+/// records pay for resolving that.
+fn fold_inode(root: &Path, entries: &mut [Entry]) -> FileRec {
+    let first = &entries[0];
+    let mut record = FileRec {
+        names: Vec::with_capacity(entries.len()),
+        size: first.size,
+        dev: first.dev,
+        ino: first.ino,
+        mtime_ns: first.mtime_ns,
+        head: Vec::new(),
+        tail: Vec::new(),
+    };
+    for entry in entries.iter_mut() {
         if !record.names.contains(&entry.relative) {
-            record.names.push(entry.relative);
+            record.names.push(std::mem::take(&mut entry.relative));
         }
     }
-
-    for record in by_inode.values_mut() {
-        // Several names for one inode is normally a hardlink, and those are
-        // separate directory entries that all have to go. But a symlinked root
-        // can hand us two spellings of one entry. Only multi-name records pay
-        // for resolving that.
-        if record.names.len() > 1 {
-            let mut seen: Vec<(PathBuf, String)> = Vec::new();
-            for name in record.names.drain(..) {
-                let real = fs::canonicalize(root.join(&name)).unwrap_or_else(|_| root.join(&name));
-                if !seen.iter().any(|(known, _)| known == &real) {
-                    seen.push((real, name));
-                }
+    if record.names.len() > 1 {
+        let mut seen: Vec<(PathBuf, String)> = Vec::new();
+        for name in record.names.drain(..) {
+            let real = fs::canonicalize(root.join(&name)).unwrap_or_else(|_| root.join(&name));
+            if !seen.iter().any(|(known, _)| known == &real) {
+                seen.push((real, name));
             }
-            record.names = seen.into_iter().map(|(_, name)| name).collect();
         }
-        record
-            .names
-            .sort_by(|left, right| name_order(left).cmp(&name_order(right)));
+        record.names = seen.into_iter().map(|(_, name)| name).collect();
     }
-
-    order
-        .into_iter()
-        .filter_map(|key| by_inode.remove(&key))
-        .collect()
+    record
+        .names
+        .sort_by(|left, right| name_order(left).cmp(&name_order(right)));
+    record
 }
 
-/// Stage 2: hardlink collapse, then discard every size only one record holds.
-/// Read order follows the volume's layout rather than the grouping, so a stage
-/// is one sweep across the disk instead of a jump per file.
-pub fn candidates(root: &Path, entries: Vec<Entry>) -> Vec<FileRec> {
-    let mut by_size: HashMap<u64, Vec<Entry>> = HashMap::new();
-    let mut sizes: Vec<u64> = Vec::new();
-    for entry in entries {
-        by_size.entry(entry.size).or_insert_with(|| {
-            sizes.push(entry.size);
-            Vec::new()
-        });
-        let size = entry.size;
-        by_size.get_mut(&size).expect("just inserted").push(entry);
+/// Stage 2: collapse hardlinks, then discard every size only one record holds.
+///
+/// One sort by (size, device, inode) does all the grouping this stage needs —
+/// a size's entries land in one run and an inode's names land adjacent inside
+/// it — which keeps the whole stage to the entry list and the records it
+/// produces. Grouping through hash maps instead cost about three times the
+/// peak, against REWRITE.md §6's per-record budget.
+///
+/// The records come back in the volume's layout order rather than the grouping
+/// order, so a later stage is one sweep across the disk instead of a jump per
+/// file.
+pub fn candidates(root: &Path, mut entries: Vec<Entry>) -> Vec<FileRec> {
+    entries.sort_unstable_by_key(|entry| (entry.size, entry.dev, entry.ino));
+
+    let mut out: Vec<FileRec> = Vec::new();
+    let mut run_start = 0;
+    while run_start < entries.len() {
+        let size = entries[run_start].size;
+        let mut run_end = run_start;
+        while run_end < entries.len() && entries[run_end].size == size {
+            run_end += 1;
+        }
+
+        let first_record = out.len();
+        let mut name_start = run_start;
+        while name_start < run_end {
+            let inode = (entries[name_start].dev, entries[name_start].ino);
+            let mut name_end = name_start;
+            while name_end < run_end && (entries[name_end].dev, entries[name_end].ino) == inode {
+                name_end += 1;
+            }
+            out.push(fold_inode(root, &mut entries[name_start..name_end]));
+            name_start = name_end;
+        }
+        // A size only one record holds is nobody's duplicate, and a hardlink
+        // cluster matching nothing else is one record wearing several names.
+        if out.len() - first_record < 2 {
+            out.truncate(first_record);
+        }
+        run_start = run_end;
     }
 
-    let mut out = Vec::new();
-    for size in sizes {
-        let bucket = by_size.remove(&size).expect("size was recorded");
-        let mut records = drop_hardlinks(root, bucket);
-        if records.len() > 1 {
-            out.append(&mut records);
-        }
-    }
-    out.sort_by_key(FileRec::layout);
+    out.sort_unstable_by_key(FileRec::layout);
     out
 }
 
@@ -298,6 +304,30 @@ mod tests {
             .find(|record| record.ino == 9)
             .expect("the cluster survives");
         assert_eq!(cluster.names, ["links/a.bin", "links/b.bin"]);
+    }
+
+    #[test]
+    fn a_record_fits_the_per_file_memory_budget() {
+        // REWRITE.md §6 allows 230 bytes per file record, §4 says 180-230 is
+        // the shape to aim for. A record is the struct, the vector holding its
+        // names, and the name bytes themselves.
+        let name = "photos/2021/holiday/IMG_20210714_183012.jpg";
+        let record = FileRec {
+            names: vec![name.to_string()],
+            size: 1,
+            dev: 1,
+            ino: 1,
+            mtime_ns: 0,
+            head: Vec::new(),
+            tail: Vec::new(),
+        };
+        let footprint = std::mem::size_of::<FileRec>()
+            + record.names.capacity() * std::mem::size_of::<String>()
+            + record.names.iter().map(String::capacity).sum::<usize>();
+        assert!(
+            footprint <= 230,
+            "{footprint} bytes per record, over the 230-byte budget"
+        );
     }
 
     #[test]

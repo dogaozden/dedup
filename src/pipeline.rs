@@ -16,6 +16,7 @@ use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTE
 use crate::device::Device;
 use crate::effort::Effort;
 use crate::filters::Filters;
+use crate::ordered::Ordered;
 use crate::stages::{has_tail, hash_stage, release, small_file_stage, Probe, Reader};
 use crate::walk::{basename, candidates, name_order, walk, FileRec};
 
@@ -34,6 +35,46 @@ pub struct Scan {
 /// How much the end probe reads — for the retention decision.
 fn ends_bytes(size: u64) -> usize {
     size.min(HEAD_BYTES as u64) as usize + usize::from(has_tail(size)) * TAIL_BYTES
+}
+
+/// Stage 1 and 2 alone: the candidate set, which is all a walk and a size
+/// bucket can say.
+///
+/// The M1 gate grades exactly this, on the premise that an implementation at
+/// M1 has no content stages and so reports it by default. That premise expires
+/// the moment stage 3 exists, which is why the harness's own oracle driver
+/// carries the same switch. Nothing but `--gate m1` ever asks for it, and no
+/// milestone here is claimed with it — see LOG.md.
+pub fn size_stage(root: &Path, filters: Filters) -> Scan {
+    let mut files_seen = 0;
+    let mut bytes_seen = 0;
+    let mut unreadable = Vec::new();
+    let entries = walk(
+        root,
+        filters,
+        &mut files_seen,
+        &mut bytes_seen,
+        &mut unreadable,
+    );
+    let records = candidates(root, entries);
+    let mut buckets: Ordered<u64, usize> = Ordered::new();
+    for (index, record) in records.iter().enumerate() {
+        buckets.push(record.size, index);
+    }
+    let mut groups: Vec<DupGroup> = buckets
+        .into_values()
+        .into_iter()
+        .filter(|bucket| bucket.len() > 1)
+        .map(|members| DupGroup { members })
+        .collect();
+    sort_groups(&records, &mut groups);
+    Scan {
+        records,
+        groups,
+        files_seen,
+        bytes_seen,
+        unreadable,
+    }
 }
 
 fn pool_of(jobs: usize) -> ThreadPool {

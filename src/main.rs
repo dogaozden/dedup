@@ -24,7 +24,7 @@ use consts::DEFAULT_MIN_SIZE;
 use device::Device;
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
-use pipeline::{find_duplicates, report_names};
+use pipeline::{find_duplicates, report_names, size_stage};
 
 #[derive(Debug, Default, Serialize)]
 struct Report {
@@ -50,6 +50,9 @@ struct Options {
     yes: bool,
     hard: bool,
     no_cache: bool,
+    /// "size" stops after the walk and size grouping. Only the M1 gate asks
+    /// for it; every other gate leaves it empty.
+    stage: String,
 }
 
 const KEEP_RULES: [&str; 3] = ["shortest", "oldest", "newest"];
@@ -64,7 +67,7 @@ fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--report-json" | "--min-size" | "-j" | "--jobs" | "-x" | "--exclude" | "--ext"
-            | "--skip-ext" => {
+            | "--skip-ext" | "--stage" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| format!("{argument} needs a value"))?;
@@ -74,6 +77,7 @@ fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
                     "-j" | "--jobs" => options.jobs = Some(value.parse()?),
                     "-x" | "--exclude" => options.excludes.push(value),
                     "--ext" => options.ext.push(value),
+                    "--stage" => options.stage = value,
                     _ => options.skip_ext.push(value),
                 }
             }
@@ -140,9 +144,12 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         excludes: &options.excludes,
     };
 
-    let device = Device::probe(&root, options.jobs);
     let effort = Effort::default();
-    let scan = find_duplicates(&root, filters, device, &effort);
+    let scan = if options.stage == "size" {
+        size_stage(&root, filters)
+    } else {
+        find_duplicates(&root, filters, Device::probe(&root, options.jobs), &effort)
+    };
 
     let mut report = Report {
         groups: report_names(&scan.records, &scan.groups),
