@@ -1332,3 +1332,241 @@ $ cargo clippy --all-targets -- -D warnings
 $ cargo fmt --check
 (no output: clean)
 ```
+
+---
+
+## M5.1 — the pre-flight menu, and --help — CLAIMED
+
+`--help` and `-h` print real usage and exit 0; they used to exit 2 with
+"unknown argument". An interactive launch gets a form of the tool's real
+options before the scan starts. Both read one table.
+
+### One table
+
+`rust/src/cli.rs` holds `FLAGS`. The parser walks it to decide what each
+argument means, `help_text()` renders it, and the menu asks it for its fields,
+their prompts and their defaults. No flag is spelled twice anywhere, and a word
+becomes a setting in exactly one function — `Flag::apply` — so the menu
+validating a field and the parser reading an argument are the same code.
+
+```
+$ dedup-rs --help
+```
+
+Captured to `evidence/m5_1-help.txt`, quoted from the file:
+
+```text
+dedup-rs — find byte-exact duplicate files.
+
+usage: dedup-rs <root> [options]
+
+Groups of files whose bytes are identical, largest first. Nothing is
+ever called a duplicate on the strength of a hash: every group is
+read and compared. Without --list or --auto, a terminal gets the
+interactive browser.
+
+options:
+      --min-size BYTES    ignore files smaller than this
+                          (default: 10485760 bytes (10 MiB))
+      --ext LIST          only these extensions, comma-separated; repeatable
+                          (default: every extension)
+      --skip-ext LIST     skip these extensions, comma-separated; repeatable
+                          (default: skip nothing)
+  -x, --exclude GLOB      skip paths matching this glob; repeatable
+                          (default: exclude nothing)
+  -j, --jobs N            readers to use
+                          (default: as many as the disk is worth)
+      --profile NAME      access patterns to use: flash, spinning or auto
+                          (default: auto)
+      --no-cache          read everything, remembering nothing
+                          (default: use the scan cache)
+  -l, --list              print the duplicate groups and stop
+                          (default: browse them, given a terminal)
+  -i, --interactive       browse them, and fail if there is no terminal
+                          (default: browse only when a terminal is there)
+      --auto [RULE]       delete without asking, keeping shortest, oldest or
+                          newest
+                          (default: delete nothing)
+  -y, --yes               do not ask before deleting
+                          (default: ask)
+      --hard              delete permanently instead of moving to the Trash
+                          (default: move to the Trash)
+      --report-json PATH  write the scan report here
+                          (default: a file in the temporary directory)
+      --stage NAME        size, to stop after grouping by length and report
+                          that; nothing there has been read, so --auto refuses
+                          it
+                          (default: full)
+  -q, --quiet             accepted for the Python tool's sake; ignored here
+                          (default: ignored either way)
+      --verify            accepted for the Python tool's sake; ignored here,
+                          which re-proves every group it deletes from anyway
+                          (default: ignored either way)
+  -h, --help              print this and stop
+exit=0
+```
+
+### The rule, enforced
+
+`cli::tests::the_help_text_and_the_parser_know_exactly_the_same_flags` scrapes
+every `-x`-shaped token out of the rendered help and asserts the set equals the
+table's, in both directions;
+`the_defaults_the_help_text_prints_are_the_defaults_the_code_has` compares each
+printed default against what a bare command line actually produces.
+
+A golden test that passes proves nothing on its own, so each way of breaking
+the rule was built and run:
+
+```
+python3 rust/evidence/scripts/menu_mutants.py
+```
+
+Captured to `evidence/m5_1-mutants.txt`:
+
+```text
+mutant help-misses-a-flag           renders every flag but the first
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags, the_help_text_says_something_about_every_flag
+
+mutant help-invents-a-flag          hand-writes a line for a flag the parser does not accept
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags
+
+mutant help-default-drifts          says a default the code does not have
+  caught by the_defaults_the_help_text_prints_are_the_defaults_the_code_has, clearing_a_field_puts_the_default_back
+
+mutant menu-writes-its-own-default  shows a default of its own instead of the table's
+  caught by clearing_a_field_puts_the_default_back, the_form_shows_the_root_every_field_and_every_default
+
+mutant menu-drops-a-field           leaves a field out of the argument list it hands back
+  caught by a_switch_toggles_and_reaches_the_options, the_command_line_prefills_the_fields_it_names
+
+mutant menu-skips-validation        accepts whatever is typed and lets the scan find out
+  caught by a_bad_profile_is_refused_the_same_way, a_field_is_refused_in_the_field_with_the_parsers_own_words, a_refusal_is_shown_beside_the_field_it_belongs_to
+
+every mutant was caught
+```
+
+### The menu
+
+It appears under exactly the browser's own condition — a terminal, no `--auto`,
+and either `-i` or no `--list` — checked by `main::browsing`, which is the same
+question `main::browse` asks after the scan. A piped or flagged run never
+reaches it.
+
+What it hands back is a command line. `main` reads that command line with
+`parse_arguments_from`, the same parser it read the real one with, so the form
+cannot say anything the flags cannot say and cannot quietly drop a flag it does
+not show — anything outside its seven fields rides through untouched. A field
+is checked by `Flag::apply` on a scratch `Options`, so it is refused in the
+field, in the parser's own words.
+
+Twelve model tests and six `TestBackend` snapshots cover it without a terminal.
+End to end, through a real pty against the real binary:
+
+```
+python3 rust/evidence/scripts/m5_1_menu_end_to_end.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5_1-end-to-end.txt`:
+
+```text
+--help exits 0 and lists the flags       ok (exit 0, 47 lines, -h identical)
+a piped run never sees the menu          ok (2 groups printed, no menu in the output)
+enter-through equals the piped run       ok (2 groups, identical to the piped run)
+enter-through with no flags at all       ok (('huge-a.bin', 'huge-b.bin'), the 10 MiB default honoured on both sides)
+typing a min-size changes the groups     ok (1 group; the 4 KiB pair was filtered out by the typed value)
+space toggles the cache switch           ok (cold 4206592 bytes, warm 12288, switch on 4206592 — the toggle reached the options)
+esc scans nothing                        ok (exit 0, no report, nothing read)
+
+every case behaves
+```
+
+The cache switch is asserted on the bytes the scan read rather than on the
+screen: ratatui repaints only the cells that changed, so a phrase drawn into a
+later frame never reaches the pty whole — the harness mistake REVIEW-M5 caught
+in its own tooling before it caught anything in the program.
+
+### Too small to read is too small to agree to
+
+REVIEW-M5's second finding was a confirmation dialog that was never drawn and
+still acted on. Nothing in the menu deletes — it runs before a scan exists —
+but starting a scan on settings nobody could see is the same mistake, so below
+54x16 the form draws a resize line and `Form::on_key` refuses everything but
+the way out. `the_paint_and_the_model_agree_on_what_is_too_small_to_read`
+renders at both sides of each boundary and asserts the drawing layer and the
+model reach the same verdict, which is what stops the two rules drifting apart.
+
+### The gate
+
+Conformance templates are non-interactive, so the menu never appears in one.
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/m5_1-gate.txt`:
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0.
+
+### Standards
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 158 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+
+$ cargo fmt --check
+(no output: clean)
+```

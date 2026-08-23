@@ -2,11 +2,11 @@ $ python3 rust/evidence/scripts/spinning_differential.py
 
 tree                  files  groups   flash seeks  spinning seeks   flash bytes  spinning bytes  verdict
 tails                     5       2            18              19        319488          389120  same
-middles                   3       1            39              11      31002624        31457280  same
+middles                   3       1            40              11      31002624        31457280  same
 last-chunk                3       1            29              14      38805504        56623104  same
-cohort-boundary          16       4            64              72      33554432        49807360  same
+cohort-boundary          16       4            63              72      33554432        49807360  same
 wide                     24       1           336             102     239075328       254607360  same
-links                     6       2            15              16       1048576         1048576  same
+links                     6       2            16              16       1048576         1048576  same
 unreadable                5       1            39              12      29884416        28311552  same
 mixed                    46      10           102              83      20717575        45826056  same
 

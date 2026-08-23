@@ -1,0 +1,13 @@
+$ python3 rust/evidence/scripts/m5_1_menu_end_to_end.py rust/target/release/dedup-rs $SCRATCH
+
+--help exits 0 and lists the flags       ok (exit 0, 47 lines, -h identical)
+a piped run never sees the menu          ok (2 groups printed, no menu in the output)
+enter-through equals the piped run       ok (2 groups, identical to the piped run)
+enter-through with no flags at all       ok (('huge-a.bin', 'huge-b.bin'), the 10 MiB default honoured on both sides)
+typing a min-size changes the groups     ok (1 group; the 4 KiB pair was filtered out by the typed value)
+space toggles the cache switch           ok (cold 4206592 bytes, warm 12288, switch on 4206592 — the toggle reached the options)
+esc scans nothing                        ok (exit 0, no report, nothing read)
+
+every case behaves
+
+exit=0

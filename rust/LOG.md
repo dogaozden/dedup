@@ -1854,3 +1854,96 @@ All six mutants are caught now (`evidence/m6-mutants.txt`).
 
 `cargo test`: 131 passed, 0 failed (111 → 131; 20 new). clippy `-D warnings`
 clean, `fmt --check` clean, `--gate all` 33/33 with no profile flag.
+
+---
+
+## 2026-08-23 — M5.1, the pre-flight menu and --help
+
+Built after M6, so `--profile` is in the flag table, in `--help`, and in the
+menu from the start rather than being added to three places later.
+
+### One table, and what makes it one
+
+`src/cli.rs` carries `FLAGS`. Three readers:
+
+- the parser, which looks a word up in the table and asks it how many more
+  words to take;
+- `help_text()`, which renders it;
+- the menu, which names seven of its entries and takes their labels, prompts,
+  help lines and defaults from them.
+
+The part that does the real work is smaller than the table: `Flag::apply` is
+the only function that turns a word into a setting. The parser calls it. The
+menu calls it on a throwaway `Options` to decide whether a field is valid. So
+"the menu rejects it with the parser's own error message" is not a thing that
+had to be arranged — there is one message because there is one function.
+
+`--help` used to exit 2 with "unknown argument", which is the bug M5_1-MENU.md
+opens with.
+
+### The menu is an argument list
+
+The rule is that the menu "only ever BUILDS the same options struct the CLI
+builds". The strongest way to keep that is not to build an options struct at
+all: `Form::to_arguments` returns a command line, and `main` reads it with
+`parse_arguments_from` — the same call, the same checks, the same errors. A
+capability the flags do not have would have to be a flag the parser accepts.
+
+It also settles what happens to the flags the form does not show. They are kept
+verbatim from the original command line and put back, so `--report-json`,
+`--hard`, `-i` and the rest survive a trip through the form untouched. There is
+a test for exactly that, because dropping one silently is the obvious way this
+design fails.
+
+### Chosen divergences
+
+- **`--stage` is documented.** It is a real flag the parser accepts, and the
+  one-table rule says every accepted flag appears in the help. Hiding it would
+  have meant an exception, and the exception is where the drift starts. Its
+  help line says what it is: groups nothing has read, which `--auto` refuses.
+- **`-q` and `--verify` are documented as ignored.** They are accepted so a
+  command line written for the Python tool still runs. Saying so is better than
+  a help text that implies they do something.
+- **The menu's list fields split on commas.** `--ext` and `--skip-ext` are
+  comma lists to the parser already. `-x` is not: a glob containing a comma
+  cannot be typed into the form. That is the form doing LESS than the flag,
+  which is the safe direction — the rule forbids gaining a capability, not
+  lacking one — and the command line still takes such a glob.
+- **The form is a two-mode screen**, browsing and editing, rather than typing
+  straight into the selected row. `q` has to mean "leave" while browsing and
+  the letter q while typing, and the browser next door is already modal.
+- **Below 54x16 nothing is accepted.** M5_1-MENU.md does not ask for this; it
+  is REVIEW-M5's second finding applied one screen earlier. A scan started on
+  settings nobody could see is the same shape of mistake as a deletion
+  confirmed on a dialog nobody could see, so the model refuses everything but
+  the way out and the paint layer draws a resize line. A test renders both
+  sides of both boundaries and asserts the two agree.
+
+### One that was worth the detour
+
+The pty case for the cache switch first asserted on the screen — that the row
+read `no-cache on` after a space. It failed while the toggle worked perfectly.
+ratatui repaints only the cells that changed, so on a later frame only the word
+`on` crosses the pty, and searching the stream for the phrase proves nothing in
+either direction. REVIEW-M5 caught the same class of thing in its own harness
+before it caught anything in the program.
+
+The case now asserts on the byte count the scan reported: warm cache 12,288
+bytes, the same run with the switch on 4,206,592. That is the toggle arriving
+at the options, not a phrase arriving at a terminal.
+
+### The golden test as a guard
+
+`evidence/scripts/menu_mutants.py` builds six ways of breaking the one-table
+rule — a help renderer that skips a flag, a hand-written help line for a flag
+that does not exist, a default in the table that the code does not have, a menu
+row that prints a default of its own, a form that drops a field on the way out,
+and a form that skips validation — and each is caught. The rule is enforced,
+not merely asserted.
+
+### Standards
+
+`cargo test`: 158 passed, 0 failed (131 → 158; 27 new, 21 of them the menu's
+and the table's). clippy `-D warnings` clean, `fmt --check` clean, `--gate all`
+33/33. M6's differential and combination checks were re-run after the parser
+was rebuilt on the table, and both still pass.
