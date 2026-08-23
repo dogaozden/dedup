@@ -12,6 +12,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::JoinHandle;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Device {
@@ -21,14 +22,55 @@ pub struct Device {
     requested: Option<usize>,
 }
 
-impl Device {
-    pub fn probe(root: &Path, requested: Option<usize>) -> Self {
-        Device {
-            solid: is_solid_state(root),
+/// A volume probe in flight.
+///
+/// Asking what kind of disk this is means running `diskutil`, and a subprocess
+/// costs more than the whole scan of a small tree does. Nothing before the
+/// reader pools are sized needs the answer, so the ask goes out on a thread as
+/// soon as the root is known and is collected where it is first wanted — by
+/// which time the walk has been running against it.
+pub struct VolumeProbe {
+    asking: Option<JoinHandle<Option<bool>>>,
+    solid: Option<bool>,
+    requested: Option<usize>,
+}
+
+impl VolumeProbe {
+    pub fn start(root: &Path, requested: Option<usize>) -> Self {
+        let volume = root.to_path_buf();
+        VolumeProbe {
+            asking: Some(std::thread::spawn(move || is_solid_state(&volume))),
+            solid: None,
             requested,
         }
     }
 
+    /// The answer, waited for the first time and free afterwards.
+    pub fn device(&mut self) -> Device {
+        if let Some(asking) = self.asking.take() {
+            // A probe thread that panicked leaves us where an unreadable
+            // volume would: not knowing, which every caller already handles.
+            self.solid = asking.join().unwrap_or(None);
+        }
+        Device {
+            solid: self.solid,
+            requested: self.requested,
+        }
+    }
+}
+
+impl Drop for VolumeProbe {
+    /// A scan that never needed the answer still waits for it here rather than
+    /// exiting over the top of a live subprocess: an orphan finishing after we
+    /// are gone is load on whatever runs next.
+    fn drop(&mut self) {
+        if let Some(asking) = self.asking.take() {
+            let _ = asking.join();
+        }
+    }
+}
+
+impl Device {
     /// True only when the disk is known to be flash. "Don't know" is a no —
     /// this is what picks the comparison chunk, and a spinning disk pays a
     /// seek every time the round moves to the next file in a group.

@@ -1205,3 +1205,98 @@ is another project's, and the stray `]` entry that appears in no mount table.
 No command of mine named a `/Volumes` path. Every tree deleted from was
 generated under this session's scratchpad with an `m5-` prefix and `HOME`
 pointed at a scratch directory.
+
+## 2026-08-23 — RBENCH optimizer round one: a noise floor of its own
+
+**Hypothesis:** none yet — RGOAL §6.2 forbids inheriting the build-day noise
+floor, and the build-day figure was taken at smoke scale on a busy machine.
+This round scores at `--scale default`, so the floor has to be measured there.
+
+**Change:** none. `python3 rbench/run.py --calibrate --scale default
+--rounds 15`, seed 1, load average 4.04 4.30 3.88.
+
+**Numbers:**
+
+| scenario | base s | cand s | ratio | dispersion |
+|---|---|---|---|---|
+| needle | 1.7997 | 1.8484 | 1.0092 | ±3.5% |
+| typical | 0.1913 | 0.1921 | 0.9959 | ±2.2% |
+| samesize | 0.0850 | 0.0864 | 0.9825 | ±4.5% |
+| widegroup | 0.1136 | 0.1155 | 1.0165 | ±10.4% |
+| photos | 0.0878 | 0.0830 | 0.9672 | ±5.7% |
+| bigheader | 0.0841 | 0.0860 | 1.0086 | ±5.3% |
+| rescan | 0.1242 | 0.1229 | 0.9575 | ±4.5% |
+
+```
+NOISE FLOOR: ±4.3%   (worst scenario: rescan at 0.9575)
+  per-round dispersion, worst scenario: widegroup at ±10.4%
+  geomean of a baseline against itself: 0.9908
+```
+
+**The floor this round is held to: ±4.3% per scenario, and a geomean that has
+to beat 0.96 before it has moved at all.** Wider than the build day's ±3.4%,
+which is what default scale on a shared box costs.
+
+The more useful half of the calibration is the absolute column, not the
+ratios. Six of the seven scenarios finish in 84–191 ms, and the same binary
+takes about 87 ms to scan an empty directory. Whatever the scan does, on most
+of this bench it is a minority of the wall clock the score is made of. The
+startup is where the seconds are.
+
+**Verdict:** KEPT as the round's reference floor.
+`evidence/r1-calibrate-seed1-default.txt`.
+
+## 2026-08-23 — the volume probe stops blocking the scan
+
+**Hypothesis:** `Device::probe` runs `diskutil info -plist` and waits for it
+before the walk starts. It is a subprocess and it costs tens of milliseconds,
+which the calibration says is a large share of five of the seven scenarios.
+Nothing before the reader pools are sized needs its answer, so the wait buys
+nothing: start the ask, walk the tree while it runs, collect it where it is
+first wanted.
+
+**Change:** `device::VolumeProbe`. `start()` spawns a thread that does the
+asking; `device()` joins it the first time it is called and is free after.
+`find_duplicates` takes the probe instead of a `Device` and settles it
+immediately after `candidates()`, the first line that needs a job count.
+`Drop` joins an uncollected probe rather than exiting over a live subprocess,
+so a scan that never wanted the answer still cannot leave an orphan running
+into whatever is timed next. Nothing about the answer changes: same
+`solid`, same pools, same comparison chunk.
+
+**Numbers:** `python3 rbench/run.py`, seed 1, `--scale default`, 9 rounds,
+load average 7.04 5.77 4.71. Noise floor measured the same day: ±4.3%.
+`--selftest` passed first — 4 of 4 sabotages caught.
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.7388 | 1.6835 | 0.9678 | ±1.3% |
+| typical | 0.1929 | 0.1563 | **0.8100** | ±1.1% |
+| samesize | 0.0866 | 0.0828 | 0.9628 | ±2.5% |
+| widegroup | 0.1079 | 0.1077 | 1.0045 | ±2.8% |
+| photos | 0.0805 | 0.0818 | 0.9974 | ±3.4% |
+| bigheader | 0.0818 | 0.0849 | 1.0000 | ±8.6% |
+| rescan | 0.1238 | 0.0793 | **0.6312** | ±1.8% |
+
+```
+SCORE: 0.8997
+```
+
+No scenario regressed past the floor, so this is not a cross-scenario trade.
+Bytes are identical to the ceiling on every scenario, as they must be — this
+change reads nothing differently.
+
+**What the shape of that table says, which is worth more than the score.**
+The win lands exactly where the walk is long enough to hide a subprocess
+behind: `typical` and `rescan`. It lands nowhere on `photos`, `bigheader` and
+`widegroup`, whose walks are trivial and whose time is in the reading — and
+the reading happens *after* `probe.device()` has been collected, because the
+reader pools have to be sized before the first stage runs. `rescan` gains most
+because it was paying two `diskutil` calls, one for the device and one for the
+cache's volume UUID, and now the two run at the same time as each other.
+
+So the probe is still on the critical path for four scenarios; it has only
+stopped being in front of the walk. The next question is what it would be
+worth to stop paying for it at all, which is a measurement and not a guess.
+
+**Verdict:** KEPT (commit below). `evidence/r1-change1-seed1-default.txt`.

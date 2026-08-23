@@ -14,7 +14,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use crate::cache::ScanCache;
 use crate::compare::{compare_stage, Compare};
 use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
-use crate::device::Device;
+use crate::device::VolumeProbe;
 use crate::effort::Effort;
 use crate::filters::Filters;
 use crate::ordered::Ordered;
@@ -132,7 +132,7 @@ fn pool_of(jobs: usize) -> ThreadPool {
 pub fn find_duplicates(
     root: &Path,
     filters: Filters,
-    device: Device,
+    probe: &mut VolumeProbe,
     effort: &Effort,
     mut cache: Option<&mut ScanCache>,
 ) -> Scan {
@@ -168,6 +168,9 @@ pub fn find_duplicates(
         cache.open_for(root, &records);
     }
 
+    // The volume probe has been running since the root was known; this is the
+    // first thing that needs its answer.
+    let device = probe.device();
     let random_jobs = device.random_jobs();
     let sequential_jobs = device.sequential_jobs();
     let random_pool = pool_of(random_jobs);

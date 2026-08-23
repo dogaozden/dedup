@@ -1,0 +1,41 @@
+rbench: building baseline c238b30 ... 23.3s
+rbench: volume /Volumes/dedupbench (reused), scale default, seed 1, rounds 15
+rbench: baseline c238b30d9e55   candidate baseline (calibration)
+rbench: load average 4.04 4.30 3.88
+  built needle      100000 files   243.8 MB  in 6.2s
+  ceiling needle    oracle read  243.8 MB in 100000 opens  (3.4s)
+rbench: needle ... 1.0092  (±3.5%)
+  built typical      16000 files   264.0 MB  in 1.7s
+  ceiling typical   oracle read   52.5 MB in 10634 opens  (0.5s)
+rbench: typical ... 0.9959  (±2.2%)
+  built samesize      1402 files   414.0 MB  in 1.0s
+  ceiling samesize  oracle read   32.8 MB in 1582 opens  (0.2s)
+rbench: samesize ... 0.9825  (±4.5%)
+  built widegroup      520 files   126.4 MB  in 0.1s
+  ceiling widegroup oracle read  126.3 MB in 1542 opens  (0.2s)
+rbench: widegroup ... 1.0165  (±10.4%)
+  built photos         100 files   393.6 MB  in 1.2s
+  ceiling photos    oracle read  147.9 MB in 125 opens  (0.6s)
+rbench: photos ... 0.9672  (±5.7%)
+  built bigheader        8 files   450.0 MB  in 1.0s
+  ceiling bigheader oracle read  146.2 MB in  20 opens  (0.2s)
+rbench: bigheader ... 1.0086  (±5.3%)
+rbench: rescan ... 0.9575  (±4.5%)
+
+scenario   base s  cand s   ratio  spread     bytes   ceiling     floor
+───────────────────────────────────────────────────────────────────────
+needle     1.7997  1.8484  1.0092   ±3.5%  243.8 MB  243.8 MB  260.9 KB
+typical    0.1913  0.1921  0.9959   ±2.2%   52.5 MB   52.5 MB   23.0 MB
+samesize   0.0850  0.0864  0.9825   ±4.5%   32.8 MB   32.8 MB   22.5 MB
+widegroup  0.1136  0.1155  1.0165  ±10.4%  126.3 MB  126.3 MB  126.3 MB
+photos     0.0878  0.0830  0.9672   ±5.7%  147.9 MB  147.9 MB  147.8 MB
+bigheader  0.0841  0.0860  1.0086   ±5.3%  146.2 MB  146.2 MB  112.0 MB
+rescan     0.1242  0.1229  0.9575   ±4.5%       0 B   32.8 MB   32.8 MB
+
+(/Users/dogaozden/AI_Projects/dedup-opus-r1/rbench/state/results.json)
+
+NOISE FLOOR: ±4.3%   (worst scenario: rescan at 0.9575)
+  per-round dispersion, worst scenario: widegroup at ±10.4%
+  geomean of a baseline against itself: 0.9908
+
+A score that differs from 1.0000 by less than the noise floor has not moved.

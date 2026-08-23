@@ -691,7 +691,7 @@ mod selection {
                     skip_ext: &[],
                     excludes: &[],
                 },
-                crate::device::Device::probe(&self.root, Some(1)),
+                &mut crate::device::VolumeProbe::start(&self.root, Some(1)),
                 effort,
                 None,
             )
