@@ -332,13 +332,15 @@ new idea you check whether the log already killed it.
 
 ```
 run                                        load   score
-self,     r2, seed 1                       5.41  0.6717
-self,     r2, seed 2                       7.96  0.6829
-referee,  r2, seed 1  (clean main)         5.34  0.6833
-self,     scale default, seed 1            4.63  0.6722
+self,     r2, seed 1                       3.53  0.6537
+self,     r2, seed 2                       4.24  0.6592
+self,     scale default, seed 1            4.21  0.6747
+referee,  r2, seed 1  (clean main)         4.49  0.6669
 ```
 
-Self and referee agree to 1.7%, inside the floor. Noise floor measured twice
+All four on `db6b8c7`, all gates green. Self and referee agree to 2.0%,
+inside the floor. The state before the pivot compare (`3019856`) scored
+0.6717 / 0.6829 / 0.6722 by the same four runs and **0.6833** refereed. Noise floor measured twice
 that day on the same machine: **±7.4%** in the afternoon (geomean against
 itself 1.0044) and **±3.7%** in the evening (0.9931). Every gate green in
 every run; `--selftest` 5 of 5 each time.
@@ -347,14 +349,14 @@ Referee's per-scenario table, which is the one to read:
 
 ```
 scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
-needle       0.7354  0.6030  0.8051   ±3.9%  122.1 MB  122.1 MB  133.3 KB
-typical      0.1713  0.1036  0.6034   ±3.5%   70.6 MB   70.6 MB   33.0 MB
-samesize     0.0269  0.0233  0.8685  ±10.4%   32.8 MB   32.8 MB   22.5 MB
-widegroup    0.1879  0.1523  0.8150  ±11.9%  451.3 MB  451.3 MB  451.3 MB
-photos       0.0234  0.0167  0.7123   ±2.6%  147.9 MB  147.9 MB  147.8 MB
-bigheader    0.0233  0.0175  0.7439   ±1.1%  138.2 MB  146.2 MB  112.0 MB
-rescan       0.0290  0.0116  0.3817   ±1.5%       0 B    5.2 MB    5.2 MB
-prefixtrap*  0.0069  0.0068  1.0036   ±3.2%   16.2 MB   16.2 MB   16.0 MB
+needle       0.6911  0.5174  0.7486   ±3.7%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1710  0.1018  0.5952   ±1.1%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0262  0.0234  0.9100   ±5.2%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1719  0.1252  0.7353   ±6.5%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0227  0.0178  0.7384   ±3.6%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0228  0.0163  0.7172   ±2.8%  138.2 MB  146.2 MB  112.0 MB
+rescan       0.0268  0.0100  0.3715   ±0.7%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0067  0.0067  1.0083   ±2.8%   16.2 MB   16.2 MB   16.0 MB
 ```
 
 ### Kept, in the order they landed
@@ -393,28 +395,38 @@ Two of those want the maintainer's eye before anything is taken:
 - **A parallel sort in `candidates()`** — 1.5%, under the floor.
 - **`strip = true`** — the binary loses 276 KB and startup does not move.
 
-### Where the wall is, and it is not where the honeypot says
+### Where the wall is, measured scenario by scenario
 
-`typical` now runs **0.1036 s for 13,372 opens — 7.9 µs each**, which is
-exactly the per-file open cost measured in C over the same tree, at the
-thread count where that cost bottoms out (0.4429 s serial, 0.1526 s at four
-readers, flat to worse out to ten). **`typical` is on the syscall floor.**
-And on `needle` the tool completes the whole scan in **0.5520–0.6030 s**
-against **0.5718 s** for a bare C loop that only opens and reads the same
-50,000 files — so `needle` is on it too. Startup is
-3.4 ms — 1.4 ms of it bare `fork`/`exec`, 1.7 ms dyld on a 3.1 MB binary —
-and is now 20–50% of five of the seven scenarios.
+Every figure here is from a C program doing only `open`/`read`/`close` with a
+batched handout, at the thread count where that cost bottoms out — **not** the
+earlier mutex-per-file probes, which were 2.5x too pessimistic and which I had
+to throw away mid-round.
 
-**The 0.20 target is below what a byte-exact scan can reach on this machine,
-and `floor.py` is why.** Its opens term counts the members of the planted
-duplicate groups: 45 on `needle`. A scan that does not already know the answer
-must open every file sharing a size with another — 50,000 on `needle` — because
-§9 forbids ruling a file out on anything but its bytes. Re-running `floor.py`'s
-own arithmetic with the honest count puts the bulk-walk honeypot at **0.4001**
-with its own serial per-open figure, **0.3416** at the fastest per-open this
-machine was measured to do, and **0.2533** at a hypothetical 4.0 µs nobody has
-observed. Full working in the entry below. The fix is one line: count the files
-in non-singleton size classes, which the generators already know.
+```
+  scenario    tool      measured floor of the syscalls alone
+  needle    0.5174 s    0.3960 s  (78% of the scan; grouping is the rest)
+  typical   0.1018 s    ~0.099 s  (13,372 opens at 7.61 us; probe says 7.80)
+  widegroup 0.1252 s    ~0.066 s  (~30% of it serial by COMPARE_BUDGET)
+  photos    0.0178 s    ~0.011 s  (147.9 MB at 21 GB/s, plus 3.4 ms startup)
+  bigheader 0.0163 s    ~0.013 s  (five 32 MB rounds at 17 GB/s, plus startup)
+  rescan    0.0100 s    ~0.007 s  (walk over 11,200 files, plus startup)
+```
+
+`needle` decomposes as 396 ms of syscalls, 22.8 ms of walk and startup,
+46.7 ms of the tiny tier's grouping — measured by removing it — and about
+39 ms of everything else. **The grouping is the algorithm**, so most of that
+is not available. `typical` is on its floor outright. Startup is 3.4 ms
+(1.4 ms `fork`/`exec`, 1.7 ms dyld on a 3.1 MB binary) and is now 20-50% of
+five of the seven scenarios; `strip` does not move it.
+
+**The 0.20 target is below what a byte-exact scan can do on this machine.**
+`floor.py:294` counts opens as the members of the planted duplicate groups —
+45 on `needle` — where §9 forces every file sharing a size with another to be
+opened, which is 50,000. Its own arithmetic with the honest count gives
+**0.4001** at its own serial per-open figure and **0.3416** at the fastest
+per-open measured here. And independently of that model: `needle`'s 396 ms of
+irreducible syscalls against a 0.691 s baseline is 0.57 on that scenario
+before the tool does anything at all.
 
 ### Where I would look next
 
