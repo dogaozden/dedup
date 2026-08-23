@@ -1,0 +1,12 @@
+--- the cluster is the victim: all three of its names must go together ---
+before: k.bin sub/xa.bin sub/xb.bin sub/xc.bin 
+after : k.bin 
+trash : xa.bin xb.bin xc.bin 
+
+--- a record pinned by a name outside the tree is never a victim ---
+before: aa.bin pinned.bin 
+
+  Nothing to remove.
+
+after : aa.bin pinned.bin 
+trash : []

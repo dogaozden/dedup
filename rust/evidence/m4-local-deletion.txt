@@ -1,0 +1,6 @@
+  deletion/oracle          pass (12 removed, 12 trashed, exit 0)
+  deletion/candidate       pass (12 removed, 12 trashed, exit 0)
+  links/oracle             pass (2 removed, 2 trashed, exit 0)
+  links/candidate          pass (2 removed, 2 trashed, exit 0)
+
+4 check(s), 0 failed

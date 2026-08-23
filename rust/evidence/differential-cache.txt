@@ -1,0 +1,7 @@
+tree               cold  warm o->o  warm o->r  warm r->r   verdict
+boundaries      1318917     954367     954367     954367   identical, and interoperable
+sameends         884736          0          0          0   identical, and interoperable
+nested            22096      22096      22096      22096   identical, and interoperable
+links2            84096      84096      84096      84096   identical, and interoperable
+
+4 tree(s), 0 differing

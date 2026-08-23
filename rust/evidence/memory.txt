@@ -1,0 +1,7 @@
+minimum of three runs each, marginal cost over 50,000 extra files
+
+names              50,000 files  100,000 files     B/file
+16 characters          19906560       27672576      155.3
+44 characters          21463040       30425088      179.2
+
+REWRITE.md §6 budget: 230 bytes per file record

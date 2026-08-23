@@ -1,0 +1,8 @@
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+3 check(s), 0 failed
+gate m4: green

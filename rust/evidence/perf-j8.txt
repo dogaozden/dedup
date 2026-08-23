@@ -1,0 +1,9 @@
+warming the page cache (untimed)
+  run 1  oracle   5.069s   dedup-rs   1.686s   3.01x
+  run 2  oracle   5.045s   dedup-rs   1.571s   3.21x
+  run 3  oracle   4.946s   dedup-rs   2.037s   2.43x
+  run 4  oracle   5.886s   dedup-rs   1.944s   3.03x
+  run 5  oracle   5.169s   dedup-rs   1.626s   3.18x
+  run 6  oracle   4.678s   dedup-rs   1.733s   2.70x
+
+-j 8  median over 6 runs: oracle 5.057s, dedup-rs 1.710s -> 2.96x
