@@ -66,6 +66,12 @@ extern "C" {
         options: u32,
     ) -> CfTypeRef;
     fn IOObjectRelease(object: IoObject) -> c_int;
+    fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> u8;
+    fn IORegistryEntryGetParentEntry(
+        entry: IoObject,
+        plane: *const c_char,
+        parent: *mut IoObject,
+    ) -> c_int;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -81,6 +87,63 @@ extern "C" {
     fn CFDictionaryGetValue(dictionary: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
     fn CFStringGetCString(value: CfTypeRef, buffer: *mut c_char, size: isize, encoding: u32) -> u8;
     fn CFRelease(value: CfTypeRef);
+}
+
+/// Whether the volume `path` sits on is backed by a disk image rather than by
+/// a physical device — a RAM disk, a `.dmg`, a sparsebundle, a VM volume.
+///
+/// This is a different question from `solid_state`, and it is asked because
+/// the thing the tool actually wants to know is whether the volume charges
+/// for a seek. `solid_state` answers `None` for every disk image, since the
+/// registry carries no `Medium Type` for one — the same answer it gives for a
+/// USB enclosure that simply does not report, which is a device that may very
+/// well spin. Treating those two alike costs a disk image the parallel
+/// reader, and treating them alike in the other direction would cost a real
+/// spinning disk a seek storm. The registry separates them: a disk image is
+/// provided by `IODiskImageBlockStorageDeviceOutKernel`, and nothing with
+/// heads is.
+///
+/// `false` for anything the registry will not describe, which leaves the
+/// caller exactly where it was.
+pub fn disk_image(path: &Path) -> bool {
+    let Some(device) = backing_device(path) else {
+        return false;
+    };
+    let plane = CString::new("IOService").expect("no interior NUL");
+    let class = CString::new("IODiskImageBlockStorageDeviceOutKernel").expect("no interior NUL");
+
+    // SAFETY: `IOServiceGetMatchingService` consumes the matching dictionary,
+    // so it is not released here. Every entry this loop holds is released
+    // exactly once: `entry` is replaced only after the old value is released,
+    // and whatever it holds on the way out is released after the loop. A zero
+    // `io_object_t` is not an object and is not released.
+    unsafe {
+        let matching = IOBSDNameMatching(K_IO_MAIN_PORT_DEFAULT, 0, device.as_ptr());
+        if matching.is_null() {
+            return false;
+        }
+        let mut entry = IOServiceGetMatchingService(K_IO_MAIN_PORT_DEFAULT, matching);
+        if entry == 0 {
+            return false;
+        }
+        // The stack over a disk image is three or four deep; the bound is
+        // there so a registry that somehow loops cannot hang a scan.
+        let mut virtual_media = false;
+        for _ in 0..16 {
+            if IOObjectConformsTo(entry, class.as_ptr()) != 0 {
+                virtual_media = true;
+                break;
+            }
+            let mut parent: IoObject = 0;
+            if IORegistryEntryGetParentEntry(entry, plane.as_ptr(), &mut parent) != 0 {
+                break;
+            }
+            IOObjectRelease(entry);
+            entry = parent;
+        }
+        IOObjectRelease(entry);
+        virtual_media
+    }
 }
 
 /// Whether the volume `path` sits on is flash, as the IO registry has it.
@@ -793,3 +856,31 @@ impl BulkDir {
     }
 }
 
+#[cfg(test)]
+mod virtual_media {
+    use super::*;
+
+    /// The boot volume is a real device, and nothing about it is an image.
+    #[test]
+    fn a_physical_volume_is_not_a_disk_image() {
+        assert!(!disk_image(Path::new("/")));
+    }
+
+    /// The bench volume is a RAM disk, which is a disk image with memory
+    /// behind it. Skipped where it is not mounted, because this is the only
+    /// virtual volume this machine is guaranteed to have when it is.
+    #[test]
+    fn a_ram_disk_is_a_disk_image() {
+        let bench = Path::new("/Volumes/dedupbench");
+        if !bench.exists() {
+            return;
+        }
+        assert!(disk_image(bench), "the bench RAM disk reads as physical");
+    }
+
+    /// Asking about a path that is not there says no, rather than guessing.
+    #[test]
+    fn a_path_that_is_not_there_is_not_a_disk_image() {
+        assert!(!disk_image(Path::new("/no/such/place")));
+    }
+}

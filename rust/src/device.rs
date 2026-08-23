@@ -207,7 +207,16 @@ fn is_solid_state(path: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    crate::sys::solid_state(path)
+    if let Some(solid) = crate::sys::solid_state(path) {
+        return Some(solid);
+    }
+    // The registry will not call a disk image flash, because it is not flash.
+    // But every caller of this is asking one question — does this volume
+    // charge for a seek — and a disk image does not: it has no heads, and
+    // what it sits on is somebody else's problem. Answering `None` here lumps
+    // it in with the USB enclosure that did not report, which is a device that
+    // may genuinely spin, and costs it the parallel reader for nothing.
+    crate::sys::disk_image(path).then_some(true)
 }
 
 /// A stable filename for the cache belonging to the volume `path` is on.
