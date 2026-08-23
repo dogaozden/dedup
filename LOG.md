@@ -124,3 +124,23 @@ gate m1: green
 The command exited 0. `cargo fmt --check` exited 0. `cargo test --quiet`
 reported `8 passed; 0 failed`. `cargo clippy --all-targets -- -D warnings`
 exited 0.
+
+## 2026-08-22 — M2 handoff
+
+### Hypothesis
+
+M2 could be implemented directly from the oracle’s five-stage pipeline while
+preserving M1 walk parity and real open/read accounting.
+
+### What happened
+
+Implemented partial M2 scaffolding: candidate grouping, a small-file byte
+comparison stage, staged digest helpers for larger files, JSON/list output, and
+open/read counter paths. The large-file bucket flow was left incomplete and the
+official M2 gate still failed all 13 cases with wrong groups. No M2 claim was
+made.
+
+The work was committed as-is at user direction in commit
+`e1de6a286e2e88a3a1b0676b6114e82a68e9d196`. Implementation details, untested
+areas, gate status, constants, and traps are recorded in `HANDOFF.md`. This
+session stopped without further implementation or validation.
