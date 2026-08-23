@@ -1,0 +1,11 @@
+# The pinned baseline for RBENCH. SCORE 1.0000 is this commit, exactly.
+#
+# The harness builds this commit's rust/ at --release from a clean git
+# extraction and times it against the candidate, interleaved, every round.
+# The same commit's dedup.py is the frozen oracle whose instrumented byte
+# count is the ceiling every candidate is held under.
+#
+# This pin moves only deliberately, between optimizer rounds, by the
+# maintainer — and when it moves, every score recorded against the old pin
+# stops being comparable. Note the move in RGOAL.md's journal when you make it.
+c238b30
