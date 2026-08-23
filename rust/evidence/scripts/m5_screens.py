@@ -84,7 +84,8 @@ class Screen:
 
 
 def main():
-    binary, scratch = sys.argv[1], sys.argv[2]
+    # Resolved, because the browser is spawned with its cwd inside the tree.
+    binary, scratch = os.path.abspath(sys.argv[1]), sys.argv[2]
     base = os.path.join(scratch, "m5-screens")
     shutil.rmtree(base, ignore_errors=True)
     root, home = os.path.join(base, "tree"), os.path.join(base, "home")
