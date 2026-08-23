@@ -1,5 +1,12 @@
 # REVIEW-M2.md — maintainer review of the M2 claim
 
+> **CURRENT VERDICT: APPROVED** — 2026-08-22 re-review at `9df8017`, appended at
+> the end of this file. All three binding items below are fixed and verified.
+> Everything from here to the re-review is the original CHANGES review, kept
+> intact as the audit trail.
+
+## Original review (verdict superseded)
+
 **Verdict: CHANGES**
 
 Claim commit `ce97445eadd49bac5fd56a3a794831d3b4458c58` (pipeline in `56b13e8`),
@@ -434,3 +441,224 @@ Verified against `dedup.py` at `b6dd81f` or by differential run, not assumed.
 - **Crate list.** `rayon`, `rusqlite`, `serde`, `serde_json` are all on §7's
   allowlist; `sha2` is the one addition and is justified in LOG.md as §7
   requires. `clap` and `libc` are permitted but unused, which needs nothing.
+
+---
+---
+
+# Re-review — 2026-08-22, at `9df8017`
+
+**Verdict: APPROVED**
+
+Re-reviewed at `9df8017495cf0430e937626a96aecff42a83e342` (fixes in `9c3c5a8`),
+against REWRITE.md and `dedup.py` at oracle `b6dd81f`. Working tree clean.
+
+All three binding items are fixed. I re-ran each of them against the exact
+verification recipe written above — not against the builder's evidence — and
+each passes with room to spare. The non-binding notes were all taken as well.
+The fixes were not narrow patches: the memory item and the glob item were both
+addressed at the cause rather than at the symptom, and the memory fix removed a
+whole per-file data structure rather than trimming it.
+
+## Item 1 — memory: **fixed**
+
+Recipe: *re-run the two-corpus slope at 50k/100k, require ≤230 B/file or an
+explicit LOG.md definition, and check the "constants in the file count"
+sentence.*
+
+Same construction as the original measurement — 250 directories, ten distinct
+1 KiB contents so retained bytes stay constant, minimum of three runs per point:
+
+```
+names            50,000 files   100,000 files      B/file
+13 characters        16056320        23642112       151.7    PASS (budget 230)
+45 characters        17104896        26656768       191.0    PASS (budget 230)
+```
+
+Was 264 and 350 respectively. Both now inside §6's budget, and the improvement
+is structural: `walk` builds `FileRec`s directly and `candidates`
+(`walk.rs:210-...`) compacts them in place behind a trailing write index, so the
+two O(files) vectors no longer coexist at peak. The `Entry` type is gone
+entirely. Two further per-file costs went with it — the report now borrows
+`&str` from the records instead of cloning every path into a `Vec<Vec<String>>`
+and then into a second buffer, and `head`/`tail` became one
+`Option<Box<Retained>>` (8 bytes) instead of two always-present `Vec<u8>`s
+(48 bytes).
+
+My independent numbers are close to the claimed 155.3 and 179.2; the 191.0 for
+long names is a little above the claim, which I attribute to my names being 45
+characters against the claim's 44 and to allocator variance. Both are well
+inside the budget either way.
+
+The "constants in the file count" sentence is corrected, at LOG.md:879-881,
+which names the error and says plainly that the entry list was O(files) and was
+the single largest reason the figure was 280. It is corrected in a later dated
+entry rather than by editing the original, which is the right way to fix a work
+log — REWRITE.md §5 asks for a journal entry per session, and silently rewriting
+an earlier one would destroy the audit trail. Accepted as written.
+
+**Verifying the fix did not break anything** was the real work here, since
+in-place compaction with a rewinding write index is exactly the kind of change
+that corrupts data in cases no ordinary tree exercises. I built four trees
+shaped to attack it — 40 alternating discarded/kept size runs; hardlink clusters
+immediately before and after single-record sizes, including clusters alone at
+their own size; clusters as the first and last surviving run; and ten distinct
+clusters plus five singles all sharing one size — and compared the whole
+protocol report against the oracle at `-j1` and `-j8`:
+
+```
+[SAME] alternating discard/keep runs -j1     [SAME] alternating discard/keep runs -j8
+[SAME] clusters beside discarded runs -j1    [SAME] clusters beside discarded runs -j8
+[SAME] cluster first and last -j1            [SAME] cluster first and last -j8
+[SAME] many clusters at one size -j1         [SAME] many clusters at one size -j8
+ALL SAME
+```
+
+Reading the loop, the invariants hold: `write <= read` always, positions above
+`read` are never swapped, and the husks between the two indices are never
+revisited because `read` jumps to `last`. The tests agree with the reading.
+
+## Item 2 — glob backtracking: **fixed**
+
+Recipe: *re-run the three commands, require each under a second, plus a unit
+test with a pathological pattern.*
+
+```
+dedup-rs  -x '*a*a*a*a*a*a*a*a*a*a*a*b'    0.126s total   (was 121.83s)
+oracle    -x '*a*a*a*a*a*a*a*a*a*a*a*b'    0.262s total   (control)
+dedup-rs  -x '*a*a*a*a*a*a*a*a*a*a*b'      0.116s total   (was  35.77s)
+```
+
+All three well under a second, and the port is now faster than the oracle on the
+pattern that used to take it two minutes. I added a harder case of my own — 60
+`*a` pairs against a 200-character name, five times the tokens and five times
+the text — and it finishes in **0.127s**, flat rather than exponential, which is
+what an O(tokens × characters) fill should look like.
+
+`glob_match` is now a bottom-up fill over (token index, character index)
+(`filters.rs:226-...`). I checked the recurrence rather than trusting the shape:
+`Any` is "skip the token or consume one character", `One` and the set case both
+require a character and advance both indices, the base cell is both-exhausted,
+and the descending iteration order means every cell it reads is already
+computed. The unit test `a_pathological_pattern_still_finishes_promptly` carries
+my three patterns with a one-second assertion, and a second new test covers the
+`*`-at-the-ends edge cases a rewrite like this can easily get wrong. The
+misleading comment is gone, replaced by one that describes what the code
+actually does.
+
+Correctness of the rewrite is confirmed by the differential battery below —
+the character-class, negated-class, range, `?` and directory-component cases all
+still match the oracle exactly.
+
+## Item 3 — unrunnable gate commands: **fixed**
+
+Recipe: *copy each quoted gate command out of MILESTONES.md and run it
+unmodified.*
+
+`{flags}` is restored — six occurrences in MILESTONES.md, two in LOG.md, and no
+residue of the pasted block anywhere in MILESTONES.md. I extracted all five
+quoted `run.py` invocations programmatically, so what I ran is what the document
+says rather than what I might have retyped, and ran each verbatim:
+
+```
+[2] --gate m2    13 check(s), 0 failed    gate m2: green     EXIT=0
+[3] --gate m3     4 check(s), 0 failed    gate m3: green     EXIT=0
+[4] --gate m4     3 check(s), 0 failed    gate m4: green     EXIT=0
+[5] --gate all   33 check(s), 0 failed    gate all: green    EXIT=0
+```
+
+Command `[1]`, the M1 claim's, fails 9 of 13 as expected — it is the prescribed
+template without `{stage}`, and the M1 claim was made at `06a5f640`, before any
+content stage existed, so the transcript beneath it was true when captured. See
+the non-binding note below.
+
+## Non-binding notes — all taken
+
+- `sample_points` now `debug_assert!`s that `size > SAMPLE_SPAN`, pinning the
+  precondition that keeps its subtraction in range (`stages.rs:57-60`).
+- The `sha2` dependency list is corrected from three crates to the actual eight,
+  and LOG.md:348-349 says plainly that the earlier list was short.
+- The `getattrlistbulk` deferral now names a milestone — "**Intended milestone:
+  M5**, alongside the TUI, or in a dedicated performance pass if M5 is never
+  commissioned" (LOG.md:687) — which clears REVIEW-M1 item 6 completely.
+- `main.rs` prints the keep rule through `Display`; covered under REVIEW-M4.md.
+
+## Independent re-verification
+
+Clean rebuild (`rm -rf target`), exit 0. Standards at `9df8017`:
+
+| check | command | result |
+|---|---|---|
+| tests | `cargo test` | `45 passed; 0 failed` (was 39) |
+| clippy | `cargo clippy --all-targets -- -D warnings` | exit 0 |
+| rustfmt | `cargo fmt --check` | exit 0 |
+
+Differential battery re-run unchanged from the original review — 32 comparisons
+across boundary sizes, sampled files, unicode names, hardlinks, unreadable trees
+and 1,200 tiny files, at `-j1`/`-j4`/`-j8`. **30 of 32 identical on every
+protocol field**, with the same two exit-code differences that are the
+`oracle_driver.py` exception-wrapper artifact already ruled benign above.
+No regression from the walk rewrite.
+
+Performance, same corpus shape as the original review (60,000 files,
+512 B – 4 KiB, 300 directories, half the content shared):
+
+```
+--- -j 8 ---
+pass 1: oracle 10.15s (rss 140 MiB) | dedup-rs 3.68s (rss 94 MiB) | 2.76x
+pass 2: oracle  9.04s (rss 140 MiB) | dedup-rs 3.36s (rss 96 MiB) | 2.69x
+pass 3: oracle  8.64s (rss 140 MiB) | dedup-rs 3.18s (rss 94 MiB) | 2.72x
+--- -j 1 ---
+pass 1: oracle 18.12s (rss 140 MiB) | dedup-rs 14.15s (rss 91 MiB) | 1.28x
+pass 2: oracle 20.80s (rss 139 MiB) | dedup-rs 13.87s (rss 91 MiB) | 1.50x
+pass 3: oracle 17.17s (rss 139 MiB) | dedup-rs 13.28s (rss 92 MiB) | 1.29x
+```
+
+Both §6 targets met on every pass, and both figures are better than the original
+review measured (2.34x and 1.18x medians). Peak RSS is now 91–96 MiB against the
+oracle's 139–140 on the same tree. Effort parity holds: `files_seen` 60,000,
+`bytes_seen` 137,416,182, `bytes_read` 137,402,414, `opens` 59,993 and all 40
+groups identical on both sides.
+
+Fence: the oracle clone has an **empty `git status` at `b6dd81f`**, and
+`git diff HEAD -- dedup.py conformance/ REWRITE.md` is empty — the referee is
+byte-identical to the maintainers' own. `ls /Volumes` immediately before the m4
+and `all` runs showed only `dedupbench` and the `]` symlink; both were unchanged
+afterwards.
+
+## Residual findings — neither blocking, neither the port's fault
+
+**1. The harness's own effort counters can lose updates under `-j8`.** While
+establishing effort parity I saw one oracle run report `opens=59988` where 20
+other runs of the same binary on the same tree reported `59993`, with
+`bytes_read`, `files_seen` and `groups` identical in all 21. The mechanism is
+visible in the source: `counting_open` does `opens[0] += 1`
+(`oracle_driver.py:82`) and `_Counted.read` does `self._tally[0] += len(block)`
+(`oracle_driver.py:42`), both non-atomic read-modify-writes, and both are called
+from the oracle's `ThreadPoolExecutor` workers. Python's GIL does not make `+=`
+on a list element atomic across bytecodes, so a lost update is possible whenever
+the interpreter switches threads mid-operation. All three `-j1` runs were exact.
+
+This is a harness observation, not a port defect, and I record it because it
+biases *against* candidates: `check_effort` fails on `opens > oracle["opens"]`
+(`run.py:260-262`), so an oracle undercount can fail a candidate that is
+byte-exact. Rate observed was 1 in 21 at `-j8`. Worth passing to the harness
+maintainers; nothing for this repo to do.
+
+**2. A dangling cross-reference in MILESTONES.md.** The `--gate all` section
+says the `{stage}` token is there "for the reason set out under the M2 claim",
+but the rewrite dropped the note that used to be under the M2 claim ("One thing
+the reviewer should know before reading the M1 line above"). So the M1 claim now
+sits above a command that fails today with the explanation only in LOG.md and in
+a forward reference that points at nothing. The substance is intact and honest —
+the M1 transcript was true at the M1 commit, and LOG.md:321-343 explains the
+whole situation — but a reader working top-down will hit the failing command
+before the explanation. Restoring a sentence under the M1 or M2 claim would fix
+it. Not binding.
+
+## Ruling
+
+The three binding items are fixed at the cause, the fixes are covered by tests
+that would catch a regression, and nothing regressed: 33 of 33 conformance
+checks green, 30 of 32 differential comparisons byte-identical with the two
+exceptions already understood, 8 of 8 of my compaction stress cases identical,
+and both §6 targets met by a wider margin than before. **M2 is APPROVED.**

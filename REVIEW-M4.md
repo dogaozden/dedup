@@ -1,5 +1,13 @@
 # REVIEW-M4.md — maintainer review of the M4 claim
 
+> **CURRENT VERDICT: APPROVED** — 2026-08-22 re-review at `9df8017`, appended at
+> the end of this file. All four binding items below are fixed and verified,
+> including the `--stage size --auto` data-loss path, which is now closed by the
+> type system rather than by a mode check. Everything from here to the
+> re-review is the original CHANGES review, kept intact as the audit trail.
+
+## Original review (verdict superseded)
+
 **Verdict: CHANGES**
 
 Claim commit `5bb7cf3c1d088c0b61c8cf98a21004bba3f90cc0` (deletion in `9612376`),
@@ -333,3 +341,216 @@ meets the *other* flags on a tool whose job is deleting files. The harness's own
 driver had already answered that question, four words of it, on the line right
 after the one that was copied. When you add a mode that changes what a group
 means, the deletion path is the first place to go looking, not the last.
+
+---
+---
+
+# Re-review — 2026-08-22, at `9df8017`
+
+**Verdict: APPROVED**
+
+Re-reviewed at `9df8017495cf0430e937626a96aecff42a83e342` (fixes in `9c3c5a8`),
+against REWRITE.md and `dedup.py` at oracle `b6dd81f`. Working tree clean.
+
+All four binding items are fixed. The one that mattered — permanent deletion of
+files that are not duplicates — was not patched where I suggested the minimum
+fix; it was closed the stronger way I asked for, so the deletion path no longer
+type-checks with unproven groups. I re-ran every verification recipe written
+above, and I wrote fresh adversarial cases for the parts of the fix that a
+recipe could not anticipate.
+
+**The restriction in the original review is lifted: this binary may now run
+outside scratch trees.**
+
+## Item 1 — `--stage size --auto` deletes non-duplicates: **fixed, structurally**
+
+Recipe: *re-run the three-file reproduction and require all three to survive;
+run the same with `--auto` and no `--stage` and require normal behaviour; read
+the guard and confirm it is not a second string comparison that the next
+`--stage` value would slip past.*
+
+The original reproduction, plus a genuine duplicate pair added to the same tree
+so I could check the fix did not simply disable deletion:
+
+```
+before:  alpha.bin       d8a73157ce10cd94a91c2079fc9a92c8
+         bravo.bin       232555f36a0bb24f621267ffeed5c06e
+         charlie.bin     80fda7545b1fc3f70af956e7cbdf33bf
+         dup-one.bin     d7e3bcfee5ebf7e16f43d4a31b5d11f6
+         dup-twoooo.bin  d7e3bcfee5ebf7e16f43d4a31b5d11f6
+
+$ dedup-rs <tree> --min-size 1 --stage size --auto -y --hard
+dedup-rs: --auto cannot act on a --stage size scan. Size buckets are files that
+merely share a length; nothing has read their contents, so removing one would
+not be removing a duplicate. Re-run without --stage.
+EXIT=2
+after:   all five files present
+
+$ dedup-rs <tree> --min-size 1 --no-cache --auto -y --hard
+  Keeping the shortest copy in each of 1 groups.
+  Delete permanently: 1 files · 16 bytes reclaimed
+      dup-twoooo.bin
+EXIT=0
+after:   alpha.bin bravo.bin charlie.bin dup-one.bin
+```
+
+Nothing is destroyed on the size-only path, the refusal explains itself, and
+ordinary deletion still removes exactly the one genuine duplicate and keeps the
+shortest-named copy. Both halves of the recipe pass.
+
+**The guard is the type, not a mode check.** I read it rather than taking the
+claim:
+
+- `Scan::groups` and `Scan::proven` are private (`pipeline.rs:32-40`), so a
+  `Scan` literal can only be written inside `pipeline`. I grepped: the only two
+  construction sites are `size_stage` (`proven: false`) and `find_duplicates`
+  (`proven: true`).
+- `ProvenGroups<'a>(&'a [DupGroup])` (`pipeline.rs:53`) has an unexported tuple
+  field, so it can only be built inside `pipeline`. Its only construction site
+  is `Scan::proven`, `self.proven.then_some(ProvenGroups(&self.groups))`
+  (`pipeline.rs:70`).
+- `run_auto` takes `ProvenGroups` (`trash.rs:238-242`) and has exactly one
+  caller, inside the `Some(proven)` arm at `main.rs:202-215`. `plan_auto` is no
+  longer `pub`.
+
+So a hypothetical future `--stage whatever` cannot slip past: any value other
+than `"size"` routes to `find_duplicates`, which does real content work and
+earns `proven: true` honestly. The guard keys on whether bytes were compared,
+not on how the mode was spelled. That is what I asked for and it is better than
+the minimal fix.
+
+## Item 2 — `--auto newest` on a tie: **fixed**
+
+## Item 3 — keep rules compared a finer clock than the oracle: **fixed**
+
+Recipe for both: *re-run the tie cases and require the same survivor as the
+oracle for all three rules; for item 3, require parity or a LOG.md entry.*
+
+I re-ran my own battery, extended from 15 combinations to 21 with two new
+shapes chosen because the fix changed the comparison quantity — a gap just under
+float64's resolution at current epoch values and one just over it. Fresh tree
+per (rule, implementation), `--hard` so nothing reaches the Trash:
+
+```
+case                                   rule       oracle keeps  dedup-rs keeps
+tied mtimes (all equal)                shortest   c.bin         c.bin      SAME
+tied mtimes (all equal)                oldest     c.bin         c.bin      SAME
+tied mtimes (all equal)                newest     c.bin         c.bin      SAME
+distinct mtimes                        shortest   c.bin         c.bin      SAME
+distinct mtimes                        oldest     bb.bin        bb.bin     SAME
+distinct mtimes                        newest     aaa.bin       aaa.bin    SAME
+two tied newest, one older             shortest   c.bin         c.bin      SAME
+two tied newest, one older             oldest     c.bin         c.bin      SAME
+two tied newest, one older             newest     bb.bin        bb.bin     SAME
+two tied oldest, one newer             shortest   c.bin         c.bin      SAME
+two tied oldest, one newer             oldest     bb.bin        bb.bin     SAME
+two tied oldest, one newer             newest     c.bin         c.bin      SAME
+sub-microsecond apart                  shortest   c.bin         c.bin      SAME
+sub-microsecond apart                  oldest     bb.bin        bb.bin     SAME
+sub-microsecond apart                  newest     c.bin         c.bin      SAME
+200ns apart (under float resolution)   shortest   c.bin         c.bin      SAME
+200ns apart (under float resolution)   oldest     aaa.bin       aaa.bin    SAME
+200ns apart (under float resolution)   newest     c.bin         c.bin      SAME
+2us apart (above float resolution)     shortest   c.bin         c.bin      SAME
+2us apart (above float resolution)     oldest     aaa.bin       aaa.bin    SAME
+2us apart (above float resolution)     newest     c.bin         c.bin      SAME
+
+ALL SAME
+```
+
+Both previously failing cases now agree: "two tied newest" keeps `bb.bin` on
+both sides where the port used to keep `aaa.bin`, and "sub-microsecond apart"
+keeps `bb.bin` on both sides where the port used to keep `aaa.bin`. The two new
+shapes agree too, and they agree *differently* from each other — at 200 ns the
+float can still separate the files and both keep `aaa.bin`, at 1 ns it cannot
+and both fall through to the tie-break — which is the behaviour a faithful port
+of a float comparison should show.
+
+The mechanism is right in the source as well. `Rule::Newest` is now
+`min_by(|l, r| time(r).total_cmp(&time(l)))` (`trash.rs:66-70`) — reversing the
+comparator and taking the minimum yields the *first* maximum, because Rust's
+`min_by` returns the first minimum where `max_by_key` returns the last maximum.
+`oracle_mtime` (`trash.rs:100-103`) reconstructs `st_mtime` as
+`seconds as f64 + 1e-9 * nanoseconds as f64`, which is how CPython builds the
+float the oracle compares.
+
+Item 3 asked for parity *or* documentation and got both: the deliberate
+remaining divergence is stated at `trash.rs:89-98` and again in LOG.md — the
+finer `mtime_ns` is still what the cache key and the retained-bytes
+revalidation compare, "where being stricter than the oracle only ever means
+reading more, never deleting more". That reasoning is correct and I accept it.
+
+## Item 4 — the plan printed the Debug spelling: **fixed**
+
+Recipe: *run `--auto shortest` and require the oracle's lowercase wording.*
+
+```
+dedup-rs:  Keeping the shortest copy in each of 1 groups.
+dedup.py:  Keeping the shortest copy in each of 1 groups.
+```
+
+`main.rs` now formats through `Display` (`{}`), so `Rule::name()` is reachable
+from the path it was written for.
+
+## Independent re-verification
+
+Clean rebuild (`rm -rf target`), exit 0. `cargo test` 45 passed / 0 failed,
+`cargo clippy --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0.
+
+`ls /Volumes` immediately before each gate run showed only `dedupbench`, which
+belongs to another project and which I did not touch, and the stray `]` entry,
+which is a symlink to `/` and appears in no mount table. No Passport and no
+unexpected external volume at any point. Gate commands copied verbatim out of
+MILESTONES.md and run unmodified:
+
+```
+--gate m4     3 check(s), 0 failed    gate m4: green     EXIT=0
+--gate all   33 check(s), 0 failed    gate all: green    EXIT=0
+```
+
+`/Volumes` was byte-identical after both runs — the harness detached and
+unlinked its image as it says it does.
+
+Fence: the oracle clone has an **empty `git status` at `b6dd81f`**, and
+`git diff HEAD -- dedup.py conformance/ REWRITE.md` produces no output, so the
+referee is byte-identical to the maintainers' own.
+
+The deletion behaviours I verified by hand in the original review — survivor
+guard, hardlink clusters removed as a unit, records pinned from outside the tree
+never touched, both Trash branches, TTY refusal, `--hard`, the no-flags default,
+continue-on-error, and cache re-proof before removal — are unchanged by this
+round except for the keep-rule comparator, and `m4-deletion`, `m4-links` and
+`m4-trashes` all pass.
+
+## Residual findings
+
+Neither is blocking and neither is a defect in this port; both are recorded in
+REVIEW-M2.md's re-review in full.
+
+1. **The harness's own effort counters can lose updates under `-j8`.** One
+   oracle run in 21 reported five fewer `opens` than the other twenty on an
+   identical tree, with every other field identical. `opens[0] += 1` and
+   `self._tally[0] += len(block)` (`oracle_driver.py:82`, `:42`) are non-atomic
+   read-modify-writes called from the oracle's thread pool. It biases against
+   candidates, since `check_effort` fails on `opens > oracle["opens"]`. For the
+   harness maintainers, not for this repo.
+2. **A dangling cross-reference in MILESTONES.md**, where the `--gate all`
+   section points at an explanation the rewrite removed from the M2 claim.
+   Cosmetic.
+
+## Ruling
+
+The data-loss path is closed by construction rather than by a check that a
+future edit could forget, the three behavioural divergences are gone and
+covered by tests, and everything else about the deletion machinery still holds
+up under both the harness and my own trees. **M4 is APPROVED**, and with it the
+project as a whole per REWRITE.md §5.
+
+One thing worth saying plainly, because the original review was blunt about the
+mistake: the fix chosen here was the harder one. Making `run_auto` refuse a
+mode string would have satisfied the letter of the item in one line. Making the
+deletion path impossible to reach with unproven groups required moving
+`run_auto` between modules, making `Scan`'s groups private, and inventing a
+token type to carry the proof — and it means the next person to add a scanning
+mode cannot reintroduce this bug by forgetting anything. That is the right
+instinct for a tool that deletes files.
