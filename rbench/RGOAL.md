@@ -318,6 +318,7 @@ was working at load average ~3.4:
 | default candidate, separately built, `--rounds 9` | **SCORE 1.0085**, every gate green |
 | same again after the last refactor | **SCORE 1.0061**, every gate green |
 | `--selftest` | 4 of 4 sabotages caught, honest control clean |
+| a candidate patched in Rust to drop one group, rebuilt from source | **VOID** on the first scenario, no timings printed, exit 1 |
 
 The four sabotaged candidates and the gate that caught each: `drop-group` →
 correctness; `inflate-bytes` → bytes ceiling; `underreport-bytes` → byte
@@ -339,6 +340,11 @@ Two things the build turned up that are worth remembering:
   case it exists to catch. It only surfaced because the check was tested in
   both directions, with a fake harness deliberately started. Test a tripwire
   by making it fire.
+
+Once fixed, that check earned its keep the same afternoon: it refused a run
+because the M5 builder was mid-scan with its own `dedup-rs`, on a machine
+whose load average had climbed to 5.5. That is a run that would otherwise
+have been timed against another agent's work and quoted as a number.
 
 **These are smoke-level proof that the harness functions. They are not
 records.** They were taken at a tenth scale, on a busy shared machine, against
