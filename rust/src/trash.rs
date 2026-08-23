@@ -8,6 +8,7 @@
 //! §3.2: a group always keeps one copy, enforced here rather than by whatever
 //! is asking.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,33 +51,46 @@ impl Rule {
         }
     }
 
-    /// Which member survives. Returns a position within `members`.
+    /// Which member survives, given each member's canonical name and the
+    /// modification time the oracle compares. Returns a position within
+    /// `members`.
     ///
     /// Python's `min` and `max` both return the FIRST extreme; Rust's
     /// `max_by_key` returns the LAST. Members arrive shortest-name-first, so an
     /// unadjusted `max` would keep the longest-named copy on a tie where the
     /// oracle keeps the shortest-named one. Reversing the comparator and taking
     /// the minimum gets the first maximum, which is what `dedup.py:2226` does.
-    fn keeper(self, records: &[FileRec], members: &[usize]) -> usize {
-        let time = |&(_, &index): &(usize, &usize)| oracle_mtime(&records[index]);
+    ///
+    /// The browser calls this too, on its own copy of the names and times, so
+    /// "keep the oldest" cannot come to mean one thing under `--auto` and
+    /// another under a menu.
+    pub fn keeper_of(self, members: &[(&str, f64)]) -> usize {
         match self {
             Rule::Shortest => members
                 .iter()
                 .enumerate()
-                .min_by_key(|&(_, &index)| name_order(records[index].path()))
+                .min_by_key(|&(_, &(name, _))| name_order(name))
                 .map(|(position, _)| position),
             Rule::Oldest => members
                 .iter()
                 .enumerate()
-                .min_by(|left, right| time(left).total_cmp(&time(right)))
+                .min_by(|left, right| left.1 .1.total_cmp(&right.1 .1))
                 .map(|(position, _)| position),
             Rule::Newest => members
                 .iter()
                 .enumerate()
-                .min_by(|left, right| time(right).total_cmp(&time(left)))
+                .min_by(|left, right| right.1 .1.total_cmp(&left.1 .1))
                 .map(|(position, _)| position),
         }
         .expect("a group always has members")
+    }
+
+    fn keeper(self, records: &[FileRec], members: &[usize]) -> usize {
+        let pairs: Vec<(&str, f64)> = members
+            .iter()
+            .map(|&index| (records[index].path(), oracle_mtime(&records[index])))
+            .collect();
+        self.keeper_of(&pairs)
     }
 }
 
@@ -96,7 +110,7 @@ impl std::fmt::Display for Rule {
 /// the coarser quantity is the right one to compare here. The finer `mtime_ns`
 /// is still what the cache key and the retained-bytes revalidation use, where
 /// being stricter than the oracle only ever means reading more.
-fn oracle_mtime(record: &FileRec) -> f64 {
+pub fn oracle_mtime(record: &FileRec) -> f64 {
     let seconds = record.mtime_ns.div_euclid(1_000_000_000);
     let nanoseconds = record.mtime_ns.rem_euclid(1_000_000_000);
     seconds as f64 + 1e-9 * nanoseconds as f64
@@ -329,8 +343,102 @@ pub fn run_auto(
     0
 }
 
+/// What one round of removal did, for a caller that has to carry on afterwards.
+#[derive(Debug, Default)]
+pub struct Removed {
+    /// Names removed, not records: a hardlinked record removes several.
+    pub files: usize,
+    pub bytes: u64,
+    /// The records that are actually gone.
+    pub records: Vec<usize>,
+    /// Groups whose copies no longer matched, left whole and untouched.
+    pub refused: Vec<DupGroup>,
+    pub failures: Vec<String>,
+}
+
+/// Remove exactly the members the browser marked.
+///
+/// This is `run_auto`'s sibling and takes the same token for the same reason:
+/// `ProvenGroups` can only be built by `Scan::proven`, so a browser over a
+/// scan that merely grouped by size cannot reach this function at all.
+///
+/// The survivor guard is enforced here rather than trusted from the UI, because
+/// §3.2 says it is the code's job. The whole request is checked before anything
+/// is removed and a request that would empty any group is refused entire — a
+/// deletion tool that quietly did most of what it was asked would be worse than
+/// one that did nothing.
+pub fn run_selected(
+    scan: &Scan,
+    proven: ProvenGroups<'_>,
+    marks: &[(usize, usize)],
+    hard: bool,
+    context: &Compare,
+    mut cache: Option<&mut ScanCache>,
+) -> Result<Removed, String> {
+    let groups = proven.groups();
+    let mut wanted: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &(group, member) in marks {
+        let members = groups
+            .get(group)
+            .ok_or_else(|| format!("no such group: {group}"))?
+            .members
+            .len();
+        if member >= members {
+            return Err(format!("no such member: {group}/{member}"));
+        }
+        wanted.entry(group).or_default().push(member);
+    }
+    for (&group, chosen) in wanted.iter_mut() {
+        chosen.sort_unstable();
+        chosen.dedup();
+        if chosen.len() >= groups[group].members.len() {
+            return Err(format!(
+                "refusing the whole selection: it would leave group {} with no copy at all",
+                group + 1
+            ));
+        }
+    }
+
+    let mut outcome = Removed::default();
+    for (&group, chosen) in wanted.iter() {
+        // A group the cache vouched for has not been read this scan. Read it
+        // now, before anything in it goes, and drop the whole group if the
+        // copies have stopped matching.
+        let candidate = vec![DupGroup {
+            members: groups[group].members.clone(),
+            attested: groups[group].attested,
+        }];
+        let (safe, refused) =
+            verify_attested(context, &scan.records, candidate, cache.as_deref_mut());
+        if !refused.is_empty() {
+            outcome.refused.extend(refused);
+            continue;
+        }
+        let proved = &safe[0];
+        for &member in chosen {
+            let index = proved.members[member];
+            let record = &scan.records[index];
+            // Removing a record pinned from outside the tree would take the
+            // names away and free nothing, so it is never a victim, however it
+            // came to be marked.
+            if !record.deletable() {
+                continue;
+            }
+            match remove_record(context.root, record, hard) {
+                Ok(()) => {
+                    outcome.files += record.names.len();
+                    outcome.bytes += record.size;
+                    outcome.records.push(index);
+                }
+                Err(error) => outcome.failures.push(error),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 /// Say plainly that some groups were not what the cache thought they were.
-fn report_refusals(records: &[FileRec], refused: &[DupGroup]) {
+pub fn report_refusals(records: &[FileRec], refused: &[DupGroup]) {
     if refused.is_empty() {
         return;
     }
@@ -487,5 +595,343 @@ mod tests {
     #[test]
     fn the_boot_volume_trashes_to_home_and_others_to_their_own_volume() {
         assert_eq!(trash_dir_for(Path::new("/")), home().join(".Trash"));
+    }
+}
+
+/// `run_selected` against real trees, because what it has to get right is what
+/// is left on the disk afterwards.
+///
+/// Everything here removes permanently rather than to the Trash, so a test run
+/// never puts anything in the user's own Trash to clean up. Trash placement is
+/// covered end to end in `evidence/scripts/m5_end_to_end.py`, which can point
+/// `HOME` somewhere scratch.
+#[cfg(test)]
+mod selection {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::effort::Effort;
+    use crate::filters::Filters;
+    use crate::pipeline::find_duplicates;
+
+    static SERIAL: AtomicUsize = AtomicUsize::new(0);
+
+    /// A scratch tree, and the ground beside it for names the scan must not
+    /// see. Removed when the test ends, however it ends.
+    struct Tree {
+        base: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Tree {
+        fn new(files: &[(&str, &[u8])]) -> Tree {
+            let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+            let base =
+                std::env::temp_dir().join(format!("m5-selection-{}-{serial}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let root = base.join("root");
+            std::fs::create_dir_all(&root).expect("scratch root");
+            let tree = Tree { base, root };
+            for (name, content) in files {
+                tree.write(name, content);
+            }
+            tree
+        }
+
+        fn write(&self, name: &str, content: &[u8]) {
+            let path = self.root.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("scratch directory");
+            }
+            std::fs::write(path, content).expect("scratch file");
+        }
+
+        fn link(&self, from: &str, to: &str) {
+            let target = self.root.join(to);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).expect("scratch directory");
+            }
+            std::fs::hard_link(self.root.join(from), target).expect("hard link");
+        }
+
+        /// A name for the same inode that lives outside the scanned root, so
+        /// the scan sees fewer names than the inode has.
+        fn pin(&self, name: &str) {
+            std::fs::hard_link(self.root.join(name), self.base.join("pinned"))
+                .expect("hard link outside the tree");
+        }
+
+        fn scan(&self, effort: &Effort) -> Scan {
+            find_duplicates(
+                &self.root,
+                Filters {
+                    min_size: 1,
+                    include_ext: None,
+                    skip_ext: &[],
+                    excludes: &[],
+                },
+                crate::device::Device::probe(&self.root, Some(1)),
+                effort,
+                None,
+            )
+        }
+
+        fn survivors(&self) -> Vec<String> {
+            let mut found = Vec::new();
+            let mut stack = vec![self.root.clone()];
+            while let Some(directory) = stack.pop() {
+                for entry in std::fs::read_dir(&directory).expect("read the tree") {
+                    let entry = entry.expect("a directory entry");
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        found.push(
+                            path.strip_prefix(&self.root)
+                                .expect("under the root")
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+            }
+            found.sort();
+            found
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// Where a name sits in the reported groups, so a test can say "mark
+    /// b.bin" instead of guessing at an index.
+    fn locate(scan: &Scan, name: &str) -> (usize, usize) {
+        for (group, members) in scan.reported().iter().enumerate() {
+            for (position, &index) in members.members.iter().enumerate() {
+                if scan.records[index].path() == name {
+                    return (group, position);
+                }
+            }
+        }
+        panic!("{name} is not in any reported group");
+    }
+
+    fn context<'a>(tree: &'a Tree, effort: &'a Effort) -> Compare<'a> {
+        Compare {
+            root: &tree.root,
+            effort,
+            solid: true,
+            learn: false,
+        }
+    }
+
+    #[test]
+    fn exactly_the_marked_members_go_and_the_rest_stay() {
+        let tree = Tree::new(&[
+            ("a.bin", b"the same hundred bytes"),
+            ("b.bin", b"the same hundred bytes"),
+            ("c.bin", b"the same hundred bytes"),
+        ]);
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        let marks = vec![locate(&scan, "b.bin"), locate(&scan, "c.bin")];
+        let removed = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &marks,
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("a selection that leaves a survivor");
+
+        assert_eq!(tree.survivors(), vec!["a.bin"]);
+        assert_eq!(removed.files, 2);
+        assert_eq!(removed.bytes, 2 * b"the same hundred bytes".len() as u64);
+        assert_eq!(removed.records.len(), 2);
+        assert!(removed.refused.is_empty());
+        assert!(removed.failures.is_empty());
+    }
+
+    #[test]
+    fn a_selection_that_would_empty_a_group_is_refused_whole() {
+        let tree = Tree::new(&[
+            ("a.bin", b"aaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("b.bin", b"aaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("c.bin", b"aaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("x.dat", b"bbbbbbbbbbbb"),
+            ("y.dat", b"bbbbbbbbbbbb"),
+        ]);
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        // Every copy in the first group, plus a perfectly legal mark in the
+        // second one. The legal mark must not be acted on either.
+        let marks = vec![
+            locate(&scan, "a.bin"),
+            locate(&scan, "b.bin"),
+            locate(&scan, "c.bin"),
+            locate(&scan, "y.dat"),
+        ];
+        let error = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &marks,
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect_err("marking every copy was allowed");
+
+        assert!(error.contains("no copy at all"), "{error}");
+        assert_eq!(
+            tree.survivors(),
+            vec!["a.bin", "b.bin", "c.bin", "x.dat", "y.dat"],
+            "a refused request still removed something"
+        );
+    }
+
+    #[test]
+    fn the_same_mark_twice_is_still_one_file_and_still_guarded() {
+        let tree = Tree::new(&[
+            ("a.bin", b"duplicated content here"),
+            ("b.bin", b"duplicated content here"),
+        ]);
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        let b = locate(&scan, "b.bin");
+        let removed = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[b, b, b],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("one file marked three times is one file");
+        assert_eq!(removed.files, 1);
+        assert_eq!(tree.survivors(), vec!["a.bin"]);
+    }
+
+    #[test]
+    fn a_record_pinned_from_outside_the_tree_survives_being_marked() {
+        let tree = Tree::new(&[
+            ("a.bin", b"pinned content xxxxxxxx"),
+            ("b.bin", b"pinned content xxxxxxxx"),
+        ]);
+        tree.pin("b.bin"); // a second name the scan cannot see
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        let removed = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[locate(&scan, "b.bin")],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("the request itself is legal");
+
+        assert_eq!(removed.files, 0, "a pinned record was removed");
+        assert_eq!(removed.bytes, 0);
+        assert!(removed.records.is_empty());
+        assert_eq!(tree.survivors(), vec!["a.bin", "b.bin"]);
+    }
+
+    #[test]
+    fn a_hardlink_cluster_is_removed_as_one_unit() {
+        let tree = Tree::new(&[
+            ("a.bin", b"clustered content yyyy"),
+            ("z.bin", b"clustered content yyyy"),
+        ]);
+        tree.link("a.bin", "sub/also-a.bin"); // both names are inside the tree
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        let removed = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[locate(&scan, "a.bin")],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("the cluster may go, z.bin survives");
+
+        // Two names, one inode: both names gone, the bytes counted once.
+        assert_eq!(removed.files, 2);
+        assert_eq!(removed.bytes, b"clustered content yyyy".len() as u64);
+        assert_eq!(removed.records.len(), 1);
+        assert_eq!(tree.survivors(), vec!["z.bin"]);
+    }
+
+    #[test]
+    fn a_mark_that_names_nothing_is_an_error_rather_than_a_deletion() {
+        let tree = Tree::new(&[
+            ("a.bin", b"content for the bounds test"),
+            ("b.bin", b"content for the bounds test"),
+        ]);
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        for bad in [(9, 0), (0, 9)] {
+            let error = run_selected(
+                &scan,
+                scan.proven().expect("the bytes were compared"),
+                &[bad],
+                true,
+                &context(&tree, &effort),
+                None,
+            )
+            .expect_err("an out-of-range mark was accepted");
+            assert!(error.contains("no such"), "{error}");
+        }
+        assert_eq!(tree.survivors(), vec!["a.bin", "b.bin"]);
+    }
+
+    #[test]
+    fn marking_nothing_removes_nothing() {
+        let tree = Tree::new(&[
+            ("a.bin", b"content for the empty test"),
+            ("b.bin", b"content for the empty test"),
+        ]);
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        let removed = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("an empty selection is legal");
+        assert_eq!(removed.files, 0);
+        assert_eq!(tree.survivors(), vec!["a.bin", "b.bin"]);
+    }
+
+    #[test]
+    fn the_guard_counts_a_pinned_copy_as_a_survivor() {
+        let tree = Tree::new(&[
+            ("a.bin", b"one deletable one pinned"),
+            ("b.bin", b"one deletable one pinned"),
+            ("c.bin", b"one deletable one pinned"),
+        ]);
+        tree.pin("c.bin");
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        // Both freeable copies may go, because the pinned one still holds the
+        // content. Marking all three is still refused.
+        let removed = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[locate(&scan, "a.bin"), locate(&scan, "b.bin")],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("two of three is a legal selection");
+        assert_eq!(removed.files, 2);
+        assert_eq!(tree.survivors(), vec!["c.bin"]);
     }
 }

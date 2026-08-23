@@ -21,6 +21,7 @@ use crate::ordered::Ordered;
 use crate::stages::{has_tail, hash_stage, release, small_file_stage, Probe, Reader};
 use crate::walk::{basename, candidates, name_order, walk, FileRec};
 
+#[derive(Debug)]
 pub struct DupGroup {
     pub members: Vec<usize>,
     /// True when the members were matched from remembered digests instead of

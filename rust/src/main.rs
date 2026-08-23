@@ -15,6 +15,7 @@ mod ordered;
 mod pipeline;
 mod stages;
 mod trash;
+mod tui;
 mod walk;
 
 use std::fs;
@@ -55,6 +56,10 @@ struct Options {
     ext: Vec<String>,
     skip_ext: Vec<String>,
     list: bool,
+    /// Ask for the browser outright. Without it the browser is what a terminal
+    /// gets when nothing else was asked for, which is the oracle's behaviour;
+    /// with it, no terminal is an error rather than a silent fallback.
+    interactive: bool,
     auto: Option<String>,
     yes: bool,
     hard: bool,
@@ -103,6 +108,7 @@ fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
                 });
             }
             "-l" | "--list" => options.list = true,
+            "-i" | "--interactive" => options.interactive = true,
             "-y" | "--yes" => options.yes = true,
             "--hard" => options.hard = true,
             "--no-cache" => options.no_cache = true,
@@ -198,7 +204,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // purpose: a group it vouched for has to be read again before anything in
     // it goes.
     let code = match rule {
-        None => 0,
+        None => browse(&options, &scan, &root, &effort, device, cache.as_mut()),
         Some(rule) => match scan.proven() {
             Some(proven) => {
                 let context = Compare {
@@ -228,6 +234,53 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         cache.close();
     }
     Ok(code)
+}
+
+/// Open the browser, if the browser is what this run is.
+///
+/// The oracle browses whenever a terminal is there and neither `--list` nor
+/// `--auto` was given, so this does too. `-i` says it outright, and then a pipe
+/// is an error instead of a silent fall-through to the report — the difference
+/// matters for a script that meant to be interactive.
+fn browse(
+    options: &Options,
+    scan: &pipeline::Scan,
+    root: &std::path::Path,
+    effort: &Effort,
+    device: Device,
+    cache: Option<&mut ScanCache>,
+) -> i32 {
+    if !tui::has_terminal() {
+        if options.interactive {
+            eprintln!("{}", tui::NO_TERMINAL);
+            return 2;
+        }
+        return 0;
+    }
+    if !options.interactive && options.list {
+        return 0; // --list already printed everything the run was asked for
+    }
+    if scan.reported().is_empty() {
+        if !options.list {
+            println!("\n  No duplicates found.\n");
+        }
+        return 0;
+    }
+    // No token, no browser: the same guard `--auto` passes through.
+    let Some(proven) = scan.proven() else {
+        eprintln!(
+            "dedup-rs: the browser cannot act on a --stage size scan. Size buckets are files \
+             that merely share a length; nothing has read their contents. Re-run without --stage."
+        );
+        return 2;
+    };
+    let context = Compare {
+        root,
+        effort,
+        solid: device.all_solid_state(),
+        learn: false,
+    };
+    tui::run(scan, proven, root, options.hard, &context, cache)
 }
 
 fn default_report_path() -> PathBuf {
