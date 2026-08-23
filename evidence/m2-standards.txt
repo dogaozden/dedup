@@ -1,0 +1,28 @@
+$ cargo test
+test filters::tests::exclusion_matches_entry_or_any_directory_component ... ok
+test filters::tests::extension_matching_uses_final_suffix_and_dotfiles_have_none ... ok
+test filters::tests::normalization_strips_whitespace_and_exactly_one_leading_dot ... ok
+test filters::tests::glob_supports_character_classes_ranges_and_negation ... ok
+test ordered::tests::equal_byte_keys_land_in_one_group ... ok
+test ordered::tests::keys_come_back_in_the_order_they_first_appeared ... ok
+test pipeline::tests::the_end_probe_only_pays_for_a_tail_once_the_pages_cannot_meet ... ok
+test stages::tests::batches_stay_wide_enough_to_be_worth_queueing ... ok
+test stages::tests::sample_windows_start_after_the_deep_head_and_end_before_the_tail ... ok
+test stages::tests::the_two_end_pages_only_separate_once_they_cannot_meet ... ok
+test tests::the_default_report_path_is_a_file_not_a_directory ... ok
+test walk::tests::a_hardlink_cluster_alone_at_its_size_is_not_a_candidate ... ok
+test walk::tests::a_record_fits_the_per_file_memory_budget ... ok
+test walk::tests::hardlink_names_collapse_onto_one_record_shortest_first ... ok
+test walk::tests::names_sort_by_code_points_rather_than_utf8_length ... ok
+test walk::tests::unique_sizes_and_lone_inodes_are_not_candidates ... ok
+test compare::tests::the_fanout_fallback_still_decides_on_equality ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+clippy exit: 0
+
+$ cargo fmt --check
+fmt exit: 0

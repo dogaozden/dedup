@@ -144,3 +144,214 @@ The work was committed as-is at user direction in commit
 `e1de6a286e2e88a3a1b0676b6114e82a68e9d196`. Implementation details, untested
 areas, gate status, constants, and traps are recorded in `HANDOFF.md`. This
 session stopped without further implementation or validation.
+
+## 2026-08-22 — M2 (pipeline parity)
+
+### Hypothesis
+
+The M2 gate would go green only from a faithful port of the oracle's stage
+order, not from an independently-designed pipeline that happens to find the
+same duplicates: `bytes_read` is held to +/-10% of the oracle's instrumented
+count and `opens` may not exceed it, so the number of syscalls and the point at
+which each stage stops reading are both graded. Porting `find_duplicates`,
+`small_file_stage`, `hash_stage`, `split_identical` and `compare_stage`
+function by function should therefore land inside the band, and anything that
+lands outside it points at a stage I have transcribed wrongly.
+
+### Triage of the inherited work-in-progress
+
+I restored `src/main.rs` from b5843c6 rather than fixing e865fb7 forward.
+ox's partial M2 was wrong in four structural ways, each of which needed the
+surrounding code rewritten anyway:
+
+- `opens` was incremented twice for every handle: `open_counted` charged one
+  and the `Effort::opened()` guard it returned charged another. In
+  `compare_group` the guard was re-taken inside the read loop, so a large file
+  charged an open per chunk.
+- `hash_stage` wrote the current record's kept head and tail onto *every*
+  member already sitting in its bucket, so retained bytes belonged to whoever
+  landed in the bucket last.
+- Stage 5 threw the buckets away and re-grouped the survivors by size alone,
+  which is stage 2's answer, not stage 4's.
+- `collapse_hardlinks` dropped the name list entirely, so a hardlinked inode
+  no longer knew its own names — an M1 regression, not an M2 gap.
+
+The reusable parts were about thirty lines of SHA-256 helpers and the counter
+struct. ox's commits are untouched; 4254c4d restores the source and says so.
+
+### What happened
+
+Split the single file into modules (`filters`, `walk`, `effort`, `device`,
+`ordered`, `stages`, `compare`, `pipeline`) because M3 and M4 add a cache and a
+deletion path and a 3,000-line `main.rs` would not be reviewable. The walk and
+the filters moved unchanged from M1; everything from stage 2 down is new.
+
+The one design decision worth naming: records live in a single arena and every
+stage carries `usize` indices into it, rather than cloning `FileRec`s between
+stages. That is what makes retained head/tail bytes belong to one record — the
+bug above is unrepresentable — and it is why `release()` can drop them for
+records no later stage will look at.
+
+Two places needed care beyond transcription:
+
+- Python dicts are insertion-ordered and the small-file stage's ordering is
+  observable: it charges each new distinct content against `RETAIN_BUDGET` in
+  bucket order, so which files fall back to the staged pipeline depends on it.
+  `src/ordered.rs` is a grouping map that keeps that order and stores each key
+  once, since a 64 KiB tier-B key is exactly what the budget is counting.
+- `partition_blocks`' quadratic guard groups the remainder by block. Cloning
+  4 MiB keys to do that would double the compare stage's memory, so the
+  fallback keys slots by digest and then re-partitions each slot with the same
+  exact pivot loop. The digest picks the slot; equality still decides, which is
+  the guarantee the oracle's comment claims for a Python dict.
+
+The first official run of the gate was green on all 13 cases.
+
+### Numbers
+
+`bytes_read` and `opens` are not merely inside the band — they are identical to
+the oracle's instrumented counts on every case:
+
+| case | rust bytes_read | oracle bytes_read | delta | rust opens | oracle opens |
+|---|---|---|---|---|---|
+| mixed | 12969560 | 12969560 | +0.00% | 89 | 89 |
+| mixed-minsize | 12009644 | 12009644 | +0.00% | 75 | 75 |
+| mixed-ext | 10765912 | 10765912 | +0.00% | 72 | 72 |
+| mixed-skipext | 12338776 | 12338776 | +0.00% | 81 | 81 |
+| mixed-exclude | 1589248 | 1589248 | +0.00% | 11 | 11 |
+| smallzoo | 874735 | 874735 | +0.00% | 60 | 60 |
+| smallzoo-j1 | 874735 | 874735 | +0.00% | 60 | 60 |
+| prefix | 6488064 | 6488064 | +0.00% | 96 | 96 |
+| bighead | 83533824 | 83533824 | +0.00% | 32 | 32 |
+| bighead-j8 | 83533824 | 83533824 | +0.00% | 32 | 32 |
+| links | 954368 | 954368 | +0.00% | 18 | 18 |
+| adversarial | 1042435 | 1042435 | +0.00% | 33 | 33 |
+| deletion | 5783385 | 5783385 | +0.00% | 66 | 66 |
+
+Also checked outside the harness, on the 50,000-file corpus below: both
+implementations report the same 9,837 groups, the same 114,896,606 bytes read
+and the same 49,996 opens.
+
+### Memory
+
+`candidates()` originally grouped through a `HashMap<u64, Vec<Entry>>` and a
+`HashMap<(dev,ino), FileRec>`. On 50,000 files that cost 699 bytes of peak RSS
+per file, three times REWRITE.md §6's budget. One sort by (size, device, inode)
+puts a size's entries in one run and an inode's names adjacent inside it, which
+removes both maps; peak RSS fell from 45,858,816 to 28,737,536 bytes.
+
+The per-record figure is the marginal cost, measured by scanning the same
+corpus shape at two sizes so the fixed buffers cancel:
+
+```text
+emptydir          10878976  maximum resident set size
+recordcorpus      28835840  maximum resident set size     (50,000 files)
+recordcorpus2     38846464  maximum resident set size    (100,000 files)
+```
+
+(38846464 - 28835840) / 50000 = **200 bytes per file record**, against the
+230-byte target. The structural footprint agrees: `size_of::<FileRec>()` plus
+the names vector plus the name bytes is 179 bytes for a 43-character path, and
+`walk::tests::a_record_fits_the_per_file_memory_budget` asserts it stays under
+230. Both corpora hold only ten distinct contents, so the small-file stage
+retains about 20 KB and RSS is essentially the records.
+
+Total RSS is larger than 230 bytes x files and always will be: it also carries
+the walk's entry list and one batch of read buffers (`RETAIN_CHECK_SPAN` files
+in flight). Those are constants in the file count, not per-record costs.
+
+### Performance
+
+No hyperfine on this machine, so these are alternated timed runs, oracle and
+port in turn, over a generated corpus of 50,000 files between 512 B and 4 KiB
+across 250 directories, one third of the content shared. Page cache warmed with
+one untimed run of each first. Verbatim:
+
+```text
+warming the page cache (untimed)
+  run 1  oracle   2.504s   dedup-rs   1.032s   2.43x
+  run 2  oracle   2.567s   dedup-rs   1.104s   2.33x
+  run 3  oracle   2.555s   dedup-rs   1.081s   2.36x
+  run 4  oracle   2.472s   dedup-rs   1.099s   2.25x
+  run 5  oracle   2.394s   dedup-rs   1.030s   2.32x
+  run 6  oracle   2.455s   dedup-rs   1.069s   2.30x
+
+-j 8  median over 6 runs: oracle 2.488s, dedup-rs 1.075s -> 2.31x
+```
+
+```text
+warming the page cache (untimed)
+  run 1  oracle   7.656s   dedup-rs   5.741s   1.33x
+  run 2  oracle   7.378s   dedup-rs   5.712s   1.29x
+  run 3  oracle   7.188s   dedup-rs   5.496s   1.31x
+  run 4  oracle   7.583s   dedup-rs   5.887s   1.29x
+  run 5  oracle   7.406s   dedup-rs   5.772s   1.28x
+  run 6  oracle   7.469s   dedup-rs   5.649s   1.32x
+
+-j 1  median over 6 runs: oracle 7.438s, dedup-rs 5.727s -> 1.30x
+```
+
+Against §6: the -j8 target is >=1.3x and the measured figure is **2.31x**; the
+-j1 target is >=1.0x and the measured figure is **1.30x**. Machine caveat:
+other agents share this box, which is why the numbers are medians of six
+alternated pairs rather than a single run.
+
+### Two things the spec and the harness disagree about
+
+Recording both rather than guessing, per REWRITE.md §0.
+
+1. **The M1 gate cannot stay green once M2 exists.** `gate_walk` runs the
+   oracle with `--stage size` and grades the candidate against
+   `key["size_groups"]`, the size buckets. The harness README says a candidate
+   should ignore `{stage}` "because your M1 binary has no content stages yet" —
+   a premise that expires the moment stage 3 lands. With the prescribed
+   template, M1 now fails 9 of 13 cases for exactly that reason, so `--gate
+   all` could never be green.
+
+   I did not touch the harness. I taught the binary the same `--stage size`
+   switch the harness's own oracle driver carries (`oracle_driver.py:189`), and
+   its honest control depends on: `run.py --selftest` requires the oracle,
+   driven through `{stage}`, to pass all four gates. `--stage size` reports the
+   candidate set and nothing else, which is what the flag says.
+
+   **Every milestone claim in MILESTONES.md uses the prescribed template with
+   no `{stage}` token.** The switch changes nothing about m2, m3 or m4, which
+   all pass `stage=""`. It exists so `--gate all` can be run end to end, and I
+   report both forms.
+
+2. **The M3 gate needs deletion working.** `gate_trust` -> `poison_refusal`
+   (`run.py:494-522`) runs `--auto shortest -y` and judges M3 by which files
+   are left on disk; without deletion it reports "nothing at all was deleted"
+   and fails. So M3 cannot go green before M4's machinery exists. I will build
+   deletion first and claim in the specified order, M3 then M4.
+
+### Crate justification (REWRITE.md §7)
+
+§7 allows `libc`, `rusqlite`, `clap`, `rayon` or `crossbeam`, `serde`/
+`serde_json` and `ratatui`, and says anything else must be justified here
+first.
+
+- **`rayon`** — the allowlisted choice of the rayon/crossbeam pair. Per-stage
+  pools with explicit thread counts (`ThreadPoolBuilder::num_threads`) are what
+  §4's device-aware sizing asks for.
+- **`sha2`** — *not* on the allowlist, and inherited from ox rather than chosen
+  by me, but I am keeping it. The stage-3 and stage-4 digests must be a real
+  cryptographic hash to narrow safely, and sha2 compiles to the ARMv8 SHA-256
+  instructions this machine has; a hand-rolled implementation would be several
+  times slower for no behavioural gain. It is a pure-Rust, no-std-capable crate
+  with no transitive dependencies beyond `digest`/`generic-array`/
+  `cpufeatures`. Nothing is ever reported or deleted on the strength of one of
+  its digests — §3.1 is enforced by stage 5, not by the hash.
+
+`clap` is allowed but unused: the argument surface is a dozen flags and the
+oracle's own parser is `argparse` with no subcommands, so hand-parsing keeps
+the binary small and the flag semantics (`--auto` with an optional rule) under
+direct control.
+
+### Still outstanding
+
+- `getattrlistbulk(2)` remains deferred, as recorded at M1. The walk is
+  portable `read_dir`. The protocol excludes directory opens from `opens`, so
+  the gate cannot see it; it is a wall-time item, and the port already clears
+  §6's targets without it.
+- No cache and no deletion yet; those are M3 and M4.
