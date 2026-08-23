@@ -356,6 +356,60 @@ quoting any figure as a starting point.
 
 ---
 
+## 2026-08-23 — optimizer round one, closed
+
+Three contestants ran the loop above against baseline `c238b30`, each in its
+own worktree, each scored by the referee protocol of §10 rather than by itself.
+
+| entrant | score | verdict |
+|---|---|---|
+| opus | **0.3173** | CONFIRMED, and merged — `823e87c` |
+| sol | 0.4808 | CONFIRMED clean, and strictly dominated |
+| ox | 1.0000 | no change; stopped honestly at three strikes |
+
+**What won.** One finding: `dedup-rs` spent about 60 ms of every run on a
+`diskutil` subprocess — twice over with the cache on — to learn two facts the
+kernel and the IO registry hand over in microseconds. Six of the seven scored
+scenarios finish in under 200 ms, so on five of them that subprocess was not
+overhead around the work, it *was* the work. Replacing it with FFI in
+`rust/src/sys.rs` took the geomean to a third of the baseline and made every
+scenario faster; nothing traded against anything. The branch's own referee run
+recorded 0.3161 against the verifier's 0.3173 — the same commit, 0.4% apart,
+comfortably inside the ±4.3% floor measured that day.
+
+**Sol found the same lever and got two thirds of the way down it.** 0.4808 is a
+real, clean, confirmed win by any standard except the one that mattered: it
+removed one `diskutil` call and left the one inside `volume_uuid` standing.
+Same idea, same afternoon, half the prize, and nothing to merge because the
+winner is a superset of it.
+
+### What the round is evidence of
+
+- **Grep every subprocess spawn on the hot path before optimising any of
+  them.** This cost Sol the round outright. `Command::new` is four tokens and
+  the whole finding was a list of where they appear; the work that followed was
+  the easy part. Count them first, then choose.
+- **The referee protocol earns its cost.** Ox's second attempt measured 0.96 in
+  its own tree and 0.9999 under the referee — self-measurement is optimistic in
+  the direction you are hoping, reliably enough that a bench without an
+  independent scorer is a bench that flatters whoever is holding it.
+- **`getattrlistbulk` is not settled.** One naive attempt (ox) scored 1.0148 —
+  slower. That is a data point about that attempt, not a verdict on the idea;
+  REWRITE.md §4 still wants it and `needle` is still the scenario where the
+  walk dominates. Whoever picks it up should read that attempt first and not
+  treat 1.0148 as the ceiling.
+- **Parked, unproven:** Sol's idea of classifying virtual media as flash-like.
+  It landed inside the ±2.9% floor, which means the bench could not see it
+  either way — and §7 already names why: the corpus volume is a RAM disk that
+  reports no medium, so this is the one case the bench charges nothing for.
+  Not rejected, not kept. If anyone measures it, measure it on top of the
+  merged tip, and read §7 and §8 before quoting the result.
+
+**Verdict:** opus KEPT (merged at `823e87c`); sol and ox REVERTED, branches
+`sol-r1` and `ox-r1` left standing as the record.
+
+---
+
 ## 12. The loop, and when to stop
 
 For each idea:

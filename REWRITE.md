@@ -213,7 +213,11 @@ claim without output.
 Rust 2021+, stable toolchain. Crate allowlist: `libc` (FFI), `rusqlite`,
 `clap`, `rayon` or `crossbeam` (pick one), `serde`/`serde_json`, `ratatui`
 (M5 only). Anything else: justify in LOG.md first. `unsafe` only inside the
-`getattrlistbulk` FFI module, each block commented with its invariant.
+`getattrlistbulk` FFI module, each block commented with its invariant. That
+module is `rust/src/sys.rs`, and it is the single one this clause means: the
+volume probing that used to be a `diskutil` subprocess (`statfs`, IOKit,
+`getattrlist`) belongs there too, alongside the `getattrlistbulk` this clause
+was written for, every block still carrying its invariant.
 Errors: a file that can't be read is DATA (`unreadable` list), never a
 crash; a directory that can't be entered is skipped and reported. Match the
 oracle's plain-prose comment voice: explain why, never what.

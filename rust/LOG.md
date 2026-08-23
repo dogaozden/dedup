@@ -79,7 +79,7 @@ That is the right work for the tool and a small move for this number. I stopped
 here rather than reach for it, because the round's brief was a score and the
 score is met by a factor of two and a half — not because the idea is bad.
 
-### Not mine, but the next person should know
+### Not mine, but the next person should know — wrong; see the correction below
 
 `python3 conformance/run.py --gate all` fails 9 of 33 checks on **`main`
 itself** — identically with and without every change on this branch, verified by
@@ -88,6 +88,35 @@ round: RBENCH derives its answer key from corpus construction, and its
 correctness gate was green on every run recorded below. But LOG.md records that
 gate green at M5 and it is not green now, so something between then and now
 moved. Reported, not touched.
+
+#### Correction — 2026-08-23
+
+The paragraph above is wrong, and wrong in the direction that costs somebody a
+day: nothing on `main` moved and nothing is broken. Those nine failures are the
+m1 gate, and they are what `--gate all` does when the candidate template has no
+`{stage}` token in it.
+
+The M1 gate grades against size buckets — every group of files that merely share
+a length — on the harness premise that an M1 binary has no content stages yet. A
+finished pipeline does not report that set. It reports the files whose bytes
+actually match, which is fewer groups, so it is marked wrong on 9 of the m1
+gate's 13 cases. That premise expiring was foreseen: the binary carries
+`--stage size` for it, and `{stage}` in the template is what turns that on for
+the m1 line and only the m1 line. MILESTONES.md sets it out under "Note on
+`--stage size`", conformance/README.md §3 says the same in the harness's own
+words, and the M5 claim records 33 checks and 0 failures with the token present.
+
+    python3 conformance/run.py --gate all \
+      --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+
+is 33 of 33. What I ran, and reported above as a fact about `main`, was that
+command without `{stage}`.
+
+The original paragraph stays where it is, because a log that quietly edits
+itself is not a log. What it is evidence of is how the mistake was made: I
+checked a gate result against a remembered "green at M5" rather than against the
+command M5 actually recorded, and then reported the difference as something
+wrong with the repository instead of something wrong with what I ran.
 
 ## 2026-08-22 — M1
 

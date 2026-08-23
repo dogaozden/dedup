@@ -30,10 +30,15 @@ fclones' own benchmarks.
    where our byte-verification guarantee becomes visible instead of
    invisible cost.)
 4. **Lanes are never conflated.** Lane A: cold-ish single scan (fresh
-   page-cache prime, no persistent caches — our tool runs `--no-cache`).
-   Lane B: repeat scan (each tool re-run as a user would re-run it; our
-   cache ON, labeled as such). fclones has no persistent cache — that
-   contrast is legitimate and must be labeled, never smuggled into lane A.
+   page-cache prime, every tool's persistent cache OFF — ours runs
+   `--no-cache`). Lane B: repeat scan (each tool re-run as a user would
+   re-run it, with **every** tool's cache ON and labeled: ours, fclones'
+   `--cache`, jdupes' `-y`). We are not the only tool with a memory —
+   fclones 0.35 ships `--cache` and jdupes ships a hash database behind
+   `-y` — so a lane B that turned on only ours would be a rigged table,
+   and lane A exists precisely so the no-memory comparison stays honest.
+   Each tool's cache is redirected into a directory the run owns, so no
+   round is ever answered out of a previous round's memory.
 5. **Versions pinned.** The report records every tool's version, our
    commit, macOS version, volume type, and generation seed. Competitors
    installed via Homebrew at current stable; never patched or forked.
