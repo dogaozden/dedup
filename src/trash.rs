@@ -32,6 +32,14 @@ impl Rule {
         }
     }
 
+    fn name(self) -> &'static str {
+        match self {
+            Rule::Shortest => "shortest",
+            Rule::Oldest => "oldest",
+            Rule::Newest => "newest",
+        }
+    }
+
     /// Which member survives. Returns a position within `members`.
     fn keeper(self, records: &[FileRec], members: &[usize]) -> usize {
         let key = |&(_, &index): &(usize, &usize)| records[index].mtime_ns;
@@ -45,6 +53,12 @@ impl Rule {
             Rule::Newest => members.iter().enumerate().max_by_key(key).map(|(p, _)| p),
         }
         .expect("a group always has members")
+    }
+}
+
+impl std::fmt::Display for Rule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
     }
 }
 
@@ -190,6 +204,14 @@ mod tests {
             head: Vec::new(),
             tail: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_rule_round_trips_through_its_name() {
+        for rule in [Rule::Shortest, Rule::Oldest, Rule::Newest] {
+            assert_eq!(Rule::parse(&rule.to_string()), Some(rule));
+        }
+        assert_eq!(Rule::parse("biggest"), None);
     }
 
     #[test]

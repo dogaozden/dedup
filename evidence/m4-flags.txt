@@ -1,0 +1,22 @@
+--- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
