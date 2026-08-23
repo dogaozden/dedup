@@ -1,0 +1,44 @@
+=== confirmed deletion moves exactly the marked copies to the Trash ===
+    expect: a.bin and x.dat survive; the other three are in the scratch Trash
+    exit: 0 (ok)
+    survivors: ['a.bin', 'x.dat'] (ok)
+    trash: ['b.bin', 'c.bin', 'y.dat'] (ok)
+
+=== cancelling the confirmation removes nothing ===
+    expect: all three files survive and the Trash is empty
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== quitting with copies marked removes nothing ===
+    expect: all three files survive
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== --hard deletes permanently and puts nothing in the Trash ===
+    expect: a.bin survives, b.bin is gone, the Trash stays empty
+    exit: 0 (ok)
+    survivors: ['a.bin'] (ok)
+    trash: [] (ok)
+
+=== space on every copy in a group cannot empty it ===
+    expect: the last copy refuses to be marked, so one survives the confirmation
+    exit: 0 (ok)
+    survivors: ['c.bin'] (ok)
+    trash: ['a.bin', 'b.bin'] (ok)
+    refusal shown on screen: True (ok)
+
+=== removing a hardlinked record removes every name it wears ===
+    expect: both names of the cluster go together; the other copy survives
+    exit: 0 (ok)
+    survivors: ['z.bin'] (ok)
+    trash: ['a.bin', 'also-a.bin'] (ok)
+
+=== -i without a terminal refuses instead of guessing ===
+    expect: exit 2, a message naming --list and --auto, and nothing removed
+    exit: 2 (ok)
+    stderr: dedup-rs: the interactive browser needs a terminal on stdin and stdout. Use --list to see the groups or --auto to clean up.
+    survivors: ['a.bin', 'b.bin'] (ok)
+
+0 check(s) differing

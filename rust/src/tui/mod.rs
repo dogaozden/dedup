@@ -38,13 +38,17 @@ pub fn has_terminal() -> bool {
 pub const NO_TERMINAL: &str = "dedup-rs: the interactive browser needs a terminal on stdin and \
                                stdout. Use --list to see the groups or --auto to clean up.";
 
-/// Put the terminal back however this function is left — returned, errored, or
-/// panicked through. §M5.4: a user's wrecked terminal is a failed milestone.
-struct Restore;
+/// Put the terminal back however the scope holding it is left — returned,
+/// errored, or panicked through. §M5.4: a user's wrecked terminal is a failed
+/// milestone.
+///
+/// The action is a closure rather than a call to `put_the_terminal_back`
+/// directly so a test can watch the guard fire without a terminal to wreck.
+struct Restore<F: FnMut()>(F);
 
-impl Drop for Restore {
+impl<F: FnMut()> Drop for Restore<F> {
     fn drop(&mut self) {
-        put_the_terminal_back();
+        (self.0)();
     }
 }
 
@@ -72,7 +76,11 @@ pub fn run(
     let mut refused: Vec<DupGroup> = Vec::new();
 
     // The hook goes on before the screen is switched, so a panic between the
-    // two still lands on a terminal that works.
+    // two still lands on a terminal that works. It runs before unwinding
+    // starts, which is what puts the panic message on the normal screen rather
+    // than on an alternate one nobody will see again. The previous hook is
+    // moved into this one and so cannot be put back; the program exits within
+    // a few lines of here either way.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         put_the_terminal_back();
@@ -100,7 +108,7 @@ fn draw_and_read(
     refused: &mut Vec<DupGroup>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
-    let _restore = Restore;
+    let _restore = Restore(put_the_terminal_back);
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
@@ -118,7 +126,7 @@ fn draw_and_read(
         let step = match step {
             Step::Apply => {
                 terminal.draw(|frame| view::draw(frame, browser))?;
-                let marks: Vec<(usize, usize)> = browser.marks().collect();
+                let marks = browser.selection();
                 let removed = remove(scan, &marks, browser.hard, context, cache.as_deref_mut());
                 match removed {
                     Ok(mut removed) => {
@@ -224,7 +232,9 @@ pub fn build(scan: &Scan, groups: &[DupGroup], root: &Path, hard: bool) -> Brows
     let cwd = std::env::current_dir().ok();
     let groups = groups
         .iter()
-        .map(|group| Group {
+        .enumerate()
+        .map(|(index, group)| Group {
+            index,
             size: scan.records[group.members[0]].size,
             members: group
                 .members
@@ -433,6 +443,31 @@ mod tests {
             key_for(Mode::Browse, press(KeyCode::Char('c'))),
             Key::Ignored
         );
+    }
+
+    #[test]
+    fn the_guard_puts_the_terminal_back_on_every_way_out_of_its_scope() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // Returning normally.
+        let fired = Rc::new(Cell::new(0));
+        {
+            let seen = Rc::clone(&fired);
+            let _guard = Restore(move || seen.set(seen.get() + 1));
+        }
+        assert_eq!(fired.get(), 1, "the guard did not fire on a normal exit");
+
+        // Unwinding through it, which is the case the panic hook cannot cover:
+        // the hook runs before the stack comes down, the guard as it does.
+        let fired = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&fired);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = Restore(move || seen.set(seen.get() + 1));
+            panic!("the browser fell over");
+        }));
+        assert!(outcome.is_err(), "the panic did not happen");
+        assert_eq!(fired.get(), 1, "the guard did not fire on a panic");
     }
 
     #[test]

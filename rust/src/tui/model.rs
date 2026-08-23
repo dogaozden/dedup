@@ -29,6 +29,10 @@ pub struct Member {
 }
 
 pub struct Group {
+    /// Where this group sits in the scan's own list. It never changes, even
+    /// once a round of deletion has renumbered what the browser shows, and it
+    /// is half of what a mark names.
+    pub index: usize,
     pub size: u64,
     pub members: Vec<Member>,
 }
@@ -164,13 +168,21 @@ impl Browser {
         self.marked.range((group, 0)..(group + 1, 0)).count()
     }
 
-    /// The marks as (group, member) pairs.
+    /// The marks as `(group in the scan, record in the scan)` pairs.
     ///
-    /// Positions, not records: turning them into records is `run_selected`'s
-    /// job, because that is where the survivor guard is, and a plan derived
-    /// here would be a second answer nothing checks.
-    pub fn marks(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.marked.iter().copied()
+    /// Screen positions never leave this module. They move whenever a round of
+    /// deletion drops a group or a member, and a stale position handed to the
+    /// remover would name a different file rather than a missing one.
+    pub fn selection(&self) -> Vec<(usize, usize)> {
+        self.marked
+            .iter()
+            .map(|&(group, member)| {
+                (
+                    self.groups[group].index,
+                    self.groups[group].members[member].record,
+                )
+            })
+            .collect()
     }
 
     fn current(&self) -> &Group {
@@ -365,6 +377,7 @@ impl Browser {
             // One copy left is not a duplicate any more.
             if members.len() > 1 {
                 kept.push(Group {
+                    index: group.index,
                     size: group.size,
                     members,
                 });
@@ -446,8 +459,9 @@ mod tests {
     /// screen positions. The real path derives this inside `run_selected`.
     fn plan(browser: &Browser) -> Vec<usize> {
         browser
-            .marks()
-            .map(|(group, member)| browser.groups[group].members[member].record)
+            .selection()
+            .into_iter()
+            .map(|(_, record)| record)
             .collect()
     }
 
@@ -467,6 +481,7 @@ mod tests {
         Browser::new(
             vec![
                 Group {
+                    index: 0,
                     size: 1000,
                     members: vec![
                         member(0, "a.bin", 300.0),
@@ -475,6 +490,7 @@ mod tests {
                     ],
                 },
                 Group {
+                    index: 1,
                     size: 10,
                     members: vec![member(3, "d.bin", 5.0), member(4, "ee.bin", 9.0)],
                 },
@@ -757,6 +773,34 @@ mod tests {
         assert_eq!(browser.applied_bytes, 2000);
         assert_eq!(browser.marked_count(), 0);
         assert_eq!(browser.flash, "moved 2 files");
+    }
+
+    #[test]
+    fn a_mark_names_the_scans_group_even_after_the_list_has_renumbered() {
+        // The first group empties out and disappears, so what the browser now
+        // calls group 0 is the scan's group 1. A mark that carried the screen
+        // position would name the wrong group here, and the wrong group is a
+        // different file rather than a missing one.
+        let mut browser = browser();
+        browser.member = 0;
+        browser.keep_only_current();
+        browser.absorb(Outcome {
+            files: 2,
+            bytes: 2000,
+            removed: vec![1, 2],
+            refused: 0,
+            failures: Vec::new(),
+        });
+        assert_eq!(browser.groups.len(), 1);
+        assert_eq!(browser.group, 0, "the browser renumbered as expected");
+
+        browser.member = 0;
+        browser.keep_only_current();
+        assert_eq!(
+            browser.selection(),
+            vec![(1, 4)],
+            "the mark did not name the scan's own group and record"
+        );
     }
 
     #[test]

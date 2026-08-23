@@ -1,0 +1,31 @@
+=== quitting with q ===
+    modes before  (canonical, echo): (True, True)
+    modes during  (canonical, echo): (False, False)
+    modes after   (canonical, echo): (True, True)
+    raw mode was entered: True
+    raw mode was released: True
+    alternate screen entered: True
+    alternate screen left: True
+    left after it entered: True
+
+=== interrupting with ctrl-c ===
+    modes before  (canonical, echo): (True, True)
+    modes during  (canonical, echo): (False, False)
+    modes after   (canonical, echo): (True, True)
+    raw mode was entered: True
+    raw mode was released: True
+    alternate screen entered: True
+    alternate screen left: True
+    left after it entered: True
+
+=== exiting because nothing is left to browse ===
+    modes before  (canonical, echo): (True, True)
+    modes during  (canonical, echo): (False, False)
+    modes after   (canonical, echo): (True, True)
+    raw mode was entered: True
+    raw mode was released: True
+    alternate screen entered: True
+    alternate screen left: True
+    left after it entered: True
+
+0 check(s) differing

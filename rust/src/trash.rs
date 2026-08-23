@@ -356,17 +356,33 @@ pub struct Removed {
     pub failures: Vec<String>,
 }
 
-/// Remove exactly the members the browser marked.
+/// Whether any name this record wears is still on disk.
+fn still_there(root: &Path, record: &FileRec) -> bool {
+    record
+        .names
+        .iter()
+        .any(|name| root.join(name).symlink_metadata().is_ok())
+}
+
+/// Remove exactly the records the browser marked.
 ///
 /// This is `run_auto`'s sibling and takes the same token for the same reason:
 /// `ProvenGroups` can only be built by `Scan::proven`, so a browser over a
 /// scan that merely grouped by size cannot reach this function at all.
 ///
+/// A mark is `(group, record)`, where the record is its index in the scan and
+/// not its position on anyone's screen. Positions move — a browser that has
+/// already removed something renumbers what is left — and a stale position
+/// would name a different file rather than an absent one, which for this
+/// program means deleting something nobody chose.
+///
 /// The survivor guard is enforced here rather than trusted from the UI, because
-/// §3.2 says it is the code's job. The whole request is checked before anything
-/// is removed and a request that would empty any group is refused entire — a
-/// deletion tool that quietly did most of what it was asked would be worse than
-/// one that did nothing.
+/// §3.2 says it is the code's job. What it counts is copies that will still be
+/// on disk afterwards, not rows in a list: a group half-emptied by an earlier
+/// round has fewer survivors left than its membership suggests. The whole
+/// request is checked before anything is removed and a request that would empty
+/// any group is refused entire — a deletion tool that quietly did most of what
+/// it was asked would be worse than one that did nothing.
 pub fn run_selected(
     scan: &Scan,
     proven: ProvenGroups<'_>,
@@ -377,21 +393,26 @@ pub fn run_selected(
 ) -> Result<Removed, String> {
     let groups = proven.groups();
     let mut wanted: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for &(group, member) in marks {
-        let members = groups
+    for &(group, record) in marks {
+        let members = &groups
             .get(group)
             .ok_or_else(|| format!("no such group: {group}"))?
-            .members
-            .len();
-        if member >= members {
-            return Err(format!("no such member: {group}/{member}"));
+            .members;
+        if !members.contains(&record) {
+            return Err(format!("record {record} is not in group {}", group + 1));
         }
-        wanted.entry(group).or_default().push(member);
+        wanted.entry(group).or_default().push(record);
     }
     for (&group, chosen) in wanted.iter_mut() {
         chosen.sort_unstable();
         chosen.dedup();
-        if chosen.len() >= groups[group].members.len() {
+        let survivors = groups[group]
+            .members
+            .iter()
+            .filter(|index| !chosen.contains(index))
+            .filter(|&&index| still_there(context.root, &scan.records[index]))
+            .count();
+        if survivors == 0 {
             return Err(format!(
                 "refusing the whole selection: it would leave group {} with no copy at all",
                 group + 1
@@ -408,15 +429,13 @@ pub fn run_selected(
             members: groups[group].members.clone(),
             attested: groups[group].attested,
         }];
-        let (safe, refused) =
+        let (_proved, refused) =
             verify_attested(context, &scan.records, candidate, cache.as_deref_mut());
         if !refused.is_empty() {
             outcome.refused.extend(refused);
             continue;
         }
-        let proved = &safe[0];
-        for &member in chosen {
-            let index = proved.members[member];
+        for &index in chosen {
             let record = &scan.records[index];
             // Removing a record pinned from outside the tree would take the
             // names away and free nothing, so it is never a victim, however it
@@ -706,13 +725,12 @@ mod selection {
         }
     }
 
-    /// Where a name sits in the reported groups, so a test can say "mark
-    /// b.bin" instead of guessing at an index.
+    /// The mark that names a file: its group, and its record in the scan.
     fn locate(scan: &Scan, name: &str) -> (usize, usize) {
         for (group, members) in scan.reported().iter().enumerate() {
-            for (position, &index) in members.members.iter().enumerate() {
+            for &index in &members.members {
                 if scan.records[index].path() == name {
-                    return (group, position);
+                    return (group, index);
                 }
             }
         }
@@ -874,7 +892,7 @@ mod selection {
         ]);
         let effort = Effort::default();
         let scan = tree.scan(&effort);
-        for bad in [(9, 0), (0, 9)] {
+        for (bad, expected) in [((9, 0), "no such group"), ((0, 9), "is not in group")] {
             let error = run_selected(
                 &scan,
                 scan.proven().expect("the bytes were compared"),
@@ -884,9 +902,57 @@ mod selection {
                 None,
             )
             .expect_err("an out-of-range mark was accepted");
-            assert!(error.contains("no such"), "{error}");
+            assert!(error.contains(expected), "{error}");
         }
         assert_eq!(tree.survivors(), vec!["a.bin", "b.bin"]);
+    }
+
+    #[test]
+    fn the_guard_counts_copies_still_on_disk_rather_than_rows_in_the_group() {
+        // A browsing session removes in rounds, and the scan's idea of a group
+        // does not shrink between them. Counting members would let the second
+        // round take the last copy, because the group still claims three.
+        let tree = Tree::new(&[
+            ("a.bin", b"content across two rounds"),
+            ("b.bin", b"content across two rounds"),
+            ("c.bin", b"content across two rounds"),
+        ]);
+        let effort = Effort::default();
+        let scan = tree.scan(&effort);
+        run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[locate(&scan, "b.bin")],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("the first round is legal");
+        assert_eq!(tree.survivors(), vec!["a.bin", "c.bin"]);
+
+        let error = run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[locate(&scan, "a.bin"), locate(&scan, "c.bin")],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect_err("the second round emptied the group");
+        assert!(error.contains("no copy at all"), "{error}");
+        assert_eq!(tree.survivors(), vec!["a.bin", "c.bin"]);
+
+        // ...and one of the two is still perfectly legal to remove.
+        run_selected(
+            &scan,
+            scan.proven().expect("the bytes were compared"),
+            &[locate(&scan, "c.bin")],
+            true,
+            &context(&tree, &effort),
+            None,
+        )
+        .expect("one of two is legal");
+        assert_eq!(tree.survivors(), vec!["a.bin"]);
     }
 
     #[test]

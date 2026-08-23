@@ -382,7 +382,7 @@ fn overlay(frame: &mut Frame, title: &str, lines: &[String], footer: &str) {
         .max(title.chars().count())
         .max(footer.chars().count());
     let width = ((inner + 6) as u16).min(area.width.saturating_sub(4));
-    let height = (lines.len() as u16 + 4).min(area.height);
+    let height = (lines.len() as u16 + 2).min(area.height);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -425,6 +425,7 @@ mod tests {
         Browser::new(
             vec![
                 Group {
+                    index: 0,
                     size: 4096,
                     members: vec![
                         member(0, "photos/beach.jpg", true, 0),
@@ -433,6 +434,7 @@ mod tests {
                     ],
                 },
                 Group {
+                    index: 1,
                     size: 512,
                     members: vec![
                         member(3, "notes.txt", true, 0),
@@ -622,8 +624,15 @@ mod tests {
         let members = (0..20)
             .map(|index| member(index, &format!("copy-{index:02}.bin"), true, 0))
             .collect();
-        let mut browser =
-            Browser::new(vec![Group { size: 100, members }], "/scratch".into(), false);
+        let mut browser = Browser::new(
+            vec![Group {
+                index: 0,
+                size: 100,
+                members,
+            }],
+            "/scratch".into(),
+            false,
+        );
         // The window is three rows at this height, so seventeen are off screen.
         let screen = render(&browser, 80, 12);
         assert!(screen[6].contains("copy-00.bin"), "{:?}", screen[6]);
@@ -650,6 +659,7 @@ mod tests {
         let long = format!("{}/target.bin", "nested/".repeat(20));
         let browser = Browser::new(
             vec![Group {
+                index: 0,
                 size: 100,
                 members: vec![member(0, &long, true, 0), member(1, "b.bin", true, 0)],
             }],

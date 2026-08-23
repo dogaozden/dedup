@@ -1,0 +1,200 @@
+----- the group list as it opens; the second copy is pinned from outside -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+     ○ backup/photos/beach.jpg                                                 2026-08-23
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- space on the pinned copy is refused, and says why -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+     ○ photos/beach.jpg                                                        2026-08-23
+   › ⊘ old/beach copy.jpg                                                      2026-08-23
+     ○ backup/photos/beach.jpg                                                 2026-08-23
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  hardlinked outside this tree — deleting it frees nothing
+  b bulk    ENTER apply   ? help    q quit
+
+----- a keeps this copy and marks the rest that can actually be freed -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable                                  1 marked · 1.0 KB to free
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+     ● backup/photos/beach.jpg                                                 2026-08-23
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- the bulk menu -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable                                  1 marked · 1.0 KB to free
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+     ● backup/photos/b┌ Bulk actions ───────────────────────────────┐          2026-08-23
+                      │ 1   Keep the oldest copy in every group     │
+                      │ 2   Keep the newest copy in every group     │
+                      │ 3   Keep the shortest path in every group   │
+                      │ 0   Clear every mark                        │
+                      └ esc to cancel ──────────────────────────────┘
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- the confirmation: the count, the bytes, and Trash rather than gone -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable                                  1 marked · 1.0 KB to free
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+     ● backup/photos/beach.jpg                                                 2026-08-23
+                              ┌ Confirm ────────────────────┐
+                              │ Move to Trash: 1 files      │
+                              │ Reclaims 1.0 KB             │
+                              └ y  confirm      n  cancel ──┘
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- n cancels, and the marks survive it; then the help screen -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable                                  1 marked · 1.0 KB to free
+
+  Keys
+
+    ↑ ↓  or  j k    move between files in this group
+    ← →  or  h l    previous / next group
+    n / p           next / previous group
+    space           mark or unmark the highlighted file
+    a               mark every copy except the highlighted one
+    u               clear all marks in this group
+    g / G           jump to first / last group
+    b               bulk actions across every group
+    ENTER           review and apply — move marked files to Trash
+    ?               toggle this help
+    q               quit without deleting anything
+
+
+
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- the second group, where one record wears two names -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable                                  1 marked · 1.0 KB to free
+
+  Group 2 of 2                                                             40 B × 2 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ notes.txt  +1 link                                                      2026-08-23
+     ○ archive/notes.txt                                                       2026-08-23
+
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- back, applied: one copy freed, the pinned one still there -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 40 B reclaimable
+
+  Group 1 of 2                                                           1.0 KB × 2 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  moved 1 files
+  b bulk    ENTER apply   ? help    q quit
+
+----- what survived on disk -----
+    notes.txt
+    archive/notes-link.txt
+    archive/notes.txt
+    old/beach copy.jpg
+    photos/beach.jpg
+----- what went to the Trash -----
+    beach.jpg
