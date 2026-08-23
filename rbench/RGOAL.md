@@ -370,6 +370,7 @@ prefixtrap*  0.0077  0.0073  0.9433   ±9.5%   16.2 MB   16.2 MB   16.0 MB
 | 5 | read sibling directories concurrently | `3019856` | → 0.6833 refereed |
 | 6 | compare a group against its pivot in parallel | `db6b8c7` | → **0.6669** refereed |
 | 7 | hardware SHA-256 (`sha2` `asm` feature) | `b3d81fd` | → **0.6102** refereed |
+| 8 | a 512 KB comparison chunk, not 4 MB | `8c2e4dd` | −11.8% A/B; **0.6029** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -1737,6 +1738,74 @@ against a syscall wall that no hash can shift.
 hardware path, and I read the comment instead of measuring the crate. The
 lesson generalises past this one line: a claim in a comment about what the
 machine is doing is a claim to be checked, not a fact to be inherited.
+
+## 2026-08-23 — four megabytes was the obvious chunk and the slow one
+
+**Change:** `rust/src/consts.rs`, one constant. `CHUNK` 4 MiB -> 512 KiB, and
+the unit test that had encoded the old value.
+
+`compare_chunk` is `MIN_CHUNK.max(preferred.min(COMPARE_BUDGET / members))`.
+The budget only divides the chunk down once a group is *wide* — 128 MB / 227
+puts a `widegroup` group at 564 KB — so on wide groups the constant was never
+visible. On a **narrow** group it is the whole answer: `bigheader`'s eight
+members each got 4 MB, 32 MB in flight for one round, and nothing that size
+stays in cache, so the read and the `memcmp` behind it both go to DRAM.
+
+Measured in C at the comparison's own shape — N files open, one span read from
+each in parallel, every block compared against the pivot, advance — eight
+`bigheader` files on four readers, best of five:
+
+```
+  4096 KB   23.82 ms      <- what it was doing
+  2048 KB   22.26 ms
+  1024 KB   18.02 ms
+   512 KB   17.76 ms      <- kept
+   256 KB   18.60 ms
+   128 KB   23.65 ms
+```
+
+**The measurement had to be redone as an A/B, and that is the lesson.** Three
+referee readings of this commit came back 0.6004, 0.6125 and 0.6029-at-21-
+rounds against a 0.6102 of record — a 1.2% move, inside the floor, and I was
+one step from dropping a change whose target scenario had visibly halved.
+What was actually happening: the box got busier between the two measurements.
+Three `codebase-memory-mcp` processes at 98% each turned up mid-evening, and
+`needle` — which never calls `compare_chunk` at all, its compare stage is
+0.06 ms of 508 — moved from 0.6986 to 0.8982. A scenario the change cannot
+reach does not move because of the change.
+
+So both commits were run back to back in one window, A/B/A:
+
+```
+  scenario    A no-chunk   B chunk   A2 no-chunk    B vs mean(A,A2)
+  needle        0.8742     0.7232      0.7288          -9.8%
+  typical       0.7640     0.5796      0.5902         -14.4%
+  samesize      0.8133     0.7778      0.8264          -5.1%
+  widegroup     0.5618     0.5630      0.5322          +2.9%
+  photos        0.7556     0.4651      0.7632         -38.8%
+  bigheader     0.6916     0.6069      0.6946         -12.4%
+  rescan        0.4097     0.4065      0.3871          +2.0%
+  SCORE         0.6772     0.5761      0.6287         -11.8%
+```
+
+**11.8%.** The two A runs sit 7.7% apart from each other, which is the size of
+the thing that was drowning the signal, and is why the pair had to be run
+together. `photos` is what this was aimed at and it drops by more than a
+third. `widegroup` and `rescan` are flat, as they should be: 128 MB / 227 is
+564 KB either way, and `rescan` reads no bytes at all.
+
+Refereed absolute for this commit in this period: **0.6029** at 21 rounds. The
+honest reading is that the absolute number now depends on what else is awake,
+and the A/B delta is the trustworthy part.
+
+**Method, changed for the rest of the round:** a single referee reading is not
+enough on a shared box. Every verdict from here is an A/B of the two commits
+in one window, with the earlier commit run on both sides of the new one.
+
+`bigheader` reads 134.2 MB where it read 138.2: a smaller chunk stops nearer
+the point two files diverge. Above the 112.0 MB floor, under the 146.2 MB
+ceiling, deterministic. `prefixtrap` does not move at 16.2 MB. 174 tests and
+the selftest pass.
 
 ---
 
