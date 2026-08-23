@@ -51,16 +51,31 @@ REPORTS = os.path.join(HERE, "reports")
 
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "bench"))
-sys.path.insert(0, os.path.join(REPO, "rbench"))
 import corpus                                             # noqa: E402
 import corpora                                            # noqa: E402
 import tools as toolkit                                   # noqa: E402
 
-# The RBENCH harness is imported rather than copied: its volume fence, its
-# advisory lock, its live-harness check and its dispersion statistic are the
-# protocol XBENCH is required to share, and a second copy of them would be a
-# second thing to keep in step.
-import run as rbench                                      # noqa: E402
+
+def _load_rbench():
+    """The RBENCH harness, loaded by path rather than by name.
+
+    Its volume fence, its advisory lock, its live-harness check and its
+    dispersion statistic are the protocol XBENCH is required to share, and a
+    second copy of them would be a second thing to keep in step. It is loaded
+    by explicit path because `import run` is ambiguous in this repo — bench/
+    and rbench/ both contain a run.py, both directories end up on sys.path,
+    and which one wins depends on the order the modules above happened to
+    insert their own paths.
+    """
+    import importlib.util
+    path = os.path.join(REPO, "rbench", "run.py")
+    spec = importlib.util.spec_from_file_location("rbench_run", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+rbench = _load_rbench()
 
 DEFAULT_ROOT = rbench.DEFAULT_ROOT
 MIN_ROUNDS = 5                       # XBENCH.md's floor, against RBENCH's 9
@@ -70,9 +85,14 @@ SCAN_TIMEOUT = 3600
 # itself and the two competitors: a stray fclones or jdupes left running by a
 # person is exactly as damaging to a measurement as a stray dedup-rs, and a
 # second xbench on the same volume is worse than either.
+#
+# The leading class is (^|[/\s]) rather than RBENCH's (^|/) because this
+# harness is normally started as `python3 xbench/compare.py`, where the
+# character before the path is a space: anchored on / alone, xbench would not
+# recognise a second copy of itself.
 rbench.BUSY_PATTERN = re.compile(
     rbench.BUSY_PATTERN.pattern
-    + r"|(^|/)xbench/compare\.py|(^|/)fclones(\s|$)|(^|/)jdupes(\s|$)")
+    + r"|(^|[/\s])xbench/compare\.py|(^|/)fclones(\s|$)|(^|/)jdupes(\s|$)")
 
 # Written beside each corpus this suite generates. corpus.load() checks
 # bench/corpus.py's generator version and knows nothing about ours, so a
@@ -194,7 +214,7 @@ def measure(scenario: str, tree: str, truth, min_size: int, tools: list,
     for tool in tools:
         tool.reset_cache(workdir)
         seen = {"seconds": [], "correct": None, "detail": "", "max_rss": None,
-                "groups_found": None, "error": None}
+                "groups_found": None, "paths_found": None, "error": None}
         entry["tools"][tool.key] = seen
 
     # ── the untimed prime run each tool gets before the clock starts ─────────
@@ -213,6 +233,7 @@ def measure(scenario: str, tree: str, truth, min_size: int, tools: list,
             truth, toolkit.groups_as_inodes(tree, got["groups"]))
         seen["correct"], seen["detail"] = exact, detail
         seen["groups_found"] = len(got["groups"])
+        seen["paths_found"] = sum(len(g) for g in got["groups"])
 
     # ── peak RSS, out of band ────────────────────────────────────────────────
     for tool in tools:
@@ -257,14 +278,16 @@ def measure(scenario: str, tree: str, truth, min_size: int, tools: list,
     return entry
 
 
-def winner(entry: dict) -> str:
+def winner(entry: dict, tools: list) -> str:
     """Who won this scenario, stated plainly, or why nobody did.
 
-    Correctness first: a tool with the wrong answer is not in the race
+    Correctness first: a tool with the wrong answer is not in the race,
     whatever its clock said. XBENCH.md forbids a crowned number across
-    scenarios, so this is only ever said per scenario.
+    scenarios, so this is only ever said per scenario and never added up.
     """
-    ranked = sorted(((s["median"], key) for key, s in entry["tools"].items()
+    label = {t.key: t.label for t in tools}
+    ranked = sorted(((s["median"], label.get(key, key))
+                     for key, s in entry["tools"].items()
                      if s.get("median") is not None and s.get("correct")),
                     key=lambda p: p[0])
     if not ranked:
@@ -280,7 +303,11 @@ def winner(entry: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def scenario_table(entry: dict, tools: list) -> str:
-    head = ("tool", "median s", "spread", "correctness", "groups", "peak RSS")
+    # `paths` sits beside `groups` because that is where the one difference no
+    # flag could close becomes visible: on a tree with hardlinks, fclones
+    # prints more paths than the others for the same groups.
+    head = ("tool", "median s", "spread", "correctness", "groups", "paths",
+            "peak RSS")
     rows = [head]
     for tool in tools:
         seen = entry["tools"].get(tool.key)
@@ -288,15 +315,16 @@ def scenario_table(entry: dict, tools: list) -> str:
             continue
         if seen["error"]:
             rows.append((tool.label, "-", "-", "FAILED: " + seen["error"][:60],
-                         "-", "-"))
+                         "-", "-", "-"))
             continue
         rows.append((
             tool.label,
             "{:.4f}".format(seen["median"]) if seen["median"] else "-",
             "±{:.1%}".format(seen["spread"] / seen["median"])
             if seen["median"] else "-",
-            ("exact" if seen["correct"] else "DIFFERS") + " — " + seen["detail"],
+            ("exact " if seen["correct"] else "DIFFERS ") + seen["detail"],
             str(seen["groups_found"]) if seen["groups_found"] is not None else "-",
+            str(seen["paths_found"]) if seen["paths_found"] is not None else "-",
             human(seen["max_rss"]) if seen["max_rss"] else "-",
         ))
     widths = [max(len(r[i]) for r in rows) for i in range(len(head))]
@@ -313,13 +341,14 @@ def write_report(results: dict, tools: list, path: str) -> None:
 
     if meta["smoke"]:
         out += [
-            "> **SMOKE RUN — NOT PUBLISHABLE.** These numbers were taken at "
-            "smoke scale on {}, which is not the measurement volume, to prove "
-            "the harness functions. Corpora this small make fixed startup a "
-            "large share of every time in the table, and the machine was not "
-            "quiet. Nothing here is a result; only the correctness column and "
-            "the fact that every tool ran at all mean anything."
-            .format(meta["volume_kind"]), ""]
+            "> **SMOKE RUN — NOT PUBLISHABLE.** Taken at {} scale on {}, to "
+            "prove the harness functions. Corpora this small make fixed "
+            "startup a large share of every time in the table{}. Nothing here "
+            "is a result: the correctness column and the fact that every tool "
+            "ran at all are the only things this report establishes."
+            .format(meta["scale"], meta["volume_kind"],
+                    ", and the machine was not quiet"
+                    if meta["other_harnesses_live"] else ""), ""]
 
     out += ["## Environment", "",
             "| field | value |", "|-------|-------|"]
@@ -383,7 +412,7 @@ def write_report(results: dict, tools: list, path: str) -> None:
                         shape["file_count"], human(shape["total_bytes"]),
                         human(shape["min_size"]), shape["planted_groups"]), "",
                     scenario_table(entry, tools), "",
-                    "**Winner:** {}".format(winner(entry)), ""]
+                    "**Winner:** {}".format(winner(entry, tools)), ""]
 
     out += ["## What this suite does not say", "",
             "- No geomean, and no single headline across tools. XBENCH.md "

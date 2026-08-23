@@ -1,0 +1,486 @@
+{
+ "meta": {
+  "host": "Dogas-MacBook-Air.local",
+  "os": "Darwin 26.5.1",
+  "cpu": "Apple M4",
+  "commit": "f2c50e009f2d",
+  "root": "/private/tmp/claude-501/-Users-dogaozden-AI-Projects-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/xb-scratch",
+  "volume_kind": "local scratch \u2014 not a measurement volume",
+  "scale": "smoke",
+  "seed": 1,
+  "rounds": 3,
+  "load_average": [
+   9.4453125,
+   10.53271484375,
+   10.17431640625
+  ],
+  "other_harnesses_live": [],
+  "halved_for_memory": false,
+  "smoke": true,
+  "versions": {
+   "ours": "dedup-rs @ f2c50e009f2d",
+   "fclones": "fclones 0.35.0",
+   "jdupes": "jdupes 1.31.1 (2025-09-26) 64-bit, linked to libjodycode 4.1.2 (2026-02-08)"
+  },
+  "setup": {
+   "ours": 0.09738641600000003,
+   "fclones": 0.03250254200000002,
+   "jdupes": 0.002671082999999963
+  },
+  "czkawka_note": "czkawka: not installed. The Homebrew formula pulls 15 dependencies including gtk4, ffmpeg and librsvg (it builds the GUI alongside the CLI), which is the cask/GUI baggage XBENCH.md excludes.",
+  "started_iso": "2026-08-23T11:14:34-04:00"
+ },
+ "order": [
+  "needle",
+  "widegroup",
+  "photolib",
+  "backup"
+ ],
+ "shapes": {
+  "needle": {
+   "file_count": 10000,
+   "total_bytes": 25541080,
+   "min_size": 1,
+   "planted_groups": 10
+  },
+  "widegroup": {
+   "file_count": 70,
+   "total_bytes": 14606336,
+   "min_size": 1,
+   "planted_groups": 8
+  },
+  "photolib": {
+   "file_count": 21,
+   "total_bytes": 82813958,
+   "min_size": 1048576,
+   "planted_groups": 5
+  },
+  "backup": {
+   "file_count": 2388,
+   "total_bytes": 22623095,
+   "min_size": 1,
+   "planted_groups": 1092
+  }
+ },
+ "lanes": {
+  "A": {
+   "needle": {
+    "lane": "A",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.28782558400000013,
+       0.38330029099999985,
+       0.21833041699999978
+      ],
+      "correct": true,
+      "detail": "(10 groups)",
+      "max_rss": 36110336,
+      "groups_found": 10,
+      "paths_found": 20,
+      "error": null,
+      "median": 0.28782558400000013,
+      "spread": 0.08248493700000004
+     },
+     "fclones": {
+      "seconds": [
+       0.14864395800000008,
+       0.27226304200000007,
+       0.14093058300000028
+      ],
+      "correct": true,
+      "detail": "(10 groups)",
+      "max_rss": 23003136,
+      "groups_found": 10,
+      "paths_found": 20,
+      "error": null,
+      "median": 0.14864395800000008,
+      "spread": 0.0656662294999999
+     },
+     "jdupes": {
+      "seconds": [
+       0.1816328330000001,
+       0.2402956249999999,
+       0.16853925000000025
+      ],
+      "correct": true,
+      "detail": "(10 groups)",
+      "max_rss": 5242880,
+      "groups_found": 10,
+      "paths_found": 20,
+      "error": null,
+      "median": 0.1816328330000001,
+      "spread": 0.035878187499999825
+     }
+    }
+   },
+   "widegroup": {
+    "lane": "A",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.1263945409999998,
+       0.10550820799999983,
+       0.10540958400000022
+      ],
+      "correct": true,
+      "detail": "(8 groups)",
+      "max_rss": 17465344,
+      "groups_found": 8,
+      "paths_found": 69,
+      "error": null,
+      "median": 0.10550820799999983,
+      "spread": 0.010492478499999791
+     },
+     "fclones": {
+      "seconds": [
+       0.03264695799999906,
+       0.03366416699999952,
+       0.03296229200000056
+      ],
+      "correct": true,
+      "detail": "(8 groups)",
+      "max_rss": 18022400,
+      "groups_found": 8,
+      "paths_found": 73,
+      "error": null,
+      "median": 0.03296229200000056,
+      "spread": 0.0005086045000002315
+     },
+     "jdupes": {
+      "seconds": [
+       0.008505916000000724,
+       0.009084541000000002,
+       0.008740624999999724
+      ],
+      "correct": true,
+      "detail": "(8 groups)",
+      "max_rss": 1966080,
+      "groups_found": 8,
+      "paths_found": 69,
+      "error": null,
+      "median": 0.008740624999999724,
+      "spread": 0.0002893124999996388
+     }
+    }
+   },
+   "photolib": {
+    "lane": "A",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.10125433400000006,
+       0.10493416699999969,
+       0.09528133399999916
+      ],
+      "correct": true,
+      "detail": "(5 groups)",
+      "max_rss": 39108608,
+      "groups_found": 5,
+      "paths_found": 10,
+      "error": null,
+      "median": 0.10125433400000006,
+      "spread": 0.0048264165000002635
+     },
+     "fclones": {
+      "seconds": [
+       0.03239049999999999,
+       0.03203445800000004,
+       0.06587316699999946
+      ],
+      "correct": true,
+      "detail": "(5 groups)",
+      "max_rss": 16711680,
+      "groups_found": 5,
+      "paths_found": 10,
+      "error": null,
+      "median": 0.03239049999999999,
+      "spread": 0.016919354499999706
+     },
+     "jdupes": {
+      "seconds": [
+       0.010735125000000068,
+       0.011011250000001027,
+       0.018012582999999083
+      ],
+      "correct": true,
+      "detail": "(5 groups)",
+      "max_rss": 1982464,
+      "groups_found": 5,
+      "paths_found": 10,
+      "error": null,
+      "median": 0.011011250000001027,
+      "spread": 0.0036387289999995076
+     }
+    }
+   },
+   "backup": {
+    "lane": "A",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.1921038750000008,
+       0.1577436670000001,
+       0.26039920799999905
+      ],
+      "correct": true,
+      "detail": "(1092 groups)",
+      "max_rss": 45891584,
+      "groups_found": 1092,
+      "paths_found": 2184,
+      "error": null,
+      "median": 0.1921038750000008,
+      "spread": 0.05132777049999948
+     },
+     "fclones": {
+      "seconds": [
+       0.09495249999999977,
+       0.08073633300000083,
+       0.12266941699999911
+      ],
+      "correct": true,
+      "detail": "(1092 groups)",
+      "max_rss": 22511616,
+      "groups_found": 1092,
+      "paths_found": 2184,
+      "error": null,
+      "median": 0.09495249999999977,
+      "spread": 0.020966541999999144
+     },
+     "jdupes": {
+      "seconds": [
+       0.11111612500000057,
+       0.12779154200000065,
+       0.13549804200000004
+      ],
+      "correct": true,
+      "detail": "(1092 groups)",
+      "max_rss": 2867200,
+      "groups_found": 1092,
+      "paths_found": 2184,
+      "error": null,
+      "median": 0.12779154200000065,
+      "spread": 0.012190958499999738
+     }
+    }
+   }
+  },
+  "B": {
+   "needle": {
+    "lane": "B",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.4971097920000007,
+       0.3137783340000002,
+       0.382226792
+      ],
+      "correct": true,
+      "detail": "(10 groups)",
+      "max_rss": 37109760,
+      "groups_found": 10,
+      "paths_found": 20,
+      "error": null,
+      "median": 0.382226792,
+      "spread": 0.09166572900000025
+     },
+     "fclones": {
+      "seconds": [
+       0.11433499999999963,
+       0.07984083399999964,
+       0.07717675000000046
+      ],
+      "correct": true,
+      "detail": "(10 groups)",
+      "max_rss": 49643520,
+      "groups_found": 10,
+      "paths_found": 20,
+      "error": null,
+      "median": 0.07984083399999964,
+      "spread": 0.018579124999999586
+     },
+     "jdupes": {
+      "seconds": [
+       0.1889986669999999,
+       0.2625811659999995,
+       0.17894087500000033
+      ],
+      "correct": true,
+      "detail": "(10 groups)",
+      "max_rss": 9240576,
+      "groups_found": 10,
+      "paths_found": 20,
+      "error": null,
+      "median": 0.1889986669999999,
+      "spread": 0.04182014549999957
+     }
+    }
+   },
+   "widegroup": {
+    "lane": "B",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.18635083399999886,
+       0.19393387499999903,
+       0.244543375000001
+      ],
+      "correct": true,
+      "detail": "(8 groups)",
+      "max_rss": 10862592,
+      "groups_found": 8,
+      "paths_found": 69,
+      "error": null,
+      "median": 0.19393387499999903,
+      "spread": 0.029096270500001076
+     },
+     "fclones": {
+      "seconds": [
+       0.03937445899999936,
+       0.04358366700000005,
+       0.06649654200000121
+      ],
+      "correct": true,
+      "detail": "(8 groups)",
+      "max_rss": 38797312,
+      "groups_found": 8,
+      "paths_found": 73,
+      "error": null,
+      "median": 0.04358366700000005,
+      "spread": 0.013561041500000925
+     },
+     "jdupes": {
+      "seconds": [
+       0.009258458000001468,
+       0.009892125000000362,
+       0.02473441599999937
+      ],
+      "correct": true,
+      "detail": "(8 groups)",
+      "max_rss": 3145728,
+      "groups_found": 8,
+      "paths_found": 69,
+      "error": null,
+      "median": 0.009892125000000362,
+      "spread": 0.007737978999998951
+     }
+    }
+   },
+   "photolib": {
+    "lane": "B",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.17995745799999874,
+       0.23502325000000113,
+       0.23531591599999935
+      ],
+      "correct": true,
+      "detail": "(5 groups)",
+      "max_rss": 10878976,
+      "groups_found": 5,
+      "paths_found": 10,
+      "error": null,
+      "median": 0.23502325000000113,
+      "spread": 0.027679229000000305
+     },
+     "fclones": {
+      "seconds": [
+       0.038955791999999434,
+       0.06548466599999969,
+       0.04135579199999917
+      ],
+      "correct": true,
+      "detail": "(5 groups)",
+      "max_rss": 38207488,
+      "groups_found": 5,
+      "paths_found": 10,
+      "error": null,
+      "median": 0.04135579199999917,
+      "spread": 0.013264437000000129
+     },
+     "jdupes": {
+      "seconds": [
+       0.010954707999999869,
+       0.029654958000000065,
+       0.011359249999999932
+      ],
+      "correct": true,
+      "detail": "(5 groups)",
+      "max_rss": 3096576,
+      "groups_found": 5,
+      "paths_found": 10,
+      "error": null,
+      "median": 0.011359249999999932,
+      "spread": 0.009350125000000098
+     }
+    }
+   },
+   "backup": {
+    "lane": "B",
+    "rounds": 3,
+    "tools": {
+     "ours": {
+      "seconds": [
+       0.21022583300000264,
+       0.20964770799999854,
+       0.24448766600000127
+      ],
+      "correct": true,
+      "detail": "(1092 groups)",
+      "max_rss": 10862592,
+      "groups_found": 1092,
+      "paths_found": 2184,
+      "error": null,
+      "median": 0.21022583300000264,
+      "spread": 0.017419979000001362
+     },
+     "fclones": {
+      "seconds": [
+       0.06525179200000153,
+       0.11081583400000028,
+       0.07682033300000057
+      ],
+      "correct": true,
+      "detail": "(1092 groups)",
+      "max_rss": 44023808,
+      "groups_found": 1092,
+      "paths_found": 2184,
+      "error": null,
+      "median": 0.07682033300000057,
+      "spread": 0.022782020999999375
+     },
+     "jdupes": {
+      "seconds": [
+       0.0904738750000007,
+       0.21160370800000194,
+       0.10783754099999854
+      ],
+      "correct": true,
+      "detail": "(1092 groups)",
+      "max_rss": 4800512,
+      "groups_found": 1092,
+      "paths_found": 2184,
+      "error": null,
+      "median": 0.10783754099999854,
+      "spread": 0.06056491650000062
+     }
+    }
+   }
+  }
+ },
+ "deltas": [
+  "**Hardlinks are printed differently.** fclones lists every name a hardlinked inode wears; ours and jdupes list one. Correctness is therefore judged on inodes (`lstat` on every reported path) rather than on names, which is fair to all three. The raw path counts still differ and that is a real difference in what each tool tells a user.",
+  "**fclones does not prove equality.** It groups by a 128-bit non-cryptographic hash (metro, its default) and never compares bytes. Ours and jdupes both read to confirm. fclones is doing strictly less work for an answer that looks the same, and its speed should be read with that in hand.",
+  "**jdupes has no native minimum-size flag.** It is given `-X size+=:N`, an extension filter, which is inclusive of N and was verified to match `--min N` and `--min-size N` on a planted tree.",
+  "**XBENCH.md's premise about caches is out of date.** The spec says fclones has no persistent cache. fclones 0.35.0 ships `--cache` and jdupes ships `-y <db>`; lane B enables all three rather than only ours, which is the fairer contrast the spec was reaching for.",
+  "**czkawka is absent.** not installed. The Homebrew formula pulls 15 dependencies including gtk4, ffmpeg and librsvg (it builds the GUI alongside the CLI), which is the cask/GUI baggage XBENCH.md excludes."
+ ]
+}

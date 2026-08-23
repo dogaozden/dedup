@@ -216,11 +216,16 @@ SCENARIOS = {
 }
 
 # (smoke floor, default) on-disk bytes, used only to refuse a corpus that will
-# not fit. Both figures are measured, not guessed — see the manifest's
-# total_bytes after a build at each scale.
+# not fit. Measured by building both at both scales on 2026-08-23, then given
+# a little headroom rather than guessed at:
+#
+#   photolib  smoke   21 files    82.8 MB     5 groups
+#             default 155 files  665.3 MB    34 groups
+#   backup    smoke  2388 files    22.6 MB  1092 groups
+#             default 23880 files 262.0 MB 10920 groups
 ESTIMATE = {
-    "photolib": (110e6, 700e6),
-    "backup":   (30e6, 290e6),
+    "photolib": (90e6, 700e6),
+    "backup":   (25e6, 280e6),
 }
 
 for _name, _spec in SCENARIOS.items():

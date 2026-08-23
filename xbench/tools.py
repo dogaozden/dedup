@@ -177,6 +177,18 @@ ALIGNMENT = [
                "drained by the parent.",
     },
     {
+        "semantic": "empty-tree output",
+        "ours": "normal JSON report",
+        "fclones": "normal JSON, groups: []",
+        "jdupes": "plain text, -j ignored",
+        "why": "A jdupes quirk, not a flag: given a directory containing no "
+               "files at all it prints 'No duplicates found.' and ignores -j "
+               "entirely. A directory that has files but no duplicates does "
+               "produce JSON with an empty matchSets. Only the fixed-startup "
+               "measurement scans an empty tree, but that measurement would "
+               "have failed outright without handling it.",
+    },
+    {
         "semantic": "progress reporting",
         "ours": "(default) quiet when not a tty",
         "fclones": "--progress=false",
@@ -247,9 +259,13 @@ def truth_as_inodes(tree: str, manifest: dict) -> frozenset:
 
 
 def compare(want: frozenset, got: frozenset) -> tuple:
-    """(exact, description) for one tool's answer against the truth."""
+    """(exact, description) for one tool's answer against the truth.
+
+    The description never repeats the verdict — the caller renders that — so
+    that a table cell reads "exact (10 groups)" rather than saying exact twice.
+    """
     if want == got:
-        return True, "exact ({} groups)".format(len(want))
+        return True, "({} groups)".format(len(want))
     missing, extra = want - got, got - want
     bits = []
     if missing:
@@ -326,7 +342,17 @@ class Ours(Tool):
     label = "dedup-rs"
 
     def version(self) -> str:
-        return os.path.basename(self.binary)
+        """The tool has no --version, so its identity is the source it was
+        built from: the commit, and whether rust/ was dirty when it was."""
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "--short=12", "HEAD"],
+                              capture_output=True, text=True)
+        dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain",
+                                "--", "rust"], capture_output=True, text=True)
+        if head.returncode != 0:
+            return "dedup-rs (unknown build)"
+        return "dedup-rs @ {}{}".format(head.stdout.strip(),
+                                        "+dirty" if dirty.stdout.strip() else "")
 
     def argv(self, tree, min_size, out, cached, workdir):
         cmd = [self.binary, tree, "--report-json", out,
@@ -423,9 +449,20 @@ class Jdupes(Tool):
     def stdout_to_file(self):
         return True
 
+    # Given a tree with no files in it at all, jdupes ignores -j and prints
+    # this line as plain text instead of JSON. A tree that has files but no
+    # duplicates does produce JSON, with an empty matchSets — so this is only
+    # ever seen on an empty directory, which is exactly what the fixed-startup
+    # measurement scans. Matched exactly rather than by "does it start with
+    # {", so that real malformed output is still an error.
+    NO_DUPES = "No duplicates found."
+
     def parse(self, tree, out):
         with open(out) as fh:
-            data = json.load(fh)
+            text = fh.read()
+        if text.strip() == self.NO_DUPES:
+            return []
+        data = json.loads(text)
         return [[f["filePath"] for f in s.get("fileList", [])]
                 for s in data.get("matchSets", [])]
 
