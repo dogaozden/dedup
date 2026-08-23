@@ -114,8 +114,13 @@ LOCK_GRACE = 5.0
 # Matched against a process's own command line, which is why these are spelled
 # as paths and executables rather than as the bare word "rbench": a shell that
 # once launched this harness carries that word forever and is not a harness.
+#
+# The harness itself is anchored on (^|[/\s]) rather than (^|/), because the
+# ordinary way to start it is `python3 rbench/run.py` from the repository root,
+# where the character before the path is a space. Anchored on / alone it did not
+# recognise a second copy of itself — the one rival it exists to catch.
 BUSY_PATTERN = re.compile(
-    r"(^|/)dedup-rs(\s|$)|(^|/)(r?bench)/run\.py|(^|/)_measure\.py"
+    r"(^|/)dedup-rs(\s|$)|(^|[/\s])(r?bench)/run\.py|(^|/)_measure\.py"
     r"|(^|/)oracle_driver\.py|conformance/run\.py")
 
 # Launchers, not harnesses. A shell whose command line mentions the harness is
