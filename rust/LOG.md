@@ -1081,3 +1081,127 @@ is another project's, and the stray `]` entry that appears in no mount table.
 No command of mine named a `/Volumes` path. Every tree the browser deleted from
 was generated under this session's scratchpad, under `m5-`-prefixed names, with
 `HOME` pointed at a scratch directory so nothing reached the real Trash.
+
+## 2026-08-23 — REVIEW-M5 fix round
+
+### Hypothesis
+
+Both binding items looked local — one wrong string handed to a shared
+function, one early return in the wrong place — but REVIEW-M5 names a root
+cause they share, and the fix is only worth having if it addresses that: the
+browser's *view* of the world was leaking into decisions. So the question for
+each was not "what is the smallest edit" but "what stops this kind of leak".
+
+### 1. The bulk rules ranked a string built for drawing
+
+`apply_bulk` passed `Member.path` — the display path — to `Rule::keeper_of`,
+while `--auto` passes the record path. The two agree until the working
+directory sits inside the scanned tree, and then some members strip their
+prefix and others do not, the strings stop sharing one, and `name_order` stops
+being order-preserving between them. Standing in `tree/photos`, "keep the
+shortest path" kept `photos/aaaa.bin` (drawn as `aaaa.bin`) where
+`--auto shortest` kept `b.bin`. The user was told the longer path would go and
+the shorter one went.
+
+The oracle has no such split: `KEEP_RULES["shortest"]` ranks `fs[i].path`, and
+`.display` is a separate property built *from* it and used only for drawing
+(`dedup.py:2226`, `dedup.py:150-161`). So this was a divergence from the oracle
+and from this program's own `--auto` at once, and it was not in the logged list
+of chosen divergences, which makes it the silent kind M5-TUI.md forbids.
+
+`Member` now carries both strings, `name` (the scan's own, relative to the
+root) and `path` (what to draw), with the doc comment on each saying which is
+which and that they are not interchangeable. Every decision reads `name`;
+nothing but the painter reads `path`. Two comments that asserted the opposite —
+`trash.rs`'s "cannot come to mean one thing under `--auto` and another under a
+menu" and its twin in `model.rs` — were false when written and now say the
+thing that is actually true.
+
+**The lesson, since it is the general one: sharing the function is not sharing
+the rule if the inputs differ.** A shared `keeper_of` looked like it made the
+two paths agree by construction. It made them agree only about *how* to rank,
+and the argument decided *what*. `oldest` and `newest` were never affected
+because they compare `mtime`, which is one number with one meaning.
+
+### 2. Below 54×12 the confirmation was not drawn and `y` still deleted
+
+`view::draw` returns early on a frame too small to lay out — correct for the
+browse screen — but it returned before the overlay match, so in `Mode::Confirm`
+the dialog was not drawn while the model still accepted `y`. A deletion could
+proceed with the count, the bytes and the Trash-vs-permanent mode never on
+screen, which hard rule 3 forbids outright.
+
+REVIEW-M5 allowed either drawing the overlays before the early return (the
+oracle's shape — its `_put` clips per line) or refusing `Key::Apply` below the
+minimum. I took the second, and not only because it is smaller: at 20×8 a
+clipped box cannot show "Move to Trash: 1 files" at all, so the first option
+would satisfy the letter of "a dialog was drawn" while still deleting on
+numbers nobody could read. Drawing something is not the requirement; the
+numbers being legible is.
+
+The minimum now lives in `model.rs`, because it stopped being only a layout
+number the moment it decided what the browser would act on, and the paint layer
+reads it from there so the two cannot drift apart. The model carries
+`legible`, set from the area of the frame that was actually painted, and on a
+frame below the minimum it takes no key but `Quit`. Movement and marking go
+with it — acting on a list that was never drawn is the same mistake more
+cheaply — and the resize message the user *can* see is the one thing on screen.
+A `debug_assert` in the event loop makes the invariant loud if it is ever
+inverted.
+
+### Taken from the non-binding notes
+
+- **Nothing tested the browser's re-read of a cache-attested group.** The
+  reviewer showed that deleting the `verify_attested` call in `run_selected`
+  left every test and the whole gate green, because `m3-poison-refusal` covers
+  `run_auto` and nothing covered its sibling. Closed with an end-to-end case:
+  warm the cache on two 24 MB copies, poison one byte in the *middle* and put
+  the mtime back, so head, tail and every sample point still match and only a
+  full re-read can tell. The scan reads 0 bytes and still reports the group —
+  that zero is the proof it was believed rather than seen — and the browser
+  reads it, disbelieves it, removes nothing and says why. I checked the test
+  can fail: with the `verify_attested` call removed it reports three differing
+  checks and `b.bin`, the copy that no longer matches, goes to the Trash.
+  105 unit tests stay green through that same removal, which is the reviewer's
+  point about where the hole was.
+- A mark is now a `Mark { group, record }` rather than a bare `(usize, usize)`.
+  This does not make a screen position unrepresentable — only a distinct type
+  for record indices would, and that is a wider change than a fix round should
+  carry — but the two fields are both `usize` and nothing except their order
+  distinguished them, and swapping them was a live failure mode.
+- Dropped the second `put_the_terminal_back` in `run`: the drop guard covers
+  every path it covered, and two mechanisms for one guarantee make a reader
+  ask which is load-bearing.
+- `evidence/m5-standards.txt` now has a generator beside it like the others.
+
+### The wrinkle inherited from the oracle, so nobody "fixes" it
+
+The confirmation counts records ("1 files") while the exit summary counts names
+("2 files moved to Trash") when a hardlink cluster is involved. The oracle does
+exactly this (`dedup.py:2462` against `dedup.py:2511`), so it is parity, not a
+bug. Changing either number would make it a divergence.
+
+### Numbers
+
+| check | result |
+| --- | --- |
+| `cargo test` | 105 passed, 0 failed (101 → 105) |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `--gate all` | 0 — 33 checks, 0 failed |
+| end-to-end browser runs, 10 scenarios | 0 differing |
+| terminal restore, 3 exit paths | 0 differing |
+| CLI dispatch, 7 flag and terminal combinations | 0 differing |
+
+`m5-screens.txt` came back byte-identical, which REVIEW-M5 expected to move. It
+did not because that script runs the browser with its working directory at the
+scanned root, where the display name and the scan name are the same string, and
+because it only opens the bulk menu to photograph it and leaves with `esc`
+without applying a rule. The transcript was regenerated from the fixed binary
+all the same.
+
+Fence: `ls /Volumes` before and after the gate run showed `dedupbench`, which
+is another project's, and the stray `]` entry that appears in no mount table.
+No command of mine named a `/Volumes` path. Every tree deleted from was
+generated under this session's scratchpad with an `m5-` prefix and `HOME`
+pointed at a scratch directory.
