@@ -1,5 +1,16 @@
 # REVIEW-M5_1.md — maintainer review of the M5.1 claim
 
+> **CURRENT VERDICT: APPROVED** — 2026-08-23 re-review at `afd67fb`, appended
+> at the end of this file. The binding item is fixed and independently
+> re-verified against the recipe below, on two separately built binaries whose
+> hashes I recorded. The builder also found and fixed a second defect I had only
+> noted in passing (exit 101 from ratatui's `Terminal::drop`), and closed the
+> hole that let the death test stop covering the browser — both of which I
+> confirmed by building the mutants myself. Everything from here to the
+> re-review is the original CHANGES review, kept intact as the audit trail.
+
+## Original review (verdict superseded)
+
 **Verdict: CHANGES**
 
 Claimed at `b102625` on branch `features`, reviewed at that tip. Binding specs
@@ -438,3 +449,213 @@ frame) is correct.
 Fix binding item 1 with the four steps in its recipe, re-run
 `tui-terminal-death.py` (made deterministic) and `cargo test` / clippy / fmt /
 `--gate all`, and re-claim M5.1. The rest of the milestone needs nothing.
+
+---
+
+# Re-review — 2026-08-23, at `afd67fb`
+
+**Verdict: APPROVED.** Binding item 1 is fixed. I re-verified it against my own
+recipe rather than the builder's report, on two independently built binaries,
+and I rebuilt both of the new mutants myself to check the tests that guard it
+actually bite on the screen they name.
+
+Re-reviewed at `afd67fb` (`17dd456` the fix, `afd67fb` the re-claim), two
+commits atop my review commit `533667b`. Tree clean. `ls /Volumes` before the
+gate run showed only `dedupbench` — no passport.
+
+## The binaries I tested
+
+I got burned once on this branch by a shared `CARGO_TARGET_DIR` handing me four
+identical binaries, so per my own warning:
+
+```
+worktree build      d7002edcf24a6b5cd53dacf93ff060b4eeb3f614f3887728dd2cca3fe35c0d02
+independent build   502ef37961d56a2e868fc890cc707de18e73634e6e790b182b3c1d0557bd5515
+```
+
+The second is `git archive afd67fb` extracted to scratch and built with its own
+target directory. The hashes differ only because the source path is embedded;
+both were driven through every scenario below and behaved identically, which is
+what rules staleness out.
+
+## Item 1 — the menu spun on a dead terminal: **fixed**
+
+The fix is the one the recipe asked for and then some. `menu.rs` now consumes
+all three answers, with `Waited => continue`; the `terminal.draw` failure path
+checks `hung_up()` first, exactly as the browser does; `hung_up()` is promoted
+to `pub(super)` and shared rather than copied; and the hardcoded 250 ms is
+replaced by the browser's own `WAIT_FOR_KEY`, so the two screens cannot drift
+apart on the timeout either. `ask` returns an `Answer` enum instead of an
+`Option`, and `main` maps `Answer::TerminalGone` to exit 1 — the same ending
+the browser gives the same event.
+
+The repository's death script, both builds:
+
+```
+$ python3 rust/evidence/scripts/tui-terminal-death.py <worktree build d7002ed>
+  keys/menu        PASS  'q' left the menu in 0.63s, exit 0
+  keys/browser     PASS  'q' left the browser in 0.63s, exit 0
+  hangup/menu      PASS  the menu left 0.06s after the terminal died, exit code 1, 0.00 CPU-seconds
+  hangup/browser   PASS  the browser left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+all scenarios passed
+EXIT=0
+
+$ python3 rust/evidence/scripts/tui-terminal-death.py <independent build 502ef37>
+  ...four PASS, identical wording, EXIT=0
+```
+
+My deterministic driver — the one that matters, because the repo script catches
+this only about half the time — at 1.5 s past the poll, three ways:
+
+```
+$ python3 rust/evidence/scripts/hangup_deterministic.py <worktree build> 1.5 3
+  run 1: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 2: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 3: LEFT(menu, exit=1, 0.01 CPU-s)
+SPUN 0/3
+
+$ python3 <my original scratch driver> <worktree build> 1.5 3      SPUN 0/3
+$ python3 <my original scratch driver> <independent build> 1.5 3   SPUN 0/3
+```
+
+I diffed the in-repo `hangup_deterministic.py` against the copy I wrote into
+the original review: it keeps the delay-past-the-poll, keeps the CPU sampling
+and the `SPINNING` threshold, and adds the exit code to the verdict line. It is
+my recipe, not a weakened version of it. Keys still work on both screens, so the
+fix is not buying the exit by ignoring input.
+
+## The second defect — exit 101 — is real, and the fix is right
+
+I had flagged the 101 in my own patched build as "run this down" without
+diagnosing it. The builder diagnosed it: ratatui's `Terminal::drop` tries to
+show the cursor and `eprintln!`s when it cannot, which panics when the
+descriptor it would print to is the terminal that just died. The fix is
+`std::mem::forget(terminal)` on the `TerminalGone` path only — the browser's
+existing pattern — with the `Restore` guard still running, so a terminal that
+is really there is still restored.
+
+I verified the in-between claim rather than taking it. Starting from `afd67fb`
+I removed **only** the `mem::forget`, keeping the three-arm loop and the
+`hung_up()` draw check:
+
+```
+### three arms, NO mem::forget — deterministic driver ###
+  run 1: LEFT(menu, exit=101, 0.01 CPU-s)
+  run 2: LEFT(menu, exit=101, 0.01 CPU-s)
+  run 3: LEFT(menu, exit=101, 0.01 CPU-s)
+SPUN 0/3
+```
+
+Exactly as claimed: the poll fix alone stops the spin and leaves the panic
+exit; the `mem::forget` is what turns 101 into 1. Both halves were needed and
+both are present.
+
+## The per-screen pinning is real — I built both mutants
+
+This was the claim most worth distrusting, since a test that says which screen
+it is on is only useful if a menu-only defect leaves the browser case green. I
+did not rely on `menu_mutants.py` reporting itself. I built both mutants from
+`afd67fb` in my own scratch trees and ran the death script against each:
+
+**`one-of-three-answers`** (revert the loop to the two-way `if`, `mem::forget`
+kept) — the original defect:
+
+```
+  keys/menu        PASS  'q' left the menu in 0.62s, exit 0
+  keys/browser     PASS  'q' left the browser in 0.62s, exit 0
+  hangup/menu      FAIL  the menu was still running 5s after the terminal died, 5.03 CPU-seconds in that window — SPINNING
+  hangup/browser   PASS  the browser left 0.06s after the terminal died, exit code 1, 0.01 CPU-seconds
+1 scenario(s) failed
+```
+
+**`drop-the-dead-terminal`** (remove the `mem::forget`, loop kept) — the second
+defect:
+
+```
+  hangup/menu      FAIL  the menu left in 0.05s but by panicking (exit 101)
+  hangup/browser   PASS  the browser left 0.06s after the terminal died, exit code 1, 0.00 CPU-seconds
+1 scenario(s) failed
+```
+
+In both cases exactly one scenario fails and it names the menu, while the
+browser scenario stays green. That is the pinning working, and it is also the
+proof that the old single-scenario script could not have caught either — the
+regression I found was invisible to it precisely because `-i` stopped reaching
+the browser and nothing asserted which screen had been reached. `reach()` now
+fails loudly if the expected screen is not the one that painted, which closes
+that hole rather than papering over it.
+
+The full battery is 8/8:
+
+```
+$ python3 rust/evidence/scripts/menu_mutants.py
+  ... six table mutants, all caught ...
+Baseline: the same tree, built and run through tui-terminal-death.py.
+  every scenario passed
+mutant one-of-three-answers         enters the blocking read when poll said nothing was typed
+  caught: hangup/menu      FAIL  ... SPINNING
+mutant drop-the-dead-terminal       lets ratatui print to a descriptor that is gone, panicking on the way out
+  caught: hangup/menu      FAIL  the menu left in 0.05s but by panicking (exit 101)
+every mutant was caught
+EXIT=0
+```
+
+## Standards and the gate, re-run at `afd67fb`
+
+```
+$ cargo test
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+
+$ cargo fmt --check
+FMT_EXIT=0
+
+$ python3 conformance/run.py --gate all \
+    --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+33 check(s), 0 failed
+gate all: green
+[exited with code 0]
+```
+
+Non-interactive use is still untouched by the change to `main`'s menu branch:
+flagless stdout is byte-identical to the `main@baf9e25` build (`cmp -s` clean),
+stderr empty on both. And since `main.rs` was edited, I re-ran the
+cohort-boundary subset of my own M6 differential at this tip —
+`pair-straddles-boundary`, `pairs-never-meet-the-pivot`, `multi-round-wide` —
+all still identical across oracle, flagless, flash, spinning and auto, 0
+failures.
+
+## The non-binding notes
+
+All three were taken, and taken openly rather than quietly.
+
+1. **Seek-win sentence:** added, and it says the right thing — the ratios
+   belong to "wide groups of large files", small-file trees seek slightly more,
+   and "Read '3.0x-3.6x fewer' as a statement about large wide groups, not
+   about every tree." It cites its own differential rows rather than asserting
+   it.
+2. **Stale prose numbers:** corrected, and the correction is *recorded* rather
+   than silently patched — the LOG says "Three stale prose numbers corrected in
+   the entries above: 158 and 159 tests to 163, and 'six mutants' to seven for
+   M6's script." That is the right way to fix a number in a journal.
+3. **Two tables:** the one-table section now says plainly that there are
+   strictly two, `HELP_FLAGS` beside `FLAGS`, and why that is not a drift hole.
+
+The builder correctly left alone the items I marked "not this branch's" (the
+attached `-j1` form, the stale `VolumeProbe` doc comment).
+
+## Ruling
+
+**APPROVED.** Binding item 1 is cleared. The fix is the right shape — it makes
+the two screens share the loop, the timeout constant and the hangup question
+rather than keeping two copies that drifted once already — and the tests that
+guard it fail on the screen they name, which I proved by building both mutants
+rather than reading about them.
+
+`REVIEW-M6.md`'s merge banner can come down as far as M5.1 is concerned. One
+thing from that file is still outstanding and is not mine to close:
+`rbench --selftest` was never run, because it rebuilds a corpus on
+`/Volumes/dedupbench` which is outside my fence and was in use by other agents.
+Run it as part of merge verification.
