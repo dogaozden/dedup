@@ -111,7 +111,29 @@ The candidate worktree and oracle clone were both clean afterward.
 Captured stdout from:
 
 ```text
-python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
+python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+'
 ```
 
 Final lines:
@@ -355,3 +377,126 @@ direct control.
   the gate cannot see it; it is a wall-time item, and the port already clears
   §6's targets without it.
 - No cache and no deletion yet; those are M3 and M4.
+
+## 2026-08-22 — M3 (cache) and M4's machinery
+
+### Hypothesis
+
+M3's gate cannot be reached without deletion, so the cache and the removal path
+had to be built together. The risky half is not the sqlite: it is that the
+cache must never become the reason a file is removed. If `verify_attested` is
+right, `m3-poison-refusal` passes; if the racily-clean comparison is `>` rather
+than `>=`, `m3-same-second` fails and nothing else does.
+
+### What happened
+
+Both gates went green on their first run. Details worth recording:
+
+- **Concurrency.** The oracle calls `cache.remember` from inside its thread
+  pool and relies on the GIL. Rather than lock the cache, `split_identical`
+  returns the digests it learned alongside the runs it settled, and the caller
+  applies them serially. Cache access is therefore single-threaded everywhere,
+  and `hash_stage` keeps the oracle's shape: look everything up before the
+  reads are dispatched, remember afterwards.
+- **The racily-clean comparison is `>=`, not `>`.** A row is trusted only when
+  `mtime_ns / 1e9 < cached_at`. The unit test
+  `a_row_one_tick_older_than_the_scan_is_trusted` pins the boundary from the
+  other side with an mtime of 99.999999999s against a row written at 100.
+- **A racy row is dropped whole.** Every column was taken in the same scan and
+  is suspect together, so `get` removes the row rather than clearing one
+  column. `a_racily_clean_row_is_dropped_whole_rather_than_re_stamped` checks
+  that a `Full` digest disappears when the `Ends` column is the one asked for.
+- **`uid()` shells out to `id -u`.** `libc::getuid` would be one call, but §7
+  confines `unsafe` to the bulk-walk FFI module and this is not that module. It
+  is a subprocess on the same footing as the `diskutil` the oracle already
+  runs, called once, with the owner of `$HOME` as a fallback.
+- **Trash moves use `rename`, with copy-then-remove as a fallback.** Within a
+  volume a rename is atomic, and the Trash is by construction on the file's own
+  volume, so the fallback should be unreachable — but losing a file to a failed
+  rename is not an acceptable failure mode for this tool.
+
+### Numbers
+
+```text
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+4 check(s), 0 failed
+gate m3: green
+```
+
+The warm scan reads 0.0 MB against a cold scan's 13.0 MB, well inside the 5%
+ceiling. `mixed` is 51 files: the small ones are settled from remembered
+whole-file digests per size class, and the staged ones never open because
+`attested_runs` finds every member's full digest.
+
+### M4 deletion, verified independently — see the open question below
+
+The M4 gate is **not run** (fence, below). What I could check without it, I
+did, on trees built into the session scratchpad by the harness's own
+`trees.py`, judged against each tree's construction record rather than against
+the oracle — the same rule `run.py:533` uses:
+
+```text
+  deletion/oracle          pass (12 removed, 12 trashed, exit 0)
+  deletion/candidate       pass (12 removed, 12 trashed, exit 0)
+  links/oracle             pass (2 removed, 2 trashed, exit 0)
+  links/candidate          pass (2 removed, 2 trashed, exit 0)
+
+4 check(s), 0 failed
+```
+
+That is `gate_deletion`'s two local checks reproduced: nothing outside the
+victim set removed, no victim left behind, every removed name in the Trash,
+and the oracle run beside the port on its own copy of the same tree with its
+own HOME. On `links` both implementations remove exactly 2 records — the
+hardlink cluster pinned by a name outside the tree survives, as it must.
+
+The flag surface the gate does not reach:
+
+```text
+--- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+```
+
+### Open question — the M4 gate and the fence
+
+My instructions carry an absolute fence: never touch `/Volumes`, never run any
+binary against anything under it. The harness's third M4 check, `gate_trashes`
+(`run.py:605`), creates an 80 MB disk image, mounts it at `/Volumes/dedupconf`,
+builds a tree on it and runs the candidate against that root with
+`--auto shortest -y`, so files are read and deleted under `/Volumes`. There is
+no way to ask for the other two M4 checks alone, and REWRITE.md §0 forbids
+editing the harness.
+
+The mount table shows no drive called "My New Passport" — the fence's named
+target — but it does show a `/Volumes/dedupbench` image belonging to somebody
+else's work on this machine, which I have not touched. I have referred the
+decision up rather than deciding it myself, and the m4 gate stays unrun until
+it comes back. Nothing about the cross-volume Trash path is verified by the
+referee at this point; the code for it is `trash_dir_for`, and the only thing
+that exercises it is a second volume.
