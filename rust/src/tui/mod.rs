@@ -24,8 +24,14 @@ use ratatui::Terminal;
 use crate::cache::ScanCache;
 use crate::compare::Compare;
 use crate::pipeline::{DupGroup, ProvenGroups, Scan};
+use crate::sys;
 use crate::trash::{oracle_mtime, report_refusals, run_selected, Removed};
 use crate::walk::FileRec;
+
+/// How long to wait for a keystroke before going round the loop again. Long
+/// enough that an idle browser is doing nothing measurable, short enough that a
+/// window resized while nobody is typing redraws while they are still looking.
+const WAIT_FOR_KEY: std::time::Duration = std::time::Duration::from_millis(250);
 
 use model::{human_count, human_size, Browser, Group, Key, Mark, Member, Mode, Outcome, Step};
 
@@ -90,14 +96,31 @@ pub fn run(
     // No explicit restore here: `draw_and_read` holds a drop guard that covers
     // every way out of it, and a second mechanism beside it only makes a reader
     // wonder which one is load-bearing.
-    let outcome = draw_and_read(&mut browser, scan, context, cache, &mut refused);
-
-    if let Err(error) = outcome {
-        eprintln!("dedup-rs: {error}");
-        return 1;
+    match draw_and_read(&mut browser, scan, context, cache, &mut refused) {
+        Err(error) => {
+            eprintln!("dedup-rs: {error}");
+            1
+        }
+        // Nothing is printed here on purpose: the summary's destination is the
+        // thing that just went away, and `println!` on a dead terminal panics.
+        Ok(Ended::TerminalGone) => 1,
+        Ok(Ended::Quit) => {
+            summarise(&browser, &scan.records, &refused);
+            0
+        }
     }
-    summarise(&browser, &scan.records, &refused);
-    0
+}
+
+/// How the loop ended. The two are told apart only so the caller knows whether
+/// there is still anybody to print the summary to.
+enum Ended {
+    Quit,
+    TerminalGone,
+}
+
+/// Whether the terminal has gone away, asked without waiting for anything.
+fn hung_up() -> bool {
+    sys::wait_for_terminal_input(std::time::Duration::ZERO) == sys::Input::HungUp
 }
 
 /// The loop itself, with the terminal held by a guard so every way out of it
@@ -108,20 +131,45 @@ fn draw_and_read(
     context: &Compare,
     mut cache: Option<&mut ScanCache>,
     refused: &mut Vec<DupGroup>,
-) -> io::Result<()> {
+) -> io::Result<Ended> {
     enable_raw_mode()?;
     let _restore = Restore(put_the_terminal_back);
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
 
-    loop {
+    let ended = loop {
         // The frame that was actually painted decides what the browser will
         // act on next: below the layout minimum the paint layer draws a resize
         // message instead of the browser, and the model refuses to act on a
         // screen that was never drawn.
-        let painted = terminal.draw(|frame| view::draw(frame, browser))?.area;
+        let painted = match terminal.draw(|frame| view::draw(frame, browser)) {
+            Ok(frame) => frame.area,
+            // A paint that fails on a terminal which has since hung up is that
+            // terminal dying, not a fault. Whether the write or the wait below
+            // notices first is a matter of timing, and both mean the same
+            // thing; a genuine error on a terminal that is still there is
+            // still an error.
+            Err(error) => {
+                if hung_up() {
+                    break Ended::TerminalGone;
+                }
+                return Err(error);
+            }
+        };
         browser.resize(painted.width, painted.height);
+        // Ask the descriptor before crossterm does. A terminal that has gone
+        // away is readable forever and empty forever, and crossterm answers
+        // that by looping inside `read` — no error comes back, so `?` below
+        // never gets the chance to fire. Leaving here is the difference
+        // between an orphaned browser exiting and one spinning on a core.
+        match sys::wait_for_terminal_input(WAIT_FOR_KEY) {
+            sys::Input::Ready => {}
+            sys::Input::HungUp => break Ended::TerminalGone,
+            // Nothing typed. Round the loop to repaint, which is also how a
+            // window that was resized while idle gets its new size.
+            sys::Input::Waited => continue,
+        }
         let event = event::read()?;
         let Event::Key(key) = event else { continue };
         // Windows sends a release for every press; acting on both would double
@@ -159,9 +207,20 @@ fn draw_and_read(
             other => other,
         };
         if step == Step::Quit {
-            return Ok(());
+            break Ended::Quit;
         }
+    };
+
+    if matches!(ended, Ended::TerminalGone) {
+        // `Terminal`'s own `Drop` tries to show the cursor and, when it cannot,
+        // `eprintln!`s about it — which panics when the descriptor it would
+        // print to is the terminal that just died. There is no cursor to put
+        // back on a terminal that is gone, so that work is skipped rather than
+        // attempted and mourned. The guard above still runs, and still restores
+        // a terminal that is really there.
+        std::mem::forget(terminal);
     }
+    Ok(ended)
 }
 
 /// Ask `trash` to remove what is marked.

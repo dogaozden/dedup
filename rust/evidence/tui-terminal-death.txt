@@ -1,0 +1,20 @@
+=== TUI terminal-death: does the browser leave when its terminal dies? ===
+date: 2026-08-23 12:13:29 EDT
+host: macOS 26.5.1, load 3.20 5.04 4.67
+script: evidence/scripts/tui-terminal-death.py
+
+--- BEFORE the fix (823e87c, the round-1 merge, built in a scratch worktree) ---
+dedup-rs: /private/tmp/dedup-prefix/rust/target/release/dedup-rs
+  keys    PASS  'q' quit the browser in 0.63s, exit 0
+  hangup  FAIL  still running 5s after the terminal died, 5.05 CPU-seconds in that window — SPINNING
+
+1 scenario(s) failed
+script exit: 1
+
+--- AFTER the fix (working tree) ---
+dedup-rs: /Users/dogaozden/AI_Projects/dedup/rust/target/release/dedup-rs
+  keys    PASS  'q' quit the browser in 0.63s, exit 0
+  hangup  PASS  left 0.06s after the terminal died, exit code 1, 0.01 CPU-seconds
+
+all scenarios passed
+script exit: 0

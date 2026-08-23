@@ -14,6 +14,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::time::Duration;
 
 /// The BSD device name backing `path` — "disk4s1" and the like — or `None`
 /// for anything `statfs` will not describe.
@@ -336,4 +337,181 @@ pub fn volume_uuid(path: &Path) -> Option<String> {
         &hex[16..20],
         &hex[20..32]
     ))
+}
+
+/// What the terminal has to say to a program about to block on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    /// There are bytes waiting. Reading will return something.
+    Ready,
+    /// The far end is gone, and every read from here on is end-of-file.
+    HungUp,
+    /// Nothing arrived before the timeout.
+    Waited,
+}
+
+/// Wait for input on `fd`, and say whether the far end has hung up.
+///
+/// The browser needs this because `crossterm::event::read` cannot answer it. A
+/// descriptor whose terminal has gone away is *readable* forever and *empty*
+/// forever, and crossterm's Unix source answers that combination by looping on
+/// `read` inside `try_read`: a zero-length read advances no parser, produces no
+/// event, and is not an error, so the loop goes round again. It never returns
+/// and it never fails, which is why no amount of error handling at the call
+/// site catches it — an orphaned browser was measured burning a whole core this
+/// way. `poll` reports the hangup that `read` will not, so the caller can leave
+/// before handing control to a loop it cannot get back from.
+fn wait_on(fd: c_int, timeout: Duration) -> Input {
+    let mut watch = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().min(c_int::MAX as u128) as c_int;
+    // SAFETY: `watch` is one fully initialised `pollfd` and the count says one,
+    // so the kernel writes only its `revents` field, inside storage this frame
+    // owns. An invalid `fd` is reported in `revents`, not undefined behaviour.
+    let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(watch), 1, millis) };
+
+    if ready < 0 {
+        // A signal arriving mid-wait is not news — SIGWINCH does it on every
+        // resize. Anything else means the descriptor cannot be waited on at
+        // all, and leaving is the safe reading of that.
+        let interrupted = std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+        return if interrupted {
+            Input::Waited
+        } else {
+            Input::HungUp
+        };
+    }
+    // Hangup is checked before readability because at end-of-file macOS reports
+    // both at once, and it is the hangup that decides.
+    if watch.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Input::HungUp;
+    }
+    if watch.revents & libc::POLLIN != 0 {
+        return Input::Ready;
+    }
+    Input::Waited
+}
+
+/// The same question asked of the terminal this process was given.
+///
+/// Standard input, specifically, because that is the descriptor crossterm
+/// reads: its `tty_fd` prefers standard input whenever that is a terminal, and
+/// the browser only opens when it is one.
+pub fn wait_for_terminal_input(timeout: Duration) -> Input {
+    wait_on(libc::STDIN_FILENO, timeout)
+}
+
+#[cfg(test)]
+mod terminal {
+    use super::*;
+
+    /// A pty pair, so the readiness under test is a real terminal
+    /// rather than a pipe standing in for one.
+    fn pty() -> (c_int, c_int) {
+        let (mut main, mut follower) = (0 as c_int, 0 as c_int);
+        // SAFETY: both out-parameters are live `c_int` storage this frame owns,
+        // and the four optional arguments are null, which `openpty` documents as
+        // "use the defaults".
+        let rc = unsafe {
+            libc::openpty(
+                std::ptr::addr_of_mut!(main),
+                std::ptr::addr_of_mut!(follower),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+        // `openpty` hands back plain descriptors, which every `fork` in this
+        // binary then copies — and the suite forks `diskutil` and `id`. A child
+        // holding the master means closing ours hangs nothing up, which is
+        // exactly the "terminal is still alive" answer this test exists to
+        // disprove. Close-on-exec is what keeps the pty ours.
+        for fd in [main, follower] {
+            // SAFETY: `fd` was just returned by `openpty`; `F_SETFD` takes an
+            // int and touches nothing else.
+            let flagged = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            assert_ne!(flagged, -1, "{}", std::io::Error::last_os_error());
+        }
+        (main, follower)
+    }
+
+    fn close(fd: c_int) {
+        // SAFETY: `fd` came from `openpty` and is closed exactly once.
+        unsafe { libc::close(fd) };
+    }
+
+    /// The whole point: a far end that has gone away must be reported as gone,
+    /// not as an endless supply of nothing.
+    ///
+    /// The hangup is made with a socket rather than the pty above, because a
+    /// pty's hangup can be postponed by anyone else holding the other end — and
+    /// in this binary somebody does: every `Command` in the suite forks, and a
+    /// child that inherits the master keeps the terminal alive until it exits.
+    /// That made this test fail about a third of the time, always by exactly one
+    /// `diskutil` lifetime. `shutdown` acts on the socket instead of on the
+    /// descriptor count, so no stray child can delay it, and macOS reports it
+    /// with the same `POLLIN | POLLHUP` a dead terminal reports. The terminal
+    /// itself is covered end to end by `evidence/scripts/tui-terminal-death.py`.
+    #[test]
+    fn a_hangup_is_reported_as_a_hangup() {
+        let mut ends = [0 as c_int; 2];
+        // SAFETY: `ends` is two `c_int`s this frame owns, which is exactly what
+        // socketpair fills.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                std::ptr::addr_of_mut!(ends).cast::<c_int>(),
+            )
+        };
+        assert_eq!(rc, 0, "socketpair: {}", std::io::Error::last_os_error());
+        let (near, far) = (ends[0], ends[1]);
+
+        assert_eq!(
+            wait_on(far, Duration::from_millis(50)),
+            Input::Waited,
+            "a live peer with nothing to say is not a hangup"
+        );
+        // SAFETY: `near` is an open socket from the pair above.
+        unsafe { libc::shutdown(near, libc::SHUT_RDWR) };
+
+        assert_eq!(wait_on(far, Duration::from_millis(50)), Input::HungUp);
+        // And it stays that way, which is what made the old loop spin: the
+        // answer never changes and never runs out, so a reader that only knows
+        // how to wait for the next byte waits forever at full speed.
+        assert_eq!(wait_on(far, Duration::from_millis(50)), Input::HungUp);
+        close(near);
+        close(far);
+    }
+
+    #[test]
+    fn a_live_terminal_with_something_typed_at_it_is_ready() {
+        let (main, follower) = pty();
+        // With the newline, because a pty in its default line mode hands
+        // nothing to the follower until the line is finished. The browser puts
+        // the terminal in raw mode and so does not wait for one; this test is
+        // not the browser, and would otherwise be testing the line discipline.
+        let typed = b"q\n";
+        // SAFETY: writing two bytes from a two-byte buffer this frame owns.
+        let written = unsafe { libc::write(main, typed.as_ptr().cast::<c_void>(), 2) };
+        assert_eq!(written, 2);
+        assert_eq!(wait_on(follower, Duration::from_millis(500)), Input::Ready);
+        close(follower);
+        close(main);
+    }
+
+    /// The idle case has to stay idle: a live terminal with nothing typed at it
+    /// is neither ready nor hung up, or the browser would quit on its own.
+    #[test]
+    fn a_live_terminal_sitting_idle_just_waits() {
+        let (main, follower) = pty();
+        assert_eq!(wait_on(follower, Duration::from_millis(50)), Input::Waited);
+        close(follower);
+        close(main);
+    }
 }

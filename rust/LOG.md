@@ -1637,3 +1637,89 @@ SCORE: 0.3251
 `evidence/r1-change3-seed1-default.txt`,
 `evidence/r1-change3-seed2-default.txt`,
 `evidence/r1-selftest-change3.txt`.
+
+## 2026-08-23 — the browser leaves when its terminal does
+
+### Hypothesis
+
+An orphaned `dedup-rs -i` was found burning a whole core for eight hours. The
+brief for it guessed the event read was returning an error or end-of-file
+repeatedly and the loop was treating that as "no event". That guess is wrong,
+and it matters that it is wrong, because the fix it implies is a no-op: the loop
+already writes `event::read()?`, so an error would have left the loop on its
+own.
+
+### What happened
+
+The spin is inside crossterm 0.29, not inside this repository, and it never
+returns to us at all. `UnixInternalEventSource::try_read` loops on `read`; a
+descriptor whose terminal has gone away is *readable* forever and *empty*
+forever, so every pass reads zero bytes, advances no parser, produces no event
+and raises no error, and goes round again. `event::read` never returns and never
+fails. `event::poll` is no better — it reaches the same `try_read` and hangs in
+the same place, before its own timeout is ever consulted.
+
+Measured rather than assumed, on this machine: after a pty's master closes,
+`poll` on the follower reports `POLLIN | POLLHUP` and `read` returns 0 bytes,
+indefinitely. So the hangup is visible to `poll` and invisible to `read`, and
+the only place to catch it is *before* handing control to crossterm.
+
+`sys::wait_on` is that check — `poll(2)` on the descriptor, hangup reported
+before readability because macOS sets both at once and it is the hangup that
+decides. The browser's loop asks it first and leaves when the answer is
+`HungUp`. Crossterm reads standard input itself whenever standard input is a
+terminal (`tty_fd`), and the browser only opens when it is one, so this polls
+the very descriptor crossterm is about to read — not a proxy for it.
+
+Two things fell out of doing it:
+
+- The loop now waits with a timeout (250 ms) rather than blocking forever, so a
+  window resized while nobody is typing still redraws. An idle repaint is a
+  buffer diff that writes nothing.
+- A paint can notice the death before the wait does, and did: the failing
+  `terminal.draw` was returning an error, `run` was `eprintln!`-ing it at a
+  terminal that no longer existed, and `println!` on a dead descriptor panics.
+  Both endings now converge on the same silent exit 1. `Terminal`'s own `Drop`
+  panics the same way — it tries to show the cursor and `eprintln!`s when it
+  cannot — so on that path the value is dropped without running it. There is no
+  cursor to restore on a terminal that is gone. The `Restore` guard still runs,
+  and still restores a terminal that is really there.
+
+### Numbers
+
+`evidence/scripts/tui-terminal-death.py` drives the real binary on a real pty,
+in the shape the bug lives in: the pty is the child's standard input but *not*
+its controlling terminal. That distinction is the reason the bug is invisible
+from an ordinary shell — with a controlling terminal the kernel sends SIGHUP
+when the master closes and the process dies of that instead.
+
+Same script, both binaries (`evidence/tui-terminal-death.txt`):
+
+| | before (`823e87c`) | after |
+|---|---|---|
+| `keys` — `q` still quits | PASS, 0.63 s, exit 0 | PASS, 0.63 s, exit 0 |
+| `hangup` — terminal closed | **FAIL: still running after 5 s, 5.05 CPU-seconds — SPINNING** | PASS: left in 0.06 s, exit 1, 0.01 CPU-seconds |
+
+The `keys` scenario is not decoration. A browser that had stopped reading input
+altogether would also have stopped spinning, and would have passed a test that
+only watched the hangup.
+
+`cargo test`: 111 passed, 0 failed. Four of those are new, in `sys`.
+
+### One that was harder than it looked
+
+The first hangup test used a pty and failed about a third of the time in the
+suite while passing alone. It was not fd recycling, which was the first guess
+and wrong. Instrumenting it showed the hangup arriving late by exactly one
+`diskutil` lifetime (114 ms): every `Command` in this binary forks, a forked
+child inherits the pty master, and the terminal is not gone while a child still
+holds it. `FD_CLOEXEC` on the pty narrowed the window but could not close it —
+`posix_spawn` can land between `openpty` and the `fcntl`. The test now makes its
+hangup with `socketpair` and `shutdown`, which acts on the socket rather than on
+the descriptor count and so cannot be postponed by a stray child, and which
+macOS reports with the same `POLLIN | POLLHUP` a dead terminal reports. 20
+consecutive suite runs, no failures. The terminal itself is covered end to end
+by the script above, which is where a real pty belongs.
+
+**Verdict:** KEPT. Touches approved M5 code; the diff is the `poll` call, the
+two endings converging, and the skipped cursor restore.
