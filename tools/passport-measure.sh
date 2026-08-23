@@ -27,6 +27,11 @@ log ""
 log "== walk only (metadata seeks) =="
 log "-- find, cold-ish:"
 ( time find "$TREE" -type f | wc -l ) 2>&1 | tee -a "$OUT"
+NFILES=$(find "$TREE" -type f | wc -l | tr -d ' ')
+if [[ "$NFILES" -lt 100 ]]; then
+  log "WARNING: only $NFILES files in this tree — too small to measure anything."
+  log "Pick a subtree with thousands of files (2-10 GB) and rerun."
+fi
 
 run_scan() {  # run_scan <label> <extra flags...>
   local label="$1"; shift
@@ -41,14 +46,14 @@ run_scan() {  # run_scan <label> <extra flags...>
 # or SKIP_SPIN=1 to do one half at a time. Same-session back-to-back runs
 # share the page cache — still informative, but say so when reading results.
 
-[[ "${SKIP_FLASH:-0}" = 1 ]] || run_scan "flash profile (current default behavior)" --profile flash --min-size 1m
-[[ "${SKIP_SPIN:-0}"  = 1 ]] || run_scan "spinning profile" --profile spinning --min-size 1m
+[[ "${SKIP_FLASH:-0}" = 1 ]] || run_scan "flash profile (current default behavior)" --profile flash --min-size 1048576
+[[ "${SKIP_SPIN:-0}"  = 1 ]] || run_scan "spinning profile" --profile spinning --min-size 1048576
 
 log ""
 log "== warm re-scan (cache on) =="
 log "$ dedup <tree> --list   (twice; second one shows the cache)"
-( time "$BIN" "$TREE" --list --min-size 1m >/dev/null ) 2>&1 | tee -a "$OUT"
-( time "$BIN" "$TREE" --list --min-size 1m >/dev/null ) 2>&1 | tee -a "$OUT"
+( time "$BIN" "$TREE" --list --min-size 1048576 >/dev/null ) 2>&1 | tee -a "$OUT"
+( time "$BIN" "$TREE" --list --min-size 1048576 >/dev/null ) 2>&1 | tee -a "$OUT"
 
 log ""
 log "== done — results in $OUT =="
