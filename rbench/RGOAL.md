@@ -1505,6 +1505,77 @@ the pivot comparison above.
 
 ---
 
+## 2026-08-23 — a measurement correction, then three more inside the floor
+
+**First, a correction to my own probes, because it changed a conclusion.**
+The C programs I used to establish "the tool is at the syscall floor" handed
+work out through a mutex, one file per lock pair — 50,000 of them on `needle`.
+The tool uses rayon with 64-file batches. Re-run with a batched handout and no
+per-file lock, `widegroup`'s 452 MB reads in **0.0133 s (35.6 GB/s)** where my
+earlier probe said 0.0337 s (14.2 GB/s). **My floor was 2.5x too pessimistic**,
+which is how "the tool is faster than a bare C loop" happened — it was not;
+my C loop was slow. `typical` survives the correction (13,372 opens in
+0.1018 s, 7.61 µs each, against 7.80 µs from the batched probe) and is on the
+floor. `widegroup` did not, and the parallel pivot compare above came out of
+noticing that.
+
+**A probe is a claim too.** It gets the same scepticism as the tool.
+
+### 1. Clamping the compare's allocation to what the file can give
+
+`read_block` allocates what it is asked for, and the compare asks for `span`.
+I expected that to be `CHUNK`, four megabytes, against a `widegroup` member of
+a quarter of one — and measured in C that allocating 4 MB per 247 KB file
+costs **2.45x** (0.0346 s against 0.0849 s). It is not four megabytes.
+`compare_chunk` is `MIN_CHUNK.max(CHUNK.min(COMPARE_BUDGET / members))`, so a
+227-member group gets **564 KB**, and the over-allocation is 2.3x rather than
+16x. Clamped it anyway and measured: candidate times **0.1247 s against
+0.1258 s** on `widegroup` and 0.0987 against 0.0977 on `typical` — identical.
+Reverted.
+
+Worth keeping the arithmetic in mind: the budget divides the chunk by the
+group width, so wide groups already read in small pieces.
+
+### 2. More readers for the compare
+
+The jobs curve on `widegroup`, current branch: 352.55 ms at one reader,
+123.82 at eight, 120.23 at twelve, 118.37 at sixteen, 117.19 at
+twenty-four. **Five percent for three times the threads**, which is under the
+floor on one scenario and worth about 0.7% of the geomean. Not taken.
+
+That curve says something more useful than its own answer. By Amdahl, one
+reader at 352.55 ms against twenty-four at 117.19 puts **about 30% of
+`widegroup`'s work on one thread**, and that serial third is not an oversight:
+the groups are processed one at a time because doing eight at once would hold
+8 × 227 × 564 KB — a gigabyte — against a `COMPARE_BUDGET` of 128 MB. The
+memory budget forces it.
+
+### 3. A wider pool for the walk
+
+`rescan` is walk-bound, so the walk pool's width is worth checking rather than
+assuming. Sweeping it:
+
+```
+  walk pool     rescan     typical
+      4        10.20 ms    97.01 ms
+      6        11.53 ms    95.97 ms
+      8        12.94 ms    98.49 ms
+     10        13.49 ms    97.72 ms
+```
+
+Four — a reader per performance core — is best, and it degrades steadily from
+there. The existing sizing was already right, which is the answer even though
+it is not a win.
+
+*(The first attempt at this sweep produced four identical numbers because a
+regex broke the build each time and every run measured the same stale binary.
+Four results that agree perfectly are a reason to check the build, not to
+believe them.)*
+
+**Three consecutive ideas inside the floor. This is the stop under §12.**
+
+---
+
 ## 12. The loop, and when to stop
 
 For each idea:
