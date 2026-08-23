@@ -1,5 +1,15 @@
 # REVIEW-M5.md — maintainer review of the M5 claim
 
+> **CURRENT VERDICT: APPROVED** — 2026-08-23 re-review at `f732400`, appended at
+> the end of this file. Both binding items are fixed and independently
+> re-verified against the recipes below, and the largest non-binding hole — that
+> nothing tested the browser's re-read of a cache-attested group — is closed
+> with a test I confirmed is load-bearing by building a mutant. Everything from
+> here to the re-review is the original CHANGES review, kept intact as the
+> audit trail.
+
+## Original review (verdict superseded)
+
 **Verdict: CHANGES**
 
 Claim commit `67c7e65`, reviewed at tip `ec0c9a6`. Implementation is `020b73c`
@@ -418,3 +428,233 @@ token carried into a second entry point, the guard that counts what will be on
 disk rather than what is in a list, and the refusal of a whole request rather
 than most of it are all the harder choice over the easier one, and they hold up
 under everything I could throw at them.
+
+---
+
+---
+
+# Re-review — 2026-08-23, at `f732400`
+
+**Verdict: APPROVED**
+
+Fixes in `612d3dd`, re-claim in `f732400`, clean tree. I re-ran both binding
+recipes exactly as they were written above, before reading how the fixes were
+implemented, so the verification was not shaped by the implementation.
+
+---
+
+## Item 1 — the bulk rule ranked a string built for drawing: **fixed**
+
+Recipe: *build `tree/b.bin` and `tree/photos/aaaa.bin` with identical bytes, run
+the browser from `tree/photos` with `b`, `3`, ENTER, `y`, and require the
+survivor to be the same file `--auto shortest` keeps from that same directory.*
+
+```
+=== A: bulk 'keep the shortest path' vs --auto shortest, cwd inside root ===
+    browser survivors: ['b.bin']
+    --auto survivors: ['b.bin']
+    browser and --auto keep the same copy: ['b.bin'] ok
+```
+
+Was `['photos/aaaa.bin']` against `['b.bin']`. They now agree, and they agree on
+the right file — the shortest name in the scan, which is what the menu says it
+keeps.
+
+The fix is the structural one, not the local one. `Member` carries two strings
+with the roles named — `name`, the scan's own path relative to the root, and
+`path`, "What to draw. Never compared, never ranked, never a keeper"
+(`model.rs:40-48`) — and `apply_bulk` reads `name` (`model.rs:280`). The two
+comments that asserted the old invariant were false when written and now state
+what is true (`trash.rs:65-68`, `model.rs:269-273`). The second half of the
+model test is what makes it a real test: it runs the same group again with the
+display strings swapped and requires the same copy to survive
+(`model.rs:704-745`), so the assertion is "what is drawn cannot change what
+dies" rather than "this particular pair sorts this way."
+
+## Item 2 — below 54×12 the confirmation was not drawn and `y` still deleted: **fixed**
+
+Recipe: *drive the browser on a 20×8 pty with `space`, ENTER, `y` and require
+that either both copies are still on disk, or the frame that was painted
+contains the count, the byte total and the mode.*
+
+```
+=== J: a terminal too small to lay out, and the way back out of it ===
+    nothing was deleted from a screen nobody could read: ['a.bin', 'b.bin'] ok
+    terminal: raw released / alt left / left last: True ok
+painted at 20×8:   'Terminal too small' True · 'Confirm' False · 'Reclaims' False
+```
+
+Was `['b.bin']` — one copy deleted. Both survive now.
+
+The builder took the refuse-below-minimum option and gave a better reason for it
+than my recipe required: at 20×8 a clipped dialog cannot fit "Move to Trash: 1
+files" at all, so drawing the overlay anyway would satisfy "a dialog was drawn"
+while still deleting on numbers nobody could read (`LOG.md`, fix round §2). I
+agree, and it is the reading of hard rule 3 I would have argued for.
+
+The minimum moved into `model.rs:12-20` and the paint layer now reads it from
+there (`view.rs:15`), so the number that decides what is drawn and the number
+that decides what is obeyed cannot drift apart — which was the actual defect,
+one step up. `Browser::legible` is set from the area of the frame that was
+really painted, every iteration, before the key is read (`tui/mod.rs:119-124`),
+and `on_key` takes nothing but `Quit` below it (`model.rs:302-315`). I checked
+the recovery path myself rather than assuming it: a resize event falls through
+to the next `terminal.draw`, which re-measures, so a user who makes the window
+bigger gets the browser back — and the unit test asserts exactly that round trip
+including that the pending confirmation is live again afterwards
+(`model.rs:806-809`). Boundary confirmed on both sides: 54×12 paints the full
+browser and the confirmation, 53×11 paints the resize message.
+
+---
+
+## The non-binding notes, and what became of them
+
+Four of the five were taken. The one I care about is the first.
+
+**The attested-group hole is closed, and I verified the test is load-bearing
+rather than taking the claim.** New end-to-end case 9
+(`m5_end_to_end.py:326-381`) warms the cache on two 24 MB copies, poisons one
+byte in the *middle* and restores the mtime, so head, tail and every sample
+point still match, then requires the scan to report the group having read
+almost nothing and the browser to re-read, refuse and say why. Against the real
+binary:
+
+```
+=== a group the cache vouched for is re-read, disbelieved and refused ===
+    the scan still grouped them: 1 (ok)
+    the scan read 0 bytes to do it
+    survivors: ['a.bin', 'b.bin'] (ok)      trash: [] (ok)
+    said it was refusing, and why: True
+0 check(s) differing          (10 scenarios)
+```
+
+Zero bytes read at scan time is the proof the group was believed rather than
+seen, so the case genuinely reaches the disbelieve path.
+
+Then the mutation, which I ran myself. I copied the tree to scratch, deleted the
+`verify_attested` block from `run_selected` — the exact lines the original
+review said nothing covered — built that mutant, and ran the repository's own
+end-to-end suite against it:
+
+```
+=== a group the cache vouched for is re-read, disbelieved and refused ===
+    the scan read 0 bytes to do it
+    grouped without reading them: True
+    survivors: ['a.bin'] (DIFFERENT)
+    trash: ['b.bin'] (DIFFERENT)
+    said it was refusing, and why: False
+3 check(s) differing
+```
+
+Three differing checks, all of them in case 9, every other scenario still green
+— and the mutant put `b.bin`, the copy that had stopped matching, in the Trash.
+That is the data loss the re-read prevents, now caught by a test that fails when
+the guard is removed. The builder's account of this matches what I observed
+independently.
+
+The rest: `Mark { group, record }` replaces the bare pair (`model.rs:22-31`),
+and the LOG is honest that this does not make a screen position
+*unrepresentable* — only a distinct type for record indices would, which is
+wider than a fix round should carry. I agree with that judgment. The redundant
+second `put_the_terminal_back` is gone. `m5_standards.sh` now exists beside the
+transcript it generates. The hardlink count wrinkle is recorded as inherited
+parity so nobody "fixes" it into a divergence.
+
+---
+
+## Independent re-verification
+
+Everything below is my own run at `f732400`, not a re-reading of the claim.
+
+```
+$ cargo fmt --check                                          EXIT=0
+$ CARGO_TARGET_DIR=<scratch> cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile ... in 8.25s                      EXIT=0   (24 crates, cold)
+$ cargo test
+test result: ok. 105 passed; 0 failed; 0 ignored               EXIT=0
+$ python3 conformance/run.py --gate all --candidate '...'
+33 check(s), 0 failed        gate all: green                   EXIT=0
+$ python3 rust/evidence/scripts/m5_end_to_end.py <bin> <scratch>
+0 check(s) differing         (10 scenarios)
+$ <my own 11-case adversarial harness, unchanged from the first review>
+0 check(s) differing         (was 2)
+```
+
+The eleven cases in my harness are the ones the original review ran: the bulk
+rule, an attested group, marking every copy, the two-round mark identity, a
+hardlink cluster, a record pinned from outside the tree, bulk against a pinned
+copy, quit and cancel, `--hard` placement, the too-small terminal, and the two
+no-terminal paths. All eleven pass now; the two that differed are items 1 and 2.
+
+`105` is the number of `#[test]` attributes in `src/`, and the 101 → 105 delta is
+four new model tests, which is what the claim says.
+
+One correction to my own review, since it was wrong and the builder caught it:
+"the screens transcript will move" — it did not, and `LOG.md` explains why.
+The explanation is checkable and true: `m5_screens.py` spawns the browser with
+`cwd=root` (`m5_screens.py:119`), where the scan name and the display name are
+the same string, and it only opens the bulk menu to photograph it
+(`m5_screens.py:155`) without applying a rule. A byte-identical transcript was
+the correct outcome there, not a sign the binary was not rebuilt.
+
+Claim hygiene: every fenced block in the re-claim is byte-identical to the
+evidence file it quotes, every command runs as written from the directory named,
+and the numbers reproduce under my own runs. `m5-standards.txt` now has a
+generator whose output format matches it.
+
+---
+
+## Residual findings
+
+None blocking; recorded so the next person does not rediscover them.
+
+1. **The deletion core now imports from the UI module.** `trash.rs:20` is
+   `use crate::tui::model::Mark;`, while `model.rs:10` is
+   `use crate::trash::Rule;`. Rust is happy with mutually dependent modules and
+   nothing is wrong, but `Mark` describes a group and a record in *the scan*,
+   not anything about a screen, and the rest of this design is careful about
+   which way the arrows point. If it is ever touched again, `Mark` belongs
+   beside `ProvenGroups` or in `trash`, and then `tui` depends on the deletion
+   machinery and nothing depends back.
+2. **The `debug_assert!(browser.legible())` in the event loop
+   (`tui/mod.rs:137`) is compiled out of release builds.** It documents the
+   invariant rather than backstopping it. That is fine — the real guard is
+   `on_key`'s early return, which is in every build and is what my 20×8 run
+   exercised — but nobody should read that line as a runtime safety net.
+3. **The below-minimum key refusal is a real divergence from the oracle**, which
+   keeps accepting keys on a terminal too small to draw on. It is explained in
+   `LOG.md`'s fix-round section against the oracle's behaviour, which satisfies
+   M5-TUI.md's "note each such divergence", but it is not in the earlier
+   "Divergences from the curses oracle, and why" list where a reader will look
+   for it. A cross-reference would be tidier.
+4. `612d3dd` also set the executable bit on nine `.py` files under
+   `evidence/scripts/` with no content change and no mention in either document.
+   Harmless and visible in `git show --summary`; noted only because an
+   undisclosed mode change is the kind of thing that costs someone ten minutes
+   later.
+5. `LOG.md`'s numbers table says "CLI dispatch … 0 differing". `m5_dispatch.py`
+   computes no such counter — it prints "every case left both files where they
+   were" and exits non-zero on a survivor check. The substance is true; the
+   phrasing reads as a quotation of something the script never printed.
+
+---
+
+## Ruling
+
+**M5 is APPROVED.** Both binding items are fixed at the level the review asked
+for rather than at the level that would have made the symptom go away: item 1 by
+giving the two strings different names and different jobs, item 2 by moving the
+number that decides what is drawn to where the decision to obey is made. The
+deletion path is unchanged in substance and still holds under everything in my
+harness, the gate is green, and the scanning core remains byte-identical to
+pre-M5 apart from a `Mark` import.
+
+The part worth saying plainly is the test. The original review's largest
+non-binding note was that a guard could be deleted with 101 tests and 33 gate
+checks still green — the exact shape of hole that only bites long after the
+milestone is signed off. The response was not to add a test that passes, which
+is easy, but to add one and then prove it fails when the guard goes, which is
+the only thing that makes a test a guard rather than a decoration. I rebuilt
+that mutant myself rather than take it on trust, and it fails the way the LOG
+says it does. That is the standard this project should hold for anything that
+protects a file from being deleted.
