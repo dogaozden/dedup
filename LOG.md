@@ -798,3 +798,161 @@ could not: `gate_trust` → `poison_refusal` (`run.py:494-522`) runs
 gate cannot go green until M4's deletion machinery exists. Deletion was
 therefore built second and the cache third. This is a property of the harness,
 not a change of plan, and the claims are in spec order regardless.
+
+## 2026-08-22 — REVIEW-M2 and REVIEW-M4 fix round
+
+### Hypothesis
+
+Seven binding items across two reviews. Six were straightforward; one was the
+kind of defect that should change how I work, not just what the code does.
+
+### The one that mattered
+
+REVIEW-M4 item 1: `--stage size --auto` deleted files that were not duplicates,
+permanently, having read no bytes of any of them. The reviewer reproduced it and
+lost two files with provably different contents.
+
+The mechanism is embarrassing in how ordinary it is. I added `--stage size` to
+satisfy the M1 gate, mirrored `oracle_driver.py`'s `size_stage` faithfully, and
+did not read the next four words of the driver — `and args.stage == "full"` on
+the line that dispatches deletion. I checked what the flag did to the *report*.
+I never asked what it did to the *other flags*, on a tool whose job is removing
+files.
+
+REWRITE.md §3.1 says nothing is deleted on the strength of a hash or a sample.
+This was weaker than a hash: it was `st_size`. And no gate could see it, because
+`gate_walk` passes `--stage size` but never `--auto`, and `gate_deletion` passes
+`--auto` but always with `{stage}` empty. The two only meet on a command line a
+person types.
+
+I took the structural fix rather than the string comparison, because the string
+comparison is exactly the thing I had already proved I would forget.
+`Scan::groups` is private; it leaves the struct through `reported()` for the
+protocol report, where a size bucket is an honest answer, or through `proven()`,
+which returns `None` for a size-only scan. `run_auto` takes a `ProvenGroups`
+token whose field is private to `pipeline`, so no other module can mint one. The
+deletion path does not type-check with unproven groups. `--stage size --auto`
+exits 2 and says why.
+
+The lesson generalises past this bug: when a new mode changes what a *group*
+means, the deletion path is the first place to look, not the last.
+
+### The other six
+
+- **`--auto newest` kept the wrong copy on a tie.** Rust's `max_by_key` returns
+  the last maximum; Python's `max` returns the first. Members arrive
+  shortest-name-first, so the oracle kept the shortest-named copy and this kept
+  the longest-named one. Reversing the comparator and taking the minimum gets
+  the first maximum. `min_by_key` already matched, which is why only `newest`
+  was wrong — the sort of asymmetry that survives casual reading.
+- **The keep rules compared a finer clock than the oracle can see.** The oracle
+  compares `st_mtime`, a float64, which resolves about 240 ns at current epoch
+  values; this compared `mtime_ns`. Files a nanosecond apart were tied there and
+  ordered here, so the tie-break picked different survivors. I chose parity over
+  the better-in-isolation nanosecond comparison: which copy survives is the
+  whole user-visible contract of a keep rule and §0 makes the oracle
+  authoritative. **The divergence that remains, deliberately:** `mtime_ns` is
+  still what the cache key and the retained-bytes revalidation compare, where
+  being stricter than the oracle only ever means reading more, never deleting
+  more.
+- **Memory: 280 B/file against §6's 230.** Three genuine per-file wastes, not
+  an accounting dispute. The walk built an `Entry` list and then a `FileRec`
+  list beside it, so every surviving file existed twice at peak; the walk now
+  builds records directly and `candidates` compacts them in place with a write
+  index. The report cloned every reported path into a `Vec<Vec<String>>` and
+  then serialised that into a second `Vec<u8>`; it now borrows the paths and
+  writes straight to the file. And `head`/`tail` were two always-present
+  `Vec<u8>`s costing 48 bytes on every record, when only records reaching stage
+  3 ever carry any; they are one `Option<Box<Retained>>`, 8 bytes.
+
+  ```text
+  minimum of three runs each, marginal cost over 50,000 extra files
+
+names              50,000 files  100,000 files     B/file
+16 characters          19906560       27672576      155.3
+44 characters          21463040       30425088      179.2
+
+REWRITE.md §6 budget: 230 bytes per file record
+```
+
+  **REVIEW-M2 was right that LOG.md said the opposite of the truth.** The
+  earlier entry claimed total RSS above the budget was "the walk's entry list
+  and one batch of read buffers ... constants in the file count". The read
+  buffers are constant. The entry list was O(files) and was the single largest
+  reason the figure was 280. That sentence was wrong and I have not left it
+  standing.
+- **The glob engine backtracked exponentially.** REVIEW-M1 raised it as
+  non-binding; I carried it forward and, worse, wrote a comment asserting it was
+  handled. It was not: `(0..=text.len()).any(|i| inner(&tokens[1..], &text[i..]))`
+  *is* the exponential backtrack. 121 seconds on one 40-character name against
+  fnmatch's third of a second. It is now a bottom-up fill over (token index,
+  character index) — each pair decided once, O(tokens x characters) — with the
+  reviewer's three patterns as a test that fails over a second. A comment
+  claiming a property the code does not have is worse than no comment, and this
+  one cost a review cycle.
+- **The quoted gate commands could not be run.** A scripted find-and-replace
+  expanded `evidence/m4-flags.txt` into the literal `{flags}` token in four gate
+  commands. Restored, and I copied the M2 command out of MILESTONES.md and ran
+  it unmodified rather than eyeballing it. The hazard is general: writing
+  documentation by templated substitution puts every brace-delimited token in
+  the document at risk, and the tokens in this project's commands are
+  brace-delimited by design.
+- **Non-binding notes, all taken.** `sample_points` asserts the precondition
+  that keeps its subtraction in range; the `sha2` dependency list is corrected
+  from three crates to the actual eight; and the `getattrlistbulk` deferral now
+  names M5, which REVIEW-M1 item 6 asked for and I answered vaguely the first
+  time.
+
+### Verification
+
+Everything re-run from a clean rebuild at this commit.
+
+```text
+$ cargo clean && cargo build --release
+     Removed 2799 files, 389.3MiB total
+   Compiling dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-rs)
+    Finished `release` profile [optimized] target(s) in 53.68s
+build exit: 0
+
+$ cargo test
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.60s
+clippy exit: 0
+$ cargo fmt --check
+fmt exit: 0
+```
+
+| check | exit |
+|---|---|
+| `--gate m2` | 0 |
+| `--gate m3` | 0 |
+| `--gate m4` | 0 |
+| `--gate all` | 0 — 33 checks, 0 failed |
+| differential trees, 42 checks | 0 differing |
+| differential cache, 4 trees both directions | 0 differing |
+| keep rules, 12 rule/tie combinations | 0 differing |
+| local deletion checks | 0 failed |
+
+Fence: `ls /Volumes` before each gate run showed only `dedupbench`, which is
+another project's, and the stray `]` entry that appears in no mount table.
+`/Volumes/dedupconf` was touched only through the harness. `/Volumes` was
+unchanged afterwards.
+
+### A working-practice note worth recording
+
+The session scratchpad at
+`/private/tmp/claude-501/.../scratchpad` is **shared between agents on this
+machine**. Part-way through this round I re-ran what I thought was my own
+differential harness and got a report in a format I did not write: another
+agent had written a file of the same name over mine. Nothing was corrupted in
+the repo, and the replacement script's two differences turned out to be the
+exit-code artifact REVIEW-M2 had already ruled benign — but the evidence in this
+repo should not depend on a file anyone can overwrite. Every harness that
+produces something quoted in a claim now lives in `evidence/scripts/` and is
+re-runnable from the repo. The perf corpus is rebuilt under a name of my own for
+the same reason.

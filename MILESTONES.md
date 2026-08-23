@@ -36,16 +36,15 @@ gate m1: green
 
 ```
 
-## M2 — pipeline parity — CLAIMED
+## M2 — pipeline parity — RE-CLAIMED after REVIEW-M2 CHANGES
 
 Stages 3 to 5 complete: the two-tier small-file stage, the one-open end probe,
 the deep-head remainder, sample windows past `SAMPLE_SPAN`, and a wave-based
 lockstep byte comparison that reuses the head and tail bytes stage 3 kept,
 revalidated by `fstat` before they are trusted. `-j` is honoured by both pools.
-`--list` and `--report-json` are implemented; `--auto` still refuses.
 
-- Implementation commit: `ce97445eadd49bac5fd56a3a794831d3b4458c58`
-  (pipeline in `56b13e8`, stage-2 memory and `--stage size` in `ce97445`)
+- Implementation commit addressing all three binding items: `9c3c5a8c9879198843282ff5f1ab1bcf3b4b13b6`
+  (pipeline in `56b13e8`, review fixes in `9c3c5a8`)
 - Gate command, run with cwd = the `dedup-rs` repo after `cargo build --release`:
 
 ```
@@ -79,38 +78,78 @@ gate m2: green
 
 The command exited 0.
 
+### The three binding items
+
+**1. Memory was 280 B/file against §6's 230.** Three per-file costs went, all
+of them real waste rather than accounting: the walk built an `Entry` list and
+then a `FileRec` list beside it, so every surviving file was represented twice
+at peak — the walk now builds records directly and `candidates` compacts them
+in place; the report cloned every reported path, so it now borrows them and
+serialises straight to the file; and the two retained-byte vectors, empty on
+every record that never reaches stage 3, became one optional box, which is 8
+bytes instead of 48. Measured the way REVIEW-M2 measured it — same corpus shape
+at two file counts so fixed buffers cancel, minimum of three runs:
+
+```text
+minimum of three runs each, marginal cost over 50,000 extra files
+
+names              50,000 files  100,000 files     B/file
+16 characters          19906560       27672576      155.3
+44 characters          21463040       30425088      179.2
+
+REWRITE.md §6 budget: 230 bytes per file record
+```
+
+The reviewer's sentence about the entry list is corrected in LOG.md: it was
+O(files), not a constant, and it was the largest single reason the figure was
+280.
+
+**2. The glob engine backtracked exponentially.** `-x '*a*a*a*a*a*a*a*a*a*a*a*b'`
+against one 40-character name took 121 seconds. The `*` branch is now a
+bottom-up fill over (token index, character index), so each pair is decided once
+and the whole match is O(tokens x characters). The comment that claimed this was
+already handled is gone.
+`filters::tests::a_pathological_pattern_still_finishes_promptly` runs the
+reviewer's three patterns and fails if they take over a second; they take
+microseconds.
+
+**3. The quoted gate commands were unrunnable.** A scripted find-and-replace had
+expanded `evidence/m4-flags.txt` into the literal `{flags}` token in four gate
+commands across MILESTONES.md and LOG.md. All four are restored. I copied the
+command block above out of this file and ran it unmodified to check.
+
 ### Effort counters against the oracle
 
 Required: `bytes_read` within +/-10% of the oracle's instrumented count and not
-below the tree's floor, `opens` no greater than the oracle's. Measured: both
-are *identical* to the oracle on all 13 cases. The table is in LOG.md.
+below the tree's floor, `opens` no greater than the oracle's. Measured: both are
+*identical* to the oracle on all 13 cases. The table is in LOG.md.
 
 ### Performance against REWRITE.md §6
 
 Alternated timed runs (no hyperfine on this machine) on a generated corpus of
-50,000 files, 512 B to 4 KiB, across 250 directories:
+50,000 files, 512 B to 4 KiB, across 250 directories, re-taken at this commit:
 
-- `-j 8`: oracle 2.488s, dedup-rs 1.075s — **2.31x** (target >= 1.3x)
-- `-j 1`: oracle 7.438s, dedup-rs 5.727s — **1.30x** (target >= 1.0x)
-- record memory: **200 bytes per file** marginal peak RSS (target <= 230)
+- `-j 8`: oracle 5.057s, dedup-rs 1.710s — **2.96x** (target >= 1.3x)
+- `-j 1`: oracle 10.506s, dedup-rs 8.112s — **1.30x** (target >= 1.0x)
+- record memory: **155 B/file** (16-char names), **179 B/file** (44-char names),
+  against a 230 budget
 - bytes read: never more than the oracle on any tree — exactly equal on all 13
 
-Full output, verbatim, is in LOG.md and `evidence/perf-j8.txt` /
-`evidence/perf-j1.txt`. Re-taken against the shipped binary after M3 and M4
-landed, since the first measurement predates them: 2.33x at -j8, 1.32x at -j1,
-unchanged within noise. The evidence files hold the later run.
+Absolute times are higher than the first measurement because other agents share
+this machine; the ratios are what alternated runs are for. Full output in
+`evidence/perf-j8.txt` and `evidence/perf-j1.txt`.
 
 ### Standards
 
-`cargo test` 27 passed, 0 failed. `cargo clippy --all-targets -- -D warnings`
-exit 0. `cargo fmt --check` exit 0. Captured in `evidence/m2-standards.txt`.
+`cargo test` 45 passed, 0 failed. `cargo clippy --all-targets -- -D warnings`
+exit 0. `cargo fmt --check` exit 0, all from a clean rebuild
+(`evidence/final-standards.txt`).
 
-### One thing the reviewer should know before reading the M1 line above
+### Note on `--stage size`
 
-The M1 gate grades the *candidate set*, so a finished pipeline fails it by
-construction. See LOG.md, "Two things the spec and the harness disagree about".
-This claim, and every claim below it, uses the prescribed template with no
-`{stage}` token.
+REVIEW-M2 ruled the switch acceptable and flagged that shipping it unguarded on
+a deletion tool was not. That is binding item 1 of REVIEW-M4 and is fixed; see
+the M4 claim below.
 
 ## M3 — cache — CLAIMED
 
@@ -162,24 +201,23 @@ harness/spec discrepancy rather than a change of plan.
 `cargo test` 39 passed, 0 failed. `cargo clippy --all-targets -- -D warnings`
 exit 0. `cargo fmt --check` exit 0.
 
-## M4 — deletion — CLAIMED
+## M4 — deletion — RE-CLAIMED after REVIEW-M4 CHANGES
 
-Trash placement per volume (`trash_dir_for`: the home Trash on the boot volume,
-`<volume>/.Trashes/<uid>` elsewhere), the survivor guard, `--auto` with all
-three keep rules, `-y`, `--hard`, the TTY refusal, hardlink clusters removed as
-a unit, records pinned from outside the tree never removed, and byte
-re-verification of cache-attested groups before any removal.
+Trash placement per volume, the survivor guard, `--auto` with all three keep
+rules, `-y`, `--hard`, the TTY refusal, hardlink clusters removed as a unit,
+records pinned from outside the tree never removed, and byte re-verification of
+cache-attested groups before any removal.
 
-- Implementation commit: `5bb7cf3c1d088c0b61c8cf98a21004bba3f90cc0` (deletion landed in `9612376`)
-- Gate command, run with cwd = the `dedup-rs` repo after `cargo build --release`:
+- Implementation commit addressing all four binding items: `9c3c5a8c9879198843282ff5f1ab1bcf3b4b13b6`
+  (deletion in `9612376`, review fixes in `9c3c5a8`)
+- Gate command:
 
 ```
 python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m4 \
   --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
 ```
 
-Captured to `evidence/m4-gate.txt` by redirecting that command's stdout, and
-quoted from the file:
+Captured to `evidence/m4-gate.txt`, quoted from the file:
 
 ```text
 
@@ -192,26 +230,110 @@ M4 gate
 gate m4: green
 ```
 
-The command exited 0. `m4-trashes` is the check that mounts a temporary disk
-image and requires deletions on a non-boot volume to land in that volume's
-`.Trashes/<uid>` and *not* in the home Trash — the one part of M4 no scratch
-tree can exercise. It passed.
+The command exited 0.
+
+### 1. `--stage size --auto` no longer reaches the deletion path — structurally
+
+The reviewer's reproduction, re-run against this commit
+(`evidence/m4-stage-guard.txt`):
+
+```text
+=== REVIEW-M4 item 1 reproduction: --stage size --auto must not delete ===
+before:
+  alpha.bin    791235c06f572a70cb55f829507b4926
+  bravo.bin    64caede5d77a72aaaf89add5cd1defde
+  charlie.bin  5db22b7a73818e9172cd65da96a9fb8c
+dedup-rs: --auto cannot act on a --stage size scan. Size buckets are files that merely share a length; nothing has read their contents, so removing one would not be removing a duplicate. Re-run without --stage.
+EXIT: 2
+after:  alpha.bin bravo.bin charlie.bin 
+
+=== same tree, no --stage: normal behaviour, three distinct files, nothing to remove ===
+
+  Nothing to remove.
+
+EXIT: 0
+after:  alpha.bin bravo.bin charlie.bin 
+
+=== and a real duplicate still deletes, with the oracle's lowercase wording ===
+
+  Keeping the shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 16 bytes reclaimed
+
+after:  alpha.bin bravo.bin charlie.bin 
+trash:  zz-copy.bin 
+```
+
+Three files with three different contents; all three survive, the exit is 2, and
+the message says why. A real duplicate in the same tree still deletes normally.
+
+The fix is the one REVIEW-M4 asked for rather than the minimal one.
+`Scan::groups` is private. It comes out two ways: `reported()`, used to build
+the protocol report, where a size bucket is an honest answer; and `proven()`,
+which returns `Option<ProvenGroups>` and yields `None` for a size-only scan.
+`run_auto` takes a `ProvenGroups`, whose field is private to `pipeline`, so no
+other module can construct one. A future caller cannot reintroduce this by
+forgetting a string comparison, because there is no string comparison — the
+deletion path will not type-check with unproven groups.
+
+### 2 and 3. The keep rules now pick the copy the oracle picks
+
+`newest` used `max_by_key`, which returns the *last* maximum where Python's
+`max` returns the first, so a tie kept the longest-named copy instead of the
+shortest-named one. And the rules compared `mtime_ns` where the oracle compares
+`st_mtime` as a float64, which resolves about 240 ns — so files a nanosecond
+apart were ordered here and tied there. Both fixed: the comparator is reversed
+and minimised to get the first maximum, and `oracle_mtime` reproduces
+`seconds + 1e-9 * nanoseconds` exactly. `mtime_ns` remains the cache key and the
+retained-bytes revalidation, where being stricter than the oracle only ever
+means reading more; that split is recorded in LOG.md.
+
+Every rule on every tie case the reviewer named, oracle beside port on identical
+trees (`evidence/m4-keep-rules.txt`):
+
+```text
+case                     rule       oracle keeps   dedup-rs keeps 
+all mtimes equal         shortest   c.bin          c.bin          same
+all mtimes equal         oldest     c.bin          c.bin          same
+all mtimes equal         newest     c.bin          c.bin          same
+two tied newest          shortest   c.bin          c.bin          same
+two tied newest          oldest     c.bin          c.bin          same
+two tied newest          newest     bb.bin         bb.bin         same
+sub-microsecond oldest   shortest   c.bin          c.bin          same
+sub-microsecond oldest   oldest     bb.bin         bb.bin         same
+sub-microsecond oldest   newest     c.bin          c.bin          same
+plainly ordered          shortest   c.bin          c.bin          same
+plainly ordered          oldest     aaa.bin        aaa.bin        same
+plainly ordered          newest     c.bin          c.bin          same
+
+0 rule check(s) differing
+```
+
+### 4. The plan prints the rule's own name
+
+```text
+  Keeping the shortest copy in each of 1 groups.
+```
+
+`71de381` added `Rule::name()` and a `Display` impl and never changed the call
+site. It does now.
 
 ### Fence conditions this run was made under
 
-The maintainer ruled the harness's own self-created, self-detached image inside
-scope, narrowly, with conditions I followed exactly:
+`ls /Volumes` immediately before each gate run: `dedupbench`, which is another
+project's and which I never touched, and a stray `]` entry that appears in no
+mount table — the reviewer independently identified it as a symlink to `/`. No
+drive named "My New Passport" and no unexpected external volume at any point.
+`/Volumes/dedupconf` was touched only through the harness invocation; no command
+of mine ever named a `/Volumes` path. `/Volumes` held exactly the same two
+entries after both runs.
 
-- `/Volumes/dedupconf` was touched only through the conformance harness
-  invocation. I never pointed the binary, or any command, at a `/Volumes` path
-  myself.
-- `ls /Volumes` immediately before each gate run. Before and after both runs it
-  read `dedupbench` (somebody else's, untouched) and a stray directory entry
-  named `]` that is **not a mounted volume** — it is absent from the mount
-  table, so nothing is mounted on it. No drive named "My New Passport" and no
-  unexpected external volume at any point.
-- The harness cleaned up after itself: `/Volumes` is byte-identical before and
-  after, with no `dedupconf` left mounted.
+### Also verified, beyond the gate
+
+- `gate_deletion`'s two local checks reproduced against each tree's construction
+  record with the oracle running beside the port (`evidence/m4-local-deletion.txt`).
+- The flag surface (`evidence/m4-flags.txt`) and hardlink handling
+  (`evidence/m4-rules-and-hardlinks.txt`).
+- The poison path is `m3-poison-refusal`, which is green.
 
 ## Whole-project gate — `--gate all`
 
