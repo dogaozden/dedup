@@ -8,4 +8,4 @@
 # This pin moves only deliberately, between optimizer rounds, by the
 # maintainer — and when it moves, every score recorded against the old pin
 # stops being comparable. Note the move in RGOAL.md's journal when you make it.
-c238b30
+94739ad

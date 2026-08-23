@@ -636,39 +636,40 @@ of arithmetic. The predecessor bench set a target below what the hardware
 charges once; a target like that can only be hit by a candidate that stopped
 doing the work.
 
-Measured against `main` at `r2`, on a quiet machine:
+Measured against the pin `94739ad` at `r2`, 2026-08-23, load average 4.98 4.45
+4.78, machine otherwise idle — of record:
 
 ```
-process creation 0.0013 s   ·   open + close 11.68 µs   ·   readdir 0.26 µs
+process creation 0.0012 s   ·   open + close 10.96 µs   ·   readdir 0.25 µs
 
 scenario     files   spawn    walk   opens    read   floor  base s  floor/base
-needle      50,000  0.0013  0.0503  0.0006  0.0000  0.0522  0.7487        7.0%
-typical     19,200  0.0013  0.0193  0.0216  0.0011  0.0434  0.1759       24.6%
-samesize     1,402  0.0013  0.0014  0.0011  0.0008  0.0045  0.0243       18.6%
-widegroup    1,820  0.0013  0.0018  0.0213  0.0153  0.0397  0.1715       23.1%
-photos         100  0.0013  0.0001  0.0005  0.0050  0.0069  0.0231       29.7%
-bigheader        8  0.0013  0.0000  0.0000  0.0038  0.0051  0.0255       20.1%
-rescan      11,200  0.0013  0.0113  0.0000  0.0000  0.0126  0.0284       44.2%
-prefixtrap      32  0.0013  0.0000  0.0001  0.0005  0.0020  0.0074       26.7%
+needle      50,000  0.0012  0.0429  0.0005  0.0000  0.0447  0.6810        6.6%
+typical     19,200  0.0012  0.0165  0.0203  0.0012  0.0392  0.1644       23.9%
+samesize     1,402  0.0012  0.0012  0.0010  0.0008  0.0042  0.0237       17.9%
+widegroup    1,820  0.0012  0.0016  0.0199  0.0166  0.0393  0.1857       21.2%
+photos         100  0.0012  0.0001  0.0004  0.0054  0.0072  0.0222       32.2%
+bigheader        8  0.0012  0.0000  0.0000  0.0041  0.0054  0.0226       23.7%
+rescan      11,200  0.0012  0.0096  0.0000  0.0000  0.0108  0.0246       44.0%
+prefixtrap      32  0.0012  0.0000  0.0001  0.0006  0.0019  0.0064       29.8%
 
-HONEYPOT: targets below ≈0.2126 are not reachable honestly.
-          ≈0.1373 if the walk became a bulk directory read.
+HONEYPOT: targets below ≈0.2131 are not reachable honestly.
+          ≈0.1431 if the walk became a bulk directory read.
 ```
 
 Read that against round one's 0.3173: the room left below the new pin is roughly
 a factor of five, not another factor of three, and the walk is where most of it
 sits.
 
-`rescan`'s row is worth a second look. Its floor is **44.2%** of its baseline
+`rescan`'s row is worth a second look. Its floor is **44.0%** of its baseline
 and almost all of that is the walk — which is the whole object of the reshape.
 Where the old `rescan` was a startup measurement with a rounding error attached,
 it is now a walk-and-cache-lookup measurement with a known irreducible half. It
 is also the second scenario, after `needle`, whose number a bulk directory read
 would move.
 
-**These are placeholders.** Re-run `floor.py` at pin time, on a quiet machine,
-after the pin moves; the numbers above were taken with another builder working.
-Three things about them are structural rather than incidental and will survive.
+**These are of record**, taken at pin time on 2026-08-23 with the machine
+otherwise idle. Three things about them are structural rather than incidental
+and will survive.
 
 **A floor may only contain what nobody can remove.** The first draft used the
 tool's own startup as the spawn term. Held against the pinned `c238b30` — which
@@ -712,6 +713,11 @@ that says "baseline" means `main` at `baf9e25`, which is what that tip will
 contain, and the run below reports a score against the *old* pin because that
 is what the harness was still holding.
 
+**Update, pin time (2026-08-23):** `baseline.lock` now names `94739ad` —
+`main` after the `features` and `r2prep` merges. The paragraph above describes
+how the run and calibration below were taken, against the *old* pin; every
+score from here forward is against this one.
+
 **Numbers.** Full scored run, `--scale r2 --candidate baf9e25`, nine rounds,
 baseline the stale pin `c238b30`, load average 4.73, another builder working.
 **This run rebuilt nothing** — every corpus was already resident, which is the
@@ -739,14 +745,14 @@ scored scenarios and the new gate run to completion with every gate green at
 `rescan`'s row is the reshape working: **0 B** read on the warm side, against a
 cold scan of 5.2 MB, over 11,200 files instead of thirteen.
 
-`--calibrate --rounds 9` at `r2`, the same afternoon and the same shared
-machine: geomean **1.0002**, **noise floor ±2.1%** (worst scenario `samesize` at
-1.0214), worst per-round dispersion `widegroup` at ±7.4%. Round one's equivalent
-at smoke scale was ±3.4%, so the larger corpora bought a tighter floor on a
-busier machine, which is what they were for — and the floor did not loosen when
-`needle` and `typical` were cut back to fit the volume, which is the evidence
-that those cuts were slack rather than signal. **This is not the noise floor of
-record** — recalibrate at pin time, on a quiet machine, against the new pin.
+`--calibrate --rounds 9` at `r2`, pin time on 2026-08-23, load average 5.59
+4.31 4.79, machine otherwise idle: geomean **0.9936**, **noise floor ±2.4%**
+(worst scenario `rescan` at 0.9759), worst per-round dispersion `widegroup` at
+±8.8%. Round one's equivalent at smoke scale was ±3.4%, so the larger corpora
+still bought a tighter floor, which is what they were for — and the floor did
+not loosen when `needle` and `typical` were cut back to fit the volume, which is
+the evidence that those cuts were slack rather than signal. **This is the noise
+floor of record**, against the `94739ad` pin.
 
 `--selftest`: 5 of 5 sabotages caught (`drop-group`, `inflate-bytes`,
 `underreport-bytes`, `touch-corpus`, `shrunk-head`), both honest controls
