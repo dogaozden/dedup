@@ -343,6 +343,698 @@ entries after both runs.
   (`evidence/m4-rules-and-hardlinks.txt`).
 - The poison path is `m3-poison-refusal`, which is green.
 
+## M5 — the interactive TUI — CLAIMED
+
+The browser is back: the group list, the member paths, the keeper marking, the
+selection, the bulk keep rules, the confirmation and the summary, in ratatui,
+with the oracle's keymap and the oracle's information architecture. Deletion
+goes through the machinery `--auto` uses and nothing else.
+
+- Implementation commit: `df03dde8eb50a4dc870ae5f8a74e4b79caae7d56`
+  (the browser in `020b73c`, the two guard fixes below in `df03dde`)
+- Gate command (the TUI must not disturb the core), run from the repo root:
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/m5-all-gate.txt`, quoted from the file:
+
+```text
+
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0.
+
+### One deletion path
+
+`trash::run_selected` is the entry point the spec asks for: beside `run_auto`,
+taking the same `ProvenGroups` token, whose field is private to `pipeline` and
+which only `Scan::proven` can mint. A browser over a `--stage size` scan does
+not type-check, and `main::browse` refuses one for the same reason `--auto`
+does. The TUI constructs no removal call of its own — it hands
+`run_selected` a list of marks and `run_selected` does the rest through
+`verify_attested` and `remove_record`, unchanged.
+
+The survivor guard inside that entry point does not trust the UI:
+
+- A mark is `(group in the scan, record in the scan)`. Screen positions never
+  leave `tui::model`, because a browser that has already deleted something
+  renumbers what is left while the scan's own list does not — a stale position
+  would name a *different file*, not a missing one.
+- The whole request is validated before anything is removed, and a request that
+  would leave any group with no copy is refused entire rather than partly
+  applied.
+- What the guard counts is copies that will still be on disk afterwards, not
+  members the scan recorded. A group half-emptied by an earlier round has fewer
+  survivors left than its membership suggests.
+- A record pinned from outside the tree is never removed, however it came to be
+  marked, exactly as in `plan_auto`.
+
+Both of the first two properties are there because the scripted runs below
+caught me getting them wrong; both bugs and their regression tests are written
+up in LOG.md.
+
+### End-to-end: the real binary, a real terminal, real trees
+
+`evidence/scripts/m5_end_to_end.py` opens a pty, spawns the release binary
+with `-i`, writes the bytes a keyboard would write, and then looks at the disk.
+`HOME` points at a scratch directory so Trash placement is checked without
+touching the user's own Trash.
+
+```
+python3 rust/evidence/scripts/m5_end_to_end.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5-end-to-end.txt`, quoted from the file:
+
+```text
+=== confirmed deletion moves exactly the marked copies to the Trash ===
+    expect: a.bin and x.dat survive; the other three are in the scratch Trash
+    exit: 0 (ok)
+    survivors: ['a.bin', 'x.dat'] (ok)
+    trash: ['b.bin', 'c.bin', 'y.dat'] (ok)
+
+=== cancelling the confirmation removes nothing ===
+    expect: all three files survive and the Trash is empty
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== quitting with copies marked removes nothing ===
+    expect: all three files survive
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== --hard deletes permanently and puts nothing in the Trash ===
+    expect: a.bin survives, b.bin is gone, the Trash stays empty
+    exit: 0 (ok)
+    survivors: ['a.bin'] (ok)
+    trash: [] (ok)
+
+=== space on every copy in a group cannot empty it ===
+    expect: the last copy refuses to be marked, so one survives the confirmation
+    exit: 0 (ok)
+    survivors: ['c.bin'] (ok)
+    trash: ['a.bin', 'b.bin'] (ok)
+    refusal shown on screen: True (ok)
+
+=== removing a hardlinked record removes every name it wears ===
+    expect: both names of the cluster go together; the other copy survives
+    exit: 0 (ok)
+    survivors: ['z.bin'] (ok)
+    trash: ['a.bin', 'also-a.bin'] (ok)
+
+=== -i without a terminal refuses instead of guessing ===
+    expect: exit 2, a message naming --list and --auto, and nothing removed
+    exit: 2 (ok)
+    stderr: dedup-rs: the interactive browser needs a terminal on stdin and stdout. Use --list to see the groups or --auto to clean up.
+    survivors: ['a.bin', 'b.bin'] (ok)
+
+0 check(s) differing
+```
+
+The command exited 0.
+
+### The terminal comes back, on every way out
+
+`evidence/scripts/m5_terminal_restore.py` reads the pty's own termios before,
+during and after a session, and looks for the alternate-screen sequences in
+what the program wrote.
+
+```
+python3 rust/evidence/scripts/m5_terminal_restore.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5-terminal-restore.txt`, quoted from the file:
+
+```text
+=== quitting with q ===
+    modes before  (canonical, echo): (True, True)
+    modes during  (canonical, echo): (False, False)
+    modes after   (canonical, echo): (True, True)
+    raw mode was entered: True
+    raw mode was released: True
+    alternate screen entered: True
+    alternate screen left: True
+    left after it entered: True
+
+=== interrupting with ctrl-c ===
+    modes before  (canonical, echo): (True, True)
+    modes during  (canonical, echo): (False, False)
+    modes after   (canonical, echo): (True, True)
+    raw mode was entered: True
+    raw mode was released: True
+    alternate screen entered: True
+    alternate screen left: True
+    left after it entered: True
+
+=== exiting because nothing is left to browse ===
+    modes before  (canonical, echo): (True, True)
+    modes during  (canonical, echo): (False, False)
+    modes after   (canonical, echo): (True, True)
+    raw mode was entered: True
+    raw mode was released: True
+    alternate screen entered: True
+    alternate screen left: True
+    left after it entered: True
+
+0 check(s) differing
+```
+
+The command exited 0. The fourth path — a panic — is covered by the drop guard
+and the panic hook rather than by this script, and the guard firing during
+unwinding is unit-tested
+(`the_guard_puts_the_terminal_back_on_every_way_out_of_its_scope`).
+
+### What the screen looks like
+
+`evidence/scripts/m5_screens.py` drives a session and reconstructs each frame
+from the escape sequences the binary wrote, so the layout can be read rather
+than inferred from a buffer assertion.
+
+```
+python3 rust/evidence/scripts/m5_screens.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5-screens.txt`; the opening frame, the refusal and the
+keep-this-copy frame, quoted from the file:
+
+```text
+----- the group list as it opens; the second copy is pinned from outside -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+     ○ backup/photos/beach.jpg                                                 2026-08-23
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+
+----- space on the pinned copy is refused, and says why -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+     ○ photos/beach.jpg                                                        2026-08-23
+   › ⊘ old/beach copy.jpg                                                      2026-08-23
+     ○ backup/photos/beach.jpg                                                 2026-08-23
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  hardlinked outside this tree — deleting it frees nothing
+  b bulk    ENTER apply   ? help    q quit
+
+----- a keeps this copy and marks the rest that can actually be freed -----
+ dedup    …ts-tib/620866d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-shots/m5-screens/tree
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  2 groups · 1.1 KB reclaimable                                  1 marked · 1.0 KB to free
+
+  Group 1 of 2                                                           1.0 KB × 3 copies
+ ──────────────────────────────────────────────────────────────────────────────────────────
+   › ○ photos/beach.jpg                                                        2026-08-23
+     ⊘ old/beach copy.jpg                                                      2026-08-23
+     ● backup/photos/beach.jpg                                                 2026-08-23
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓ file   ←→ group   space mark   a keep-this   u clear
+  b bulk    ENTER apply   ? help    q quit
+```
+
+### Model and paint, separated and tested
+
+`src/tui/model.rs` holds the state and every decision — cursor movement,
+marking, the two refusals, the bulk rules, the rebuild after a round of
+deletion — and imports nothing from a terminal. `src/tui/view.rs` reads it and
+writes to a frame, and decides nothing. The spec's three named model cases are
+`a_group_may_never_have_every_copy_marked`,
+`a_hardlink_cluster_is_one_row_and_goes_as_one_unit` and
+`a_record_pinned_from_outside_the_tree_is_not_offered`; the render tests
+snapshot the whole drawn buffer for a seeded scan and assert that the paths are
+visible and the keeper is marked, in shape and in colour.
+
+Captured to `evidence/m5-standards.txt`, quoted from the file:
+
+```text
+$ cargo test
+
+test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m5/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.69s
+
+$ cargo fmt --check
+(no output: clean)
+```
+
+### How a run reaches the browser, and what a piped run still does
+
+Adding an interactive mode to a tool the harness drives as a subprocess is a
+chance to change non-interactive behaviour by accident, so this is checked
+rather than assumed. The browser opens on the oracle's own condition — a
+terminal, and neither `--list` nor `--auto` — and `-i` asks for it outright,
+which is the only case where a pipe is an error rather than a fall-through.
+A piped run with no flags still writes its report and prints nothing, exactly
+as before M5.
+
+```
+python3 rust/evidence/scripts/m5_dispatch.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5-dispatch.txt`, quoted from the file:
+
+```text
+=== no flags: the oracle's default is the browser ===
+    terminal: True   flags: (none)
+    exit: 0   entered the browser: True
+    said: dedup…d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-dispatch/m5-dispatch/case-0/tree─────────────
+
+=== --list: prints the groups and stops ===
+    terminal: True   flags: ['--list']
+    exit: 0   entered the browser: False
+    said: 1 duplicate group(s) keep a.bin b.bin
+
+=== nothing duplicated: says so and stops ===
+    terminal: True   flags: (none)
+    exit: 0   entered the browser: False
+    said: No duplicates found.
+
+=== -i with nothing duplicated: not an error ===
+    terminal: True   flags: ['-i']
+    exit: 0   entered the browser: False
+    said: No duplicates found.
+
+=== no flags through a pipe: exactly as before M5 ===
+    terminal: False   flags: (none)
+    exit: 0   entered the browser: False
+    said: 
+
+=== --list through a pipe: exactly as before M5 ===
+    terminal: False   flags: ['--list']
+    exit: 0   entered the browser: False
+    said: 1 duplicate group(s) keep a.bin b.bin
+
+=== -i through a pipe: refuses, and says what to use ===
+    terminal: False   flags: ['-i']
+    exit: 2   entered the browser: False
+    said: dedup-rs: the interactive browser needs a terminal on stdin and stdout. Use --list to see the gr
+
+every case left both files where they were
+```
+
+The command exited 0.
+
+### Fence conditions this run was made under
+
+`ls /Volumes` immediately before and after the gate run: `dedupbench`, which is
+another project's and which I never touched, and the stray `]` entry that
+appears in no mount table. No drive named "My New Passport" and no unexpected
+external volume at any point; no command of mine named a `/Volumes` path.
+Every tree the browser deleted from was generated by these scripts under this
+session's scratchpad with an `m5-` prefix, and every run pointed `HOME` at a
+scratch directory, so nothing reached the real Trash.
+
+### Not in this milestone
+
+`getattrlistbulk(2)`. LOG.md had named M5 as the milestone that would land it;
+M5-TUI.md scopes this run to the browser, so it is re-deferred to a dedicated
+performance pass, with the reasoning in LOG.md rather than left unsaid.
+
+## M5 — the interactive TUI — RE-CLAIMED after REVIEW-M5 CHANGES
+
+Both binding items fixed, both verified the way REVIEW-M5 said it would verify
+them, and the whole gate still green. The review's root-cause framing is right
+and is what the fixes are shaped around: each item was a place where the
+browser's *view* of the world reached a decision — a string built for drawing
+ranked the copies, and the paint layer's early return decided whether a safety
+dialog existed.
+
+- Fix commit: `612d3dd541f639a4ec2ae87fc4da9715b7eb8baa`
+- Gate command, run from the repo root:
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/m5-all-gate.txt`, quoted from the file:
+
+```text
+
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0.
+
+### 1. The keep rules rank the scan's own name
+
+`Member` now carries two strings and says which is which: `name`, the scan's
+name relative to the root — the one `--auto` ranks — and `path`, what to draw.
+`apply_bulk` passes `name` to `Rule::keeper_of`. Nothing but the painter reads
+`path`, and the two comments that claimed the rule could not diverge (they were
+false when written) now say what is actually true, in `trash.rs` and
+`model.rs`.
+
+The reviewer's own reproduction, now run as end-to-end case 7 — the same tree
+built twice and cleaned two ways from the same directory inside it:
+
+```text
+=== bulk keep-shortest keeps the copy --auto shortest keeps ===
+    expect: b.bin survives both, even run from inside the tree where the drawn paths rank the other way round
+    exit: 0 (ok)
+    browser survivors: ['b.bin'] (ok)
+    --auto survivors: ['b.bin'] (ok)
+    browser and --auto agree: ['b.bin'] (ok)
+```
+
+Plus the model test REVIEW-M5 specified, over a group whose display order and
+record order disagree: `a_bulk_rule_ranks_the_scans_name_not_the_one_on_screen`
+asserts `apply_bulk(Rule::Shortest)` marks the record-order non-keeper, and
+that swapping only the display strings changes nothing about which copy dies.
+`keep_this_one_and_the_survivor_guard_do_not_read_the_display_string` covers
+the two other ways a copy gets marked on that same group.
+
+### 2. A screen nobody can read takes no orders but quit
+
+`MIN_WIDTH`/`MIN_HEIGHT` moved into `model.rs`, because the moment they decide
+what the browser will act on they are not only a layout number; the paint layer
+reads them from there so the two cannot drift. The model carries `legible`, set
+from the area of the frame that was actually painted, and below the minimum it
+returns `Step::Stay` for every key but `Quit`.
+
+REVIEW-M5 allowed drawing a clipped overlay instead. I did not take it: at 20×8
+a box cannot fit "Move to Trash: 1 files", so that option would draw *a* dialog
+while the numbers hard rule 3 exists to show stayed invisible.
+
+End-to-end case 8, on the reviewer's own 20×8 pty with `space`, ENTER, `y`:
+
+```text
+=== a terminal too small to lay out will not confirm a deletion ===
+    expect: both copies survive; the frame says to resize rather than asking y/n
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin'] (ok)
+    trash: [] (ok)
+    painted the resize message: True
+    never painted a confirmation: True
+```
+
+Model tests `a_screen_too_small_to_read_takes_no_orders_but_quit` (including
+the frame shrinking *underneath* a live confirmation, and the confirmation
+coming back when it grows again) and
+`the_legibility_floor_is_the_one_the_paint_layer_uses`.
+
+### The re-read of a cache-attested group, now tested
+
+REVIEW-M5's sharpest non-binding note: nothing anywhere exercised
+`run_selected`'s `verify_attested` call, and deleting it left everything green.
+End-to-end case 9 closes it — two 24 MB copies, the cache warmed, then one byte
+changed in the *middle* and the mtime restored, so head, tail and every sample
+point still agree and only a full re-read can tell:
+
+```text
+=== a group the cache vouched for is re-read, disbelieved and refused ===
+    expect: the scan reads nothing and still groups them; the browser reads them, removes nothing, and says why
+    cold scan exit: 0 (ok)
+    exit: 0 (ok)
+    the scan still grouped them: 1 (ok)
+    the scan read 0 bytes to do it
+    grouped without reading them: True
+    survivors: ['a.bin', 'b.bin'] (ok)
+    trash: [] (ok)
+    said it was refusing, and why: True
+```
+
+The 0 bytes is the proof the group was believed rather than seen. **I checked
+the test can fail**: with the `verify_attested` call removed it reports three
+differing checks and sends `b.bin` — the copy that no longer matches — to the
+Trash, while all 105 unit tests and the whole gate stay green, which is exactly
+the hole the reviewer described.
+
+### All ten browser scenarios
+
+```
+python3 rust/evidence/scripts/m5_end_to_end.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5-end-to-end.txt`, quoted from the file:
+
+```text
+=== confirmed deletion moves exactly the marked copies to the Trash ===
+    expect: a.bin and x.dat survive; the other three are in the scratch Trash
+    exit: 0 (ok)
+    survivors: ['a.bin', 'x.dat'] (ok)
+    trash: ['b.bin', 'c.bin', 'y.dat'] (ok)
+
+=== cancelling the confirmation removes nothing ===
+    expect: all three files survive and the Trash is empty
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== quitting with copies marked removes nothing ===
+    expect: all three files survive
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== --hard deletes permanently and puts nothing in the Trash ===
+    expect: a.bin survives, b.bin is gone, the Trash stays empty
+    exit: 0 (ok)
+    survivors: ['a.bin'] (ok)
+    trash: [] (ok)
+
+=== space on every copy in a group cannot empty it ===
+    expect: the last copy refuses to be marked, so one survives the confirmation
+    exit: 0 (ok)
+    survivors: ['c.bin'] (ok)
+    trash: ['a.bin', 'b.bin'] (ok)
+    refusal shown on screen: True (ok)
+
+=== removing a hardlinked record removes every name it wears ===
+    expect: both names of the cluster go together; the other copy survives
+    exit: 0 (ok)
+    survivors: ['z.bin'] (ok)
+    trash: ['a.bin', 'also-a.bin'] (ok)
+
+=== bulk keep-shortest keeps the copy --auto shortest keeps ===
+    expect: b.bin survives both, even run from inside the tree where the drawn paths rank the other way round
+    exit: 0 (ok)
+    browser survivors: ['b.bin'] (ok)
+    --auto survivors: ['b.bin'] (ok)
+    browser and --auto agree: ['b.bin'] (ok)
+
+=== a terminal too small to lay out will not confirm a deletion ===
+    expect: both copies survive; the frame says to resize rather than asking y/n
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin'] (ok)
+    trash: [] (ok)
+    painted the resize message: True
+    never painted a confirmation: True
+
+=== a group the cache vouched for is re-read, disbelieved and refused ===
+    expect: the scan reads nothing and still groups them; the browser reads them, removes nothing, and says why
+    cold scan exit: 0 (ok)
+    exit: 0 (ok)
+    the scan still grouped them: 1 (ok)
+    the scan read 0 bytes to do it
+    grouped without reading them: True
+    survivors: ['a.bin', 'b.bin'] (ok)
+    trash: [] (ok)
+    said it was refusing, and why: True
+
+=== -i without a terminal refuses instead of guessing ===
+    expect: exit 2, a message naming --list and --auto, and nothing removed
+    exit: 2 (ok)
+    stderr: dedup-rs: the interactive browser needs a terminal on stdin and stdout. Use --list to see the groups or --auto to clean up.
+    survivors: ['a.bin', 'b.bin'] (ok)
+
+0 check(s) differing
+```
+
+The command exited 0.
+
+### Standards
+
+`evidence/m5-standards.txt` now has a generator beside it like the other four,
+which was the last non-binding note:
+
+```
+cd rust && evidence/scripts/m5_standards.sh > evidence/m5-standards.txt
+```
+
+Quoted from the file:
+
+```text
+$ cargo test
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m5/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+
+$ cargo fmt --check
+(no output: clean)
+```
+
+### The other non-binding notes
+
+- A mark is a `Mark { group, record }` rather than a bare pair. This does not
+  make a screen position unrepresentable — only a distinct type for record
+  indices would, which is wider than a fix round should carry — but the two
+  fields are both `usize`, nothing but their order distinguished them, and
+  swapping them was a live failure mode.
+- The second `put_the_terminal_back` in `run` is gone; the drop guard covers
+  every path it covered, and two mechanisms for one guarantee only make a
+  reader wonder which is load-bearing.
+- The confirmation-counts-records against summary-counts-names wrinkle is
+  recorded in LOG.md as inherited parity, so the next reader does not
+  "fix" it into a divergence.
+
+`evidence/m5-screens.txt` came back byte-identical, which REVIEW-M5 expected to
+move. It did not, because that script runs the browser with its working
+directory at the scanned root — where the display name and the scan name are
+the same string — and because it only opens the bulk menu to photograph it and
+leaves with `esc` without applying a rule. It was regenerated from the fixed
+binary regardless.
+
+### Fence conditions this round was made under
+
+`ls /Volumes` immediately before and after the gate run: `dedupbench`, another
+project's, and the stray `]` entry that appears in no mount table. No command
+of mine named a `/Volumes` path. Every tree deleted from was generated under
+this session's scratchpad with an `m5-` prefix, with `HOME` pointed at a
+scratch directory, so nothing reached the real Trash.
+
+
 ## Whole-project gate — `--gate all`
 
 ```

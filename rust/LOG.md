@@ -956,3 +956,252 @@ repo should not depend on a file anyone can overwrite. Every harness that
 produces something quoted in a claim now lives in `evidence/scripts/` and is
 re-runnable from the repo. The perf corpus is rebuilt under a name of my own for
 the same reason.
+
+## 2026-08-23 — M5 (the interactive browser)
+
+### Hypothesis
+
+The browser could be a thin frontend: read the oracle's curses mode for the
+information architecture, keep the state machine free of any terminal so it
+could be tested by calling functions, and route every deletion through the
+machinery `--auto` already uses rather than writing a second removal path.
+
+### What happened
+
+Built `src/tui/` in three parts — `model` (state, no terminal), `view` (paint,
+no decisions), `mod` (the terminal, the event loop, and the bridge to `trash`).
+`trash::run_selected` is the new entry point beside `run_auto`; it takes the
+same `ProvenGroups` token, so a browser over a `--stage size` scan will not
+type-check, and it enforces the survivor guard itself instead of trusting the
+UI. `Rule::keeper_of` is now the single definition of what each keep rule
+means, called by both `plan_auto` and the browser's bulk menu.
+
+**Two bugs the end-to-end runs caught that the unit tests had not.** Both were
+mine, both were in the same place, and both would have deleted the wrong file.
+
+1. *A mark named a screen position.* The first version passed
+   `(group position, member position)` to `run_selected`. That is correct until
+   the first deletion, after which the browser drops emptied groups and
+   renumbers what is left while the scan's own list does not change. The second
+   round of a session then named a different group. The scripted run showed it
+   as a deletion that removed nothing; the same drift with a live record on the
+   other end would have removed a file nobody chose. A mark is now
+   `(group in the scan, record in the scan)` — record indices never move —
+   and `run_selected` checks the record really is in the group it was filed
+   under. Regression test:
+   `a_mark_names_the_scans_group_even_after_the_list_has_renumbered`.
+2. *The survivor guard counted rows, not copies.* It refused a selection only
+   when it covered every member the scan recorded. Across two rounds that is
+   not the same question: a group of three that already lost one has two copies
+   left, and marking both passed a count against three. The guard now counts
+   members that are unmarked **and** still on disk. Regression test:
+   `the_guard_counts_copies_still_on_disk_rather_than_rows_in_the_group`.
+
+The end-to-end script drives the real binary through a pty. Two things a bare
+pty does not do for you: it has no window size until you set one with
+`TIOCSWINSZ`, and it does not answer the cursor-position query (`ESC[6n`) that
+the backend issues at startup. Without both the browser simply hangs, which
+cost an hour before I read the raw bytes coming back off the master fd.
+
+### Divergences from the curses oracle, and why
+
+- **The browser needs a flag to be asked for outright.** The oracle browses
+  whenever stdout is a terminal and neither `--list` nor `--auto` was given,
+  and so does this — but `-i`/`--interactive` says it explicitly, and only then
+  is a pipe an error (exit 2, `NO_TERMINAL`) rather than a silent fall-through.
+  A default that refuses loudly would have printed a refusal on every piped
+  run the harness makes; a flag that refuses silently would be useless to a
+  script that meant it. This is the one flag the oracle does not have.
+- **Overlays are `Block`s.** curses drew `┌─ TITLE ─┐` by hand and measured its
+  own text. A bordered ratatui block does both, so the corners are rounded and
+  the footer is a bottom title. Same information, native idiom.
+- **The help text says what ENTER will actually do.** The oracle's help always
+  reads "move marked files to Trash" even under `--hard`; here it reads
+  "delete marked files permanently" when that is what will happen. The oracle's
+  own confirmation dialog already made that distinction, so this is the help
+  text catching up with it rather than a new behaviour.
+- **The help text lists `n` / `p`.** They have always been group navigation in
+  the oracle; its help never mentioned them.
+- **The post-deletion flash says "deleted" under `--hard`.** The oracle says
+  "moved N files" either way.
+- **No summary flash is lost on the way out.** In the oracle, finishing the
+  last group returns from `run()` before the next `draw`, so the "moved N
+  files" message it just set is never painted. Here the same thing happens, and
+  the summary the user actually reads is the one printed on the restored
+  terminal — which the oracle also prints. No information is missing; it is
+  just not written twice.
+- **Dates need a subprocess.** `strftime("%Y-%m-%d", localtime(...))` has no
+  std equivalent that knows the local zone, and §7 keeps `unsafe` (and so
+  `localtime_r`) inside the bulk-walk FFI module. `date +%z` runs once per
+  session — the same footing as the `id -u` in `trash` — and the date is then
+  pure arithmetic. UTC is the fallback; being wrong about the zone shifts a
+  displayed date by at most a day and cannot affect what is deleted.
+
+### `getattrlistbulk(2)`, re-deferred
+
+LOG.md's "smaller divergences" entry named M5 as the milestone that would land
+the bulk walk, "or a dedicated performance pass if M5 is never commissioned".
+M5 has now been commissioned and it is not that milestone: M5-TUI.md scopes
+this run to the browser and says to match the oracle's feature set and stop
+there, and REWRITE.md §6's wall-time targets are already met without the FFI.
+Landing an `unsafe` walk rewrite inside a milestone whose review is blocking
+because it is deletion-adjacent would be the wrong thing to put in the same
+diff. It belongs to a dedicated performance pass, which is where I am leaving
+it, said plainly here rather than dropped quietly.
+
+### Crate justification (REWRITE.md §7)
+
+`ratatui` is on the allowlist for M5. `cargo add ratatui` with default features
+pulls the termwiz, termion and termina backends as well — 110 crates including
+`wezterm-*`, `uuid` and `time`. M5-TUI.md allows "`ratatui` + its default
+`crossterm` backend", so the dependency is
+`ratatui = { default-features = false, features = ["crossterm"] }`: 74 crates,
+and `crossterm` comes in through `ratatui::crossterm` rather than as a
+dependency of its own. Nothing in the scan, cache or deletion path links
+against any of it.
+
+### Numbers
+
+| check | result |
+| --- | --- |
+| `cargo test` | 101 passed, 0 failed |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `--gate all` | 0 — 33 checks, 0 failed |
+| end-to-end browser runs, 7 scenarios | 0 differing |
+| terminal restore, 3 exit paths | 0 differing |
+| CLI dispatch, 7 flag and terminal combinations | 0 differing |
+
+The suite went from 45 tests to 101. The 56 new ones are 27 on the model, 12
+on the paint through `TestBackend`, 9 on `run_selected` against real scratch
+trees, and 8 on the key map, the date arithmetic and the drop guard.
+
+Fence: `ls /Volumes` before and after the gate run showed `dedupbench`, which
+is another project's, and the stray `]` entry that appears in no mount table.
+No command of mine named a `/Volumes` path. Every tree the browser deleted from
+was generated under this session's scratchpad, under `m5-`-prefixed names, with
+`HOME` pointed at a scratch directory so nothing reached the real Trash.
+
+## 2026-08-23 — REVIEW-M5 fix round
+
+### Hypothesis
+
+Both binding items looked local — one wrong string handed to a shared
+function, one early return in the wrong place — but REVIEW-M5 names a root
+cause they share, and the fix is only worth having if it addresses that: the
+browser's *view* of the world was leaking into decisions. So the question for
+each was not "what is the smallest edit" but "what stops this kind of leak".
+
+### 1. The bulk rules ranked a string built for drawing
+
+`apply_bulk` passed `Member.path` — the display path — to `Rule::keeper_of`,
+while `--auto` passes the record path. The two agree until the working
+directory sits inside the scanned tree, and then some members strip their
+prefix and others do not, the strings stop sharing one, and `name_order` stops
+being order-preserving between them. Standing in `tree/photos`, "keep the
+shortest path" kept `photos/aaaa.bin` (drawn as `aaaa.bin`) where
+`--auto shortest` kept `b.bin`. The user was told the longer path would go and
+the shorter one went.
+
+The oracle has no such split: `KEEP_RULES["shortest"]` ranks `fs[i].path`, and
+`.display` is a separate property built *from* it and used only for drawing
+(`dedup.py:2226`, `dedup.py:150-161`). So this was a divergence from the oracle
+and from this program's own `--auto` at once, and it was not in the logged list
+of chosen divergences, which makes it the silent kind M5-TUI.md forbids.
+
+`Member` now carries both strings, `name` (the scan's own, relative to the
+root) and `path` (what to draw), with the doc comment on each saying which is
+which and that they are not interchangeable. Every decision reads `name`;
+nothing but the painter reads `path`. Two comments that asserted the opposite —
+`trash.rs`'s "cannot come to mean one thing under `--auto` and another under a
+menu" and its twin in `model.rs` — were false when written and now say the
+thing that is actually true.
+
+**The lesson, since it is the general one: sharing the function is not sharing
+the rule if the inputs differ.** A shared `keeper_of` looked like it made the
+two paths agree by construction. It made them agree only about *how* to rank,
+and the argument decided *what*. `oldest` and `newest` were never affected
+because they compare `mtime`, which is one number with one meaning.
+
+### 2. Below 54×12 the confirmation was not drawn and `y` still deleted
+
+`view::draw` returns early on a frame too small to lay out — correct for the
+browse screen — but it returned before the overlay match, so in `Mode::Confirm`
+the dialog was not drawn while the model still accepted `y`. A deletion could
+proceed with the count, the bytes and the Trash-vs-permanent mode never on
+screen, which hard rule 3 forbids outright.
+
+REVIEW-M5 allowed either drawing the overlays before the early return (the
+oracle's shape — its `_put` clips per line) or refusing `Key::Apply` below the
+minimum. I took the second, and not only because it is smaller: at 20×8 a
+clipped box cannot show "Move to Trash: 1 files" at all, so the first option
+would satisfy the letter of "a dialog was drawn" while still deleting on
+numbers nobody could read. Drawing something is not the requirement; the
+numbers being legible is.
+
+The minimum now lives in `model.rs`, because it stopped being only a layout
+number the moment it decided what the browser would act on, and the paint layer
+reads it from there so the two cannot drift apart. The model carries
+`legible`, set from the area of the frame that was actually painted, and on a
+frame below the minimum it takes no key but `Quit`. Movement and marking go
+with it — acting on a list that was never drawn is the same mistake more
+cheaply — and the resize message the user *can* see is the one thing on screen.
+A `debug_assert` in the event loop makes the invariant loud if it is ever
+inverted.
+
+### Taken from the non-binding notes
+
+- **Nothing tested the browser's re-read of a cache-attested group.** The
+  reviewer showed that deleting the `verify_attested` call in `run_selected`
+  left every test and the whole gate green, because `m3-poison-refusal` covers
+  `run_auto` and nothing covered its sibling. Closed with an end-to-end case:
+  warm the cache on two 24 MB copies, poison one byte in the *middle* and put
+  the mtime back, so head, tail and every sample point still match and only a
+  full re-read can tell. The scan reads 0 bytes and still reports the group —
+  that zero is the proof it was believed rather than seen — and the browser
+  reads it, disbelieves it, removes nothing and says why. I checked the test
+  can fail: with the `verify_attested` call removed it reports three differing
+  checks and `b.bin`, the copy that no longer matches, goes to the Trash.
+  105 unit tests stay green through that same removal, which is the reviewer's
+  point about where the hole was.
+- A mark is now a `Mark { group, record }` rather than a bare `(usize, usize)`.
+  This does not make a screen position unrepresentable — only a distinct type
+  for record indices would, and that is a wider change than a fix round should
+  carry — but the two fields are both `usize` and nothing except their order
+  distinguished them, and swapping them was a live failure mode.
+- Dropped the second `put_the_terminal_back` in `run`: the drop guard covers
+  every path it covered, and two mechanisms for one guarantee make a reader
+  ask which is load-bearing.
+- `evidence/m5-standards.txt` now has a generator beside it like the others.
+
+### The wrinkle inherited from the oracle, so nobody "fixes" it
+
+The confirmation counts records ("1 files") while the exit summary counts names
+("2 files moved to Trash") when a hardlink cluster is involved. The oracle does
+exactly this (`dedup.py:2462` against `dedup.py:2511`), so it is parity, not a
+bug. Changing either number would make it a divergence.
+
+### Numbers
+
+| check | result |
+| --- | --- |
+| `cargo test` | 105 passed, 0 failed (101 → 105) |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `--gate all` | 0 — 33 checks, 0 failed |
+| end-to-end browser runs, 10 scenarios | 0 differing |
+| terminal restore, 3 exit paths | 0 differing |
+| CLI dispatch, 7 flag and terminal combinations | 0 differing |
+
+`m5-screens.txt` came back byte-identical, which REVIEW-M5 expected to move. It
+did not because that script runs the browser with its working directory at the
+scanned root, where the display name and the scan name are the same string, and
+because it only opens the bulk menu to photograph it and leaves with `esc`
+without applying a rule. The transcript was regenerated from the fixed binary
+all the same.
+
+Fence: `ls /Volumes` before and after the gate run showed `dedupbench`, which
+is another project's, and the stray `]` entry that appears in no mount table.
+No command of mine named a `/Volumes` path. Every tree deleted from was
+generated under this session's scratchpad with an `m5-` prefix and `HOME`
+pointed at a scratch directory.

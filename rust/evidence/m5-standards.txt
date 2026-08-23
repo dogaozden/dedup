@@ -1,0 +1,11 @@
+$ cargo test
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m5/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+
+$ cargo fmt --check
+(no output: clean)
