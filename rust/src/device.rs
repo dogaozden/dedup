@@ -11,7 +11,7 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::thread::JoinHandle;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Device {
@@ -21,14 +21,55 @@ pub struct Device {
     requested: Option<usize>,
 }
 
-impl Device {
-    pub fn probe(root: &Path, requested: Option<usize>) -> Self {
-        Device {
-            solid: is_solid_state(root),
+/// A volume probe in flight.
+///
+/// Asking what kind of disk this is means running `diskutil`, and a subprocess
+/// costs more than the whole scan of a small tree does. Nothing before the
+/// reader pools are sized needs the answer, so the ask goes out on a thread as
+/// soon as the root is known and is collected where it is first wanted — by
+/// which time the walk has been running against it.
+pub struct VolumeProbe {
+    asking: Option<JoinHandle<Option<bool>>>,
+    solid: Option<bool>,
+    requested: Option<usize>,
+}
+
+impl VolumeProbe {
+    pub fn start(root: &Path, requested: Option<usize>) -> Self {
+        let volume = root.to_path_buf();
+        VolumeProbe {
+            asking: Some(std::thread::spawn(move || is_solid_state(&volume))),
+            solid: None,
             requested,
         }
     }
 
+    /// The answer, waited for the first time and free afterwards.
+    pub fn device(&mut self) -> Device {
+        if let Some(asking) = self.asking.take() {
+            // A probe thread that panicked leaves us where an unreadable
+            // volume would: not knowing, which every caller already handles.
+            self.solid = asking.join().unwrap_or(None);
+        }
+        Device {
+            solid: self.solid,
+            requested: self.requested,
+        }
+    }
+}
+
+impl Drop for VolumeProbe {
+    /// A scan that never needed the answer still waits for it here rather than
+    /// exiting over the top of a live subprocess: an orphan finishing after we
+    /// are gone is load on whatever runs next.
+    fn drop(&mut self) {
+        if let Some(asking) = self.asking.take() {
+            let _ = asking.join();
+        }
+    }
+}
+
+impl Device {
     /// True only when the disk is known to be flash. "Don't know" is a no —
     /// this is what picks the comparison chunk, and a spinning disk pays a
     /// seek every time the round moves to the next file in a group.
@@ -85,11 +126,7 @@ fn is_solid_state(path: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    match ask_diskutil(&mount_point(path), "SolidState")?.as_str() {
-        value if value.starts_with("<true") => Some(true),
-        value if value.starts_with("<false") => Some(false),
-        _ => None,
-    }
+    crate::sys::solid_state(path)
 }
 
 /// A stable filename for the cache belonging to the volume `path` is on.
@@ -99,13 +136,8 @@ fn is_solid_state(path: &Path) -> Option<bool> {
 /// and guessing wrong only ever costs one cold scan.
 pub fn volume_uuid(path: &Path) -> String {
     let root = mount_point(path);
-    if let Some(uuid) = ask_diskutil(&root, "VolumeUUID")
-        .as_deref()
-        .and_then(|value| value.strip_prefix("<string>"))
-        .and_then(|value| value.split('<').next())
-        .filter(|value| !value.is_empty())
-    {
-        return uuid.to_string();
+    if let Some(uuid) = crate::sys::volume_uuid(&root) {
+        return uuid;
     }
     let digest = crate::stages::sha256(root.as_os_str().as_encoded_bytes());
     digest
@@ -115,42 +147,9 @@ pub fn volume_uuid(path: &Path) -> String {
         .to_string()
 }
 
-fn ask_diskutil(root: &Path, key: &str) -> Option<String> {
-    let output = Command::new("diskutil")
-        .args(["info", "-plist"])
-        .arg(root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    plist_value(&text, key).map(ToString::to_string)
-}
-
-/// Whatever element follows `<key>name</key>`. Enough of a plist reader for
-/// two boolean-or-string lookups, and it keeps the crate list short.
-fn plist_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let marker = format!("<key>{key}</key>");
-    let rest = text.split_once(&marker)?.1;
-    Some(rest.trim_start())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plist_lookup_finds_the_element_after_the_key() {
-        let text = "<dict>\n\t<key>SolidState</key>\n\t<true/>\n\t<key>VolumeUUID</key>\n\t<string>ABC-123</string>\n</dict>";
-        assert!(plist_value(text, "SolidState")
-            .expect("key present")
-            .starts_with("<true"));
-        assert!(plist_value(text, "VolumeUUID")
-            .expect("key present")
-            .starts_with("<string>ABC-123<"));
-        assert!(plist_value(text, "Missing").is_none());
-    }
 
     #[test]
     fn an_explicit_j_overrides_both_pools() {

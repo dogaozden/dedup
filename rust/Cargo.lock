@@ -213,6 +213,7 @@ dependencies = [
 name = "dedup-rs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ratatui",
  "rayon",
  "rusqlite",

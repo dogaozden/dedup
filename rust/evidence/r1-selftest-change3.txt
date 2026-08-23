@@ -1,0 +1,24 @@
+rbench selftest: samesize at smoke scale
+
+  built samesize       142 files    59.0 MB  in 0.1s
+  ceiling samesize  oracle read    3.0 MB in 158 opens  (0.1s)
+  control, no sabotage      clean
+
+  drop-group                caught by the correctness gate
+      candidate: wrong answer on samesize — 1 group(s) not reported, e.g. [['same/g000-0.bin', 'same/g000-1.bin']]
+
+  inflate-bytes             caught by the bytes ceiling
+      candidate: read 10.1 MB where the oracle read 3.0 MB — reading more than the oracle is a regression
+
+  underreport-bytes         caught by the byte floor
+      candidate: read 780.0 KB — proving these groups takes at least 2.0 MB, so they were not proved
+  built samesize       142 files    59.0 MB  in 0.1s
+  ceiling samesize  oracle read    3.0 MB in 158 opens  (0.1s)
+
+  touch-corpus              caught by the manifest tripwire
+      the corpus moved under samesize: same/bigtwin-a.bin was modified during the run
+  built samesize       142 files    59.0 MB  in 0.1s
+  ceiling samesize  oracle read    3.0 MB in 158 opens  (0.1s)
+
+selftest passed
+EXIT=0

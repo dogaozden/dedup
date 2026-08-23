@@ -1,0 +1,38 @@
+rbench: building candidate ... 27.3s
+rbench: volume /Volumes/dedupbench (reused), scale default, seed 2, rounds 9
+rbench: baseline c238b30d9e55   candidate worktree 824685c9ec98
+rbench: load average 3.91 4.90 4.56
+  built needle      100000 files   244.0 MB  in 6.2s
+  ceiling needle    oracle read  244.0 MB in 100000 opens  (3.3s)
+rbench: needle ... 0.9654  (±1.8%)
+  ceiling typical   oracle read   64.8 MB in 10473 opens  (0.6s)
+rbench: typical ... 0.8246  (±1.2%)
+  ceiling samesize  oracle read   33.2 MB in 1586 opens  (0.2s)
+rbench: samesize ... 0.9637  (±3.8%)
+  ceiling widegroup oracle read  126.3 MB in 1542 opens  (0.3s)
+rbench: widegroup ... 1.0249  (±6.5%)
+  built photos         100 files   390.1 MB  in 0.6s
+  ceiling photos    oracle read  149.2 MB in 125 opens  (0.2s)
+rbench: photos ... 0.9831  (±6.5%)
+  built bigheader        8 files   450.0 MB  in 0.5s
+  ceiling bigheader oracle read  146.2 MB in  20 opens  (0.2s)
+rbench: bigheader ... 1.0241  (±11.0%)
+  rescan does not match its manifest (3 group(s) not reported, e.g. [['album/copies/pair000.jpg', 'album/pair000/a.jpg'], ['album/set/five-0.jpg', 'album/set/five-1.jpg', 'album/set/five-2.jpg']]); rebuilding
+  built rescan          13 files    42.2 MB  in 0.0s
+  ceiling rescan    oracle read   25.8 MB in  29 opens  (0.1s)
+rbench: rescan ... 0.6337  (±1.5%)
+
+scenario   base s  cand s   ratio  spread     bytes   ceiling     floor
+───────────────────────────────────────────────────────────────────────
+needle     1.6944  1.6478  0.9654   ±1.8%  244.0 MB  244.0 MB  259.8 KB
+typical    0.1905  0.1564  0.8246   ±1.2%   64.8 MB   64.8 MB   36.2 MB
+samesize   0.0848  0.0818  0.9637   ±3.8%   33.2 MB   33.2 MB   23.0 MB
+widegroup  0.1124  0.1164  1.0249   ±6.5%  126.3 MB  126.3 MB  126.3 MB
+photos     0.0848  0.0832  0.9831   ±6.5%  149.2 MB  149.2 MB  149.1 MB
+bigheader  0.0820  0.0899  1.0241  ±11.0%  146.2 MB  146.2 MB  112.0 MB
+rescan     0.1224  0.0784  0.6337   ±1.5%       0 B   25.8 MB   25.8 MB
+
+(/Users/dogaozden/AI_Projects/dedup-opus-r1/rbench/state/results.json)
+
+SCORE: 0.9062
+EXIT=0

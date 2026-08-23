@@ -14,6 +14,7 @@ mod filters;
 mod ordered;
 mod pipeline;
 mod stages;
+mod sys;
 mod trash;
 mod tui;
 mod walk;
@@ -27,7 +28,7 @@ use serde::Serialize;
 use cache::ScanCache;
 use compare::Compare;
 use consts::DEFAULT_MIN_SIZE;
-use device::Device;
+use device::{Device, VolumeProbe};
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
 use pipeline::{find_duplicates, report_names, size_stage};
@@ -168,12 +169,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let effort = Effort::default();
-    let device = Device::probe(&root, options.jobs);
+    // Started rather than answered: what kind of disk this is takes a
+    // subprocess to find out, and nothing needs it until the pools are sized.
+    let mut probe = VolumeProbe::start(&root, options.jobs);
     let mut cache = (!options.no_cache && options.stage != "size").then(ScanCache::new);
     let mut scan = if options.stage == "size" {
         size_stage(&root, filters)
     } else {
-        find_duplicates(&root, filters, device, &effort, cache.as_mut())
+        find_duplicates(&root, filters, &mut probe, &effort, cache.as_mut())
     };
     scan.unreadable.sort();
     scan.unreadable.dedup();
@@ -203,6 +206,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // describes the scan rather than the wreckage. The cache is still open on
     // purpose: a group it vouched for has to be read again before anything in
     // it goes.
+    let device = probe.device();
     let code = match rule {
         None => browse(&options, &scan, &root, &effort, device, cache.as_mut()),
         Some(rule) => match scan.proven() {
