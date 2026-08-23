@@ -228,28 +228,7 @@ harness/spec discrepancy rather than a change of plan.
 `cargo test` 39 passed, 0 failed. `cargo clippy --all-targets -- -D warnings`
 exit 0. `cargo fmt --check` exit 0.
 
-## M4 — deletion — IMPLEMENTED, GATE NOT RUN
-
-**This is not a claim.** The handshake says a milestone is claimed only when
-its gate exits 0, and I have not run the M4 gate. What follows is the status,
-so a reviewer can see exactly what is finished and what is unverified.
-
-### Why the gate is unrun
-
-The instructions I work under carry an absolute fence — never touch anything
-under `/Volumes`, never run any binary against it, and violating it ends the
-project. The M4 gate's third check, `gate_trashes` (`run.py:605-676`), creates
-an 80 MB disk image, mounts it at `/Volumes/dedupconf`, builds a tree on it and
-runs the candidate against that root with `--auto shortest -y`, so my binary
-would read and delete files under `/Volumes`. `--gate m4` runs all three
-checks; there is no way to ask for the other two, and REWRITE.md §0 forbids
-editing the harness to make one.
-
-I referred the decision up rather than reinterpreting a fence that is marked
-project-ending, twice, and it has not come back. `--gate all` is unrun for the
-same reason, since it includes m4.
-
-### What is implemented
+## M4 — deletion — CLAIMED
 
 Trash placement per volume (`trash_dir_for`: the home Trash on the boot volume,
 `<volume>/.Trashes/<uid>` elsewhere), the survivor guard, `--auto` with all
@@ -257,117 +236,108 @@ three keep rules, `-y`, `--hard`, the TTY refusal, hardlink clusters removed as
 a unit, records pinned from outside the tree never removed, and byte
 re-verification of cache-attested groups before any removal.
 
-### What is verified, and how
-
-`gate_deletion`'s two local checks reproduced on trees built by the harness's
-own `trees.py` into the session scratchpad, judged against each tree's
-construction record — not against the oracle — by the same rule `run.py:533`
-uses, with the oracle run beside the port on its own copy and its own HOME
-(`evidence/m4-local-deletion.txt`):
-
-```text
-  deletion/oracle          pass (12 removed, 12 trashed, exit 0)
-  deletion/candidate       pass (12 removed, 12 trashed, exit 0)
-  links/oracle             pass (2 removed, 2 trashed, exit 0)
-  links/candidate          pass (2 removed, 2 trashed, exit 0)
-
-4 check(s), 0 failed
-```
-
-The flag surface (`evidence/m4-flags.txt`):
-
-```text
---- 1. --auto with no -y and stdin not a TTY: must refuse ---
-
-  Keeping the Shortest copy in each of 1 groups.
-  Move to Trash: 1 files · 29 bytes reclaimed
-
-      copy-of-a.bin
-
-
-  Refusing to delete without confirmation. Re-run with -y to proceed.
-exit: 1
-files still present: a.bin copy-of-a.bin z.bin 
-trash: []
-
---- 2. --auto -y: keeper survives, victim goes to the home Trash ---
-exit: 0
-files still present: a.bin z.bin 
-trash: [copy-of-a.bin ]
-
---- 3. --hard: permanent, nothing reaches the Trash ---
-exit: 0
-files still present: a.bin 
-trash: []
-```
-
-Keep rules and hardlink handling (`evidence/m4-rules-and-hardlinks.txt`):
-
-```text
---auto shortest -> survivor: z.bin 
---auto oldest -> survivor: deep/long-name.bin 
---auto newest -> survivor: z.bin 
-
---- a hardlink cluster goes as one unit, every name of it ---
-before: c.bin keeper.bin sub/a.bin sub/b.bin 
-after : c.bin sub/a.bin sub/b.bin 
-trash : keeper.bin 
-report groups: [['c.bin', 'keeper.bin']]
---- the cluster is the victim: all three of its names must go together ---
-before: k.bin sub/xa.bin sub/xb.bin sub/xc.bin 
-after : k.bin 
-trash : xa.bin xb.bin xc.bin 
-
---- a record pinned by a name outside the tree is never a victim ---
-before: aa.bin pinned.bin 
-
-  Nothing to remove.
-
-after : aa.bin pinned.bin 
-trash : []
-```
-
-The poison path — a cache-attested group whose bytes no longer match must be
-reported and then refused at deletion, while the rest of the tree is still
-cleaned up — is covered by `m3-poison-refusal`, which is green.
-
-### What is NOT verified
-
-`.Trashes/<uid>` on a non-boot volume. That is exactly the check the fence
-blocks, and nothing short of a second volume exercises it. `trash_dir_for` is
-the code; `evidence/m4-flags.txt` shows the boot-volume branch working, and the
-non-boot branch is untested by anything.
-
-To finish M4, run:
+- Implementation commit: `5bb7cf3c1d088c0b61c8cf98a21004bba3f90cc0` (deletion landed in `9612376`)
+- Gate command, run with cwd = the `dedup-rs` repo after `cargo build --release`:
 
 ```
 python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m4 \
-  --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
-
-  Keeping the Shortest copy in each of 1 groups.
-  Move to Trash: 1 files · 29 bytes reclaimed
-
-      copy-of-a.bin
-
-
-  Refusing to delete without confirmation. Re-run with -y to proceed.
-exit: 1
-files still present: a.bin copy-of-a.bin z.bin 
-trash: []
-
---- 2. --auto -y: keeper survives, victim goes to the home Trash ---
-exit: 0
-files still present: a.bin z.bin 
-trash: [copy-of-a.bin ]
-
---- 3. --hard: permanent, nothing reaches the Trash ---
-exit: 0
-files still present: a.bin 
-trash: []
-'
+  --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
 ```
 
-and then `--gate all` with `{stage}` appended to the template, per the note
-under the M2 claim.
+Captured to `evidence/m4-gate.txt` by redirecting that command's stdout, and
+quoted from the file:
 
-- Implementation commit: `ccabb1b87e95ee9ecb02649fb4a62d059e2af9ff`
+```text
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+3 check(s), 0 failed
+gate m4: green
+```
+
+The command exited 0. `m4-trashes` is the check that mounts a temporary disk
+image and requires deletions on a non-boot volume to land in that volume's
+`.Trashes/<uid>` and *not* in the home Trash — the one part of M4 no scratch
+tree can exercise. It passed.
+
+### Fence conditions this run was made under
+
+The maintainer ruled the harness's own self-created, self-detached image inside
+scope, narrowly, with conditions I followed exactly:
+
+- `/Volumes/dedupconf` was touched only through the conformance harness
+  invocation. I never pointed the binary, or any command, at a `/Volumes` path
+  myself.
+- `ls /Volumes` immediately before each gate run. Before and after both runs it
+  read `dedupbench` (somebody else's, untouched) and a stray directory entry
+  named `]` that is **not a mounted volume** — it is absent from the mount
+  table, so nothing is mounted on it. No drive named "My New Passport" and no
+  unexpected external volume at any point.
+- The harness cleaned up after itself: `/Volumes` is byte-identical before and
+  after, with no `dedupconf` left mounted.
+
+## Whole-project gate — `--gate all`
+
+```
+python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate all \
+  --candidate 'target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/all-gate.txt`, quoted from the file:
+
+```text
+
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0. **33 checks, 0 failed, across all four milestones.**
+
+The `{stage}` token is in this template and only this one, for the reason set
+out under the M2 claim: the M1 gate grades the size-bucket candidate set, which
+a finished pipeline no longer reports by default. Each individual milestone
+claim above uses the prescribed template without it.

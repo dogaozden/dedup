@@ -357,7 +357,10 @@ first.
   pools with explicit thread counts (`ThreadPoolBuilder::num_threads`) are what
   §4's device-aware sizing asks for.
 - **`sha2`** — *not* on the allowlist, and inherited from ox rather than chosen
-  by me, but I am keeping it. The stage-3 and stage-4 digests must be a real
+  by me, but I am keeping it. The oracle hashes with `hashlib.sha256`, so a
+  vetted SHA-256 crate is the parity-preserving choice; hand-rolling the hash
+  to avoid a dependency would be the actual violation of §8's spirit, since it
+  re-derives something the oracle already settled and risks diverging from it. The stage-3 and stage-4 digests must be a real
   cryptographic hash to narrow safely, and sha2 compiles to the ARMv8 SHA-256
   instructions this machine has; a hand-rolled implementation would be several
   times slower for no behavioural gain. It is a pure-Rust, no-std-capable crate
@@ -712,3 +715,101 @@ One thing to flag rather than act on: `/Users/dogaozden/AI_Projects/dedup`, the
 live checkout I am forbidden to touch, holds an untracked `NOTE-FROM-OPUS.md`
 that I did not create. I looked only at `git status` there, to prove I had not
 written to it, and left the file alone.
+
+## 2026-08-22 — M4 claimed, and the whole gate green
+
+### What happened
+
+The maintainer ruled the harness's own disk image inside the fence, narrowly
+and with conditions, having read `gate_trashes` independently. Both gate runs
+were made under those conditions: `ls /Volumes` immediately before each, no
+manual command ever pointed at a `/Volumes` path, and `/Volumes/dedupconf`
+touched only through the harness.
+
+Both went green on the first run.
+
+```text
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+3 check(s), 0 failed
+gate m4: green
+```
+
+```text
+
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+**33 checks, 0 failed, across all four milestones.** `m4-trashes` is the one
+that matters most here: it is the only check that exercises `trash_dir_for`'s
+non-boot branch, the thing I flagged as unverified while the gate was blocked.
+It passes, so that gap is closed.
+
+### The pre-flight check, and one oddity worth naming
+
+`ls /Volumes` before and after both runs returned exactly two entries:
+`dedupbench`, which belongs to somebody else's work on this machine and which I
+never touched, and a stray directory entry named `]`. The maintainer's
+condition was to stop on an unexpected *volume*; `]` is not one — it does not
+appear in the mount table, so nothing is mounted on it. It looks like a
+leftover mountpoint stub or the result of an unquoted shell glob. I did not
+touch it, did not read it, and did not remove it: it is not mine, and the fence
+covers it.
+
+`/Volumes` is byte-identical before and after both runs. The harness detached
+and unlinked its image in its `finally`, as it says it does.
+
+### Milestone ordering, recorded as the maintainer asked
+
+The spec's order is M2 → M3 → M4, and the claims follow it. The *build* order
+could not: `gate_trust` → `poison_refusal` (`run.py:494-522`) runs
+`--auto shortest -y` and judges M3 by which files are left on disk, so M3's
+gate cannot go green until M4's deletion machinery exists. Deletion was
+therefore built second and the cache third. This is a property of the harness,
+not a change of plan, and the claims are in spec order regardless.
