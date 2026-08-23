@@ -1381,7 +1381,7 @@ test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
 
 
 $ cargo clippy --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
 
 $ cargo fmt --check
 (no output: clean)
@@ -1482,7 +1482,8 @@ the rule was built and run:
 python3 rust/evidence/scripts/menu_mutants.py
 ```
 
-Captured to `evidence/m5_1-mutants.txt`:
+Captured to `evidence/m5_1-mutants.txt`, the six that attack the table (the
+same script's two terminal-death mutants are quoted under the re-claim below):
 
 ```text
 mutant help-misses-a-flag           renders every flag but the first
@@ -1502,8 +1503,6 @@ mutant menu-drops-a-field           leaves a field out of the argument list it h
 
 mutant menu-skips-validation        accepts whatever is typed and lets the scan find out
   caught by a_bad_profile_is_refused_the_same_way, a_field_is_refused_in_the_field_with_the_parsers_own_words, a_refusal_is_shown_beside_the_field_it_belongs_to
-
-every mutant was caught
 ```
 
 ### The menu
@@ -1626,7 +1625,7 @@ test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
 
 
 $ cargo clippy --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
 
 $ cargo fmt --check
 (no output: clean)
