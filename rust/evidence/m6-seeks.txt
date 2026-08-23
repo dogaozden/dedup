@@ -1,0 +1,23 @@
+$ python3 rust/evidence/scripts/spinning_seeks.py
+
+One group of N identical files, one reader (-j 1).
+
+files    MiB   flash seeks   spinning seeks   ratio      flash MiB   spinning MiB   groups
+    4     20            64               20     3.2x        82.0           80.0        1
+    8     20           128               40     3.2x       164.0          160.0        1
+   16     20           256               86     3.0x       328.0          359.9        1
+   32     20           512              172     3.0x       656.0          719.8        1
+    6    100           216               60     3.6x       603.0          600.0        1
+
+Same corpora at the default reader count, for scale only (threads interleave, so these move between runs):
+files    MiB   flash seeks   spinning seeks
+    4     20            59               20
+    8     20           124               40
+   16     20           255               86
+   32     20           512              172
+    6    100           192               60
+
+spinning issues fewer seeks on every corpus: between 3.0x and 3.6x fewer
+HDD wall-clock unvalidated: no rotational drive is available here.
+
+exit=0

@@ -472,69 +472,16 @@ pub fn split_identical_capped(
 
     let mut clusters: Vec<Vec<usize>> = members.iter().map(|&index| vec![index]).collect();
     while clusters.len() > 1 {
-        let mut merged = clusters.remove(0);
-        let pivot = merged[0];
-        let mut leftovers: Vec<Vec<usize>> = Vec::new();
-        let mut pivot_lost = false;
-
+        let mut round = Round::around(clusters.remove(0));
         for batch in clusters.chunks(SPIN_INTERLEAVE - 1) {
             let mut cohort = Vec::with_capacity(batch.len() + 1);
-            cohort.push(pivot);
+            cohort.push(round.pivot);
             cohort.extend(batch.iter().map(|cluster| cluster[0]));
             let (runs, lost) =
                 compare_cohort(context, records, &cohort, chunk, &mut settled, unreadable);
-            pivot_lost |= lost.contains(&pivot);
-
-            for run in runs {
-                let mut fused: Vec<usize> = Vec::new();
-                let with_pivot = run.contains(&pivot);
-                for representative in run {
-                    if representative == pivot {
-                        continue;
-                    }
-                    let cluster = batch
-                        .iter()
-                        .find(|cluster| cluster[0] == representative)
-                        .expect("every representative came from this batch");
-                    if with_pivot {
-                        merged.extend_from_slice(cluster);
-                    } else {
-                        fused.extend_from_slice(cluster);
-                    }
-                }
-                if !fused.is_empty() {
-                    leftovers.push(fused);
-                }
-            }
-            // A cluster whose representative could not be read this pass keeps
-            // its other members: they were proved equal to each other before
-            // the file went away.
-            for index in lost {
-                if index == pivot {
-                    continue;
-                }
-                let rest: Vec<usize> = batch
-                    .iter()
-                    .find(|cluster| cluster[0] == index)
-                    .expect("every lost member came from this batch")[1..]
-                    .to_vec();
-                if !rest.is_empty() {
-                    leftovers.push(rest);
-                }
-            }
+            round.fold(batch, &runs, &lost);
         }
-
-        if pivot_lost {
-            // The pivot proved nothing about anybody, so its cluster goes back
-            // in without it and is offered a new representative next round.
-            merged.retain(|&index| index != pivot);
-            if !merged.is_empty() {
-                leftovers.insert(0, merged);
-            }
-        } else if merged.len() > 1 {
-            settled.matched.push(merged);
-        }
-        clusters = leftovers;
+        clusters = round.close(&mut settled.matched);
     }
     // Whatever the last round left: already proved equal among themselves.
     if let Some(last) = clusters.pop() {
@@ -543,6 +490,97 @@ pub fn split_identical_capped(
         }
     }
     settled
+}
+
+/// One pivot's sweep over the pool, in the middle of being taken.
+///
+/// The bookkeeping is separated from the reading for the reason M5-TUI.md gives
+/// for separating the model from the paint: the interesting case is a file that
+/// goes away between one cohort and the next, and no test can stage that with a
+/// real file. Here it is three arguments.
+struct Round {
+    pivot: usize,
+    /// The pivot's cluster, and everything proved equal to it this sweep.
+    merged: Vec<usize>,
+    /// Clusters for the next pivot to try, in the order they were met.
+    leftovers: Vec<Vec<usize>>,
+    /// Whether some cohort could not read the pivot. Nothing that cohort saw
+    /// was measured against anything, so the sweep proves less than it looks
+    /// like it did.
+    lost_the_pivot: bool,
+}
+
+impl Round {
+    fn around(cluster: Vec<usize>) -> Round {
+        Round {
+            pivot: cluster[0],
+            merged: cluster,
+            leftovers: Vec::new(),
+            lost_the_pivot: false,
+        }
+    }
+
+    /// Take in what one cohort came back with: `runs` partitions the cohort
+    /// members that were read, `lost` names the ones that were not.
+    fn fold(&mut self, batch: &[Vec<usize>], runs: &[Vec<usize>], lost: &[usize]) {
+        let cluster_of = |representative: usize| -> &[usize] {
+            batch
+                .iter()
+                .find(|cluster| cluster[0] == representative)
+                .expect("every name in a cohort came from this batch")
+        };
+        self.lost_the_pivot |= lost.contains(&self.pivot);
+
+        for run in runs {
+            let mut fused: Vec<usize> = Vec::new();
+            let with_pivot = run.contains(&self.pivot);
+            for &representative in run {
+                if representative == self.pivot {
+                    continue;
+                }
+                if with_pivot {
+                    self.merged.extend_from_slice(cluster_of(representative));
+                } else {
+                    fused.extend_from_slice(cluster_of(representative));
+                }
+            }
+            if !fused.is_empty() {
+                self.leftovers.push(fused);
+            }
+        }
+
+        // A cluster whose representative could not be read keeps its other
+        // members: they were proved equal to each other before the file went
+        // away, and one of them speaks for the cluster next time.
+        for &index in lost {
+            if index == self.pivot {
+                continue;
+            }
+            let rest = cluster_of(index)[1..].to_vec();
+            if !rest.is_empty() {
+                self.leftovers.push(rest);
+            }
+        }
+    }
+
+    /// Finish the sweep: settle the pivot's class if there is one, and hand
+    /// back the pool for the next pivot.
+    fn close(mut self, matched: &mut Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+        if self.lost_the_pivot {
+            // Everything this sweep did NOT put in `merged` was sent to the
+            // pool without ever being measured against the pivot, so settling
+            // `merged` here would strand its members: a file equal to them,
+            // sitting in the pool, would never meet them again. The cluster
+            // goes back in without the pivot and takes its turn afresh.
+            self.merged.retain(|&index| index != self.pivot);
+            if !self.merged.is_empty() {
+                self.leftovers.insert(0, self.merged);
+            }
+        } else if self.merged.len() > 1 {
+            matched.push(self.merged);
+        }
+        self.leftovers
+    }
 }
 
 /// Run `split_identical` over every candidate group.
@@ -756,5 +794,328 @@ mod tests {
         }
         // ...and the width cap is what keeps that inside the budget.
         assert_eq!(SLOW_CHUNK * SPIN_INTERLEAVE, COMPARE_BUDGET);
+    }
+
+    // ------------------------------------------------ the capped comparison
+
+    /// A scratch tree of same-size files, one per content class.
+    struct Bench {
+        root: std::path::PathBuf,
+        records: Vec<FileRec>,
+    }
+
+    impl Drop for Bench {
+        fn drop(&mut self) {
+            for record in &self.records {
+                let _ = std::fs::set_permissions(
+                    self.root.join(record.path()),
+                    std::os::unix::fs::PermissionsExt::from_mode(0o644),
+                );
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Bench {
+        /// One file per letter, every file the same length, files sharing a
+        /// letter sharing their bytes. `chunk` says how long, so a caller can
+        /// choose whether the comparison takes one round or several.
+        fn new(name: &str, classes: &[u8], size: usize) -> Bench {
+            let root = std::env::temp_dir().join(format!(
+                "feat-capped-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("a scratch directory");
+            let mut records = Vec::new();
+            for (position, &letter) in classes.iter().enumerate() {
+                // Same bytes everywhere but the last kilobyte, so nothing can
+                // separate two files without reading them to the end.
+                let mut content = vec![0x5A_u8; size];
+                let tail = content.len() - 1024;
+                content[tail..].fill(letter);
+                let path = format!("f{position:03}.bin");
+                std::fs::write(root.join(&path), &content).expect("a scratch file");
+                let meta = std::fs::metadata(root.join(&path)).expect("a stat");
+                use std::os::unix::fs::MetadataExt;
+                records.push(FileRec {
+                    names: vec![path],
+                    size: meta.size(),
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                    nlink: meta.nlink(),
+                    mtime_ns: 0,
+                    retained: None,
+                });
+            }
+            Bench { root, records }
+        }
+
+        fn lock(&self, position: usize) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                self.root.join(self.records[position].path()),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .expect("a scratch file we own");
+        }
+
+        /// The partition each comparison reaches, normalised so two answers
+        /// can be compared regardless of the order they were found in.
+        fn partitions(&self, chunk: usize) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+            let members: Vec<usize> = (0..self.records.len()).collect();
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            let plain = split_identical(
+                &Compare {
+                    root: &self.root,
+                    effort: &effort,
+                    profile: Profile::Flash,
+                    solid: true,
+                    learn: false,
+                },
+                &self.records,
+                &members,
+                chunk,
+                &mut sink,
+                None,
+            );
+            let mut sink = Vec::new();
+            let capped = split_identical_capped(
+                &Compare {
+                    root: &self.root,
+                    effort: &effort,
+                    profile: Profile::Spinning,
+                    solid: true,
+                    learn: false,
+                },
+                &self.records,
+                &members,
+                chunk,
+                &mut sink,
+            );
+            (tidy(plain.matched), tidy(capped.matched))
+        }
+    }
+
+    fn tidy(mut groups: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+        for group in groups.iter_mut() {
+            group.sort_unstable();
+        }
+        groups.sort();
+        groups
+    }
+
+    #[test]
+    fn a_group_wider_than_the_cap_still_comes_back_whole() {
+        // Three times the cohort width, every file the same: the sweep has to
+        // gather all of them into one class, across four cohorts.
+        let bench = Bench::new("wide", &[b'A'; 24], 8192);
+        let (plain, capped) = bench.partitions(4096);
+        assert_eq!(capped, vec![(0..24).collect::<Vec<usize>>()]);
+        assert_eq!(capped, plain);
+    }
+
+    #[test]
+    fn equal_members_split_across_cohorts_are_still_found() {
+        // The shape SPIN.md names: with a cap of 8 the first round compares
+        // the pivot against members 1..=7, then against 8..=14. Members 7 and
+        // 8 are the same file's content and never meet in that round. Only a
+        // later pass over what the first one left can put them together.
+        assert_eq!(SPIN_INTERLEAVE, 8, "this shape is built around the cap");
+        let classes = *b"ACCCCCCBBDDDDDDA";
+        let bench = Bench::new("boundary", &classes, 8192);
+        let (plain, capped) = bench.partitions(4096);
+        assert_eq!(
+            capped,
+            vec![
+                vec![0, 15],                 // A, either end of the group
+                vec![1, 2, 3, 4, 5, 6],      // C, all inside the first cohort
+                vec![7, 8],                  // B, one in each cohort of the first round
+                vec![9, 10, 11, 12, 13, 14], // D, all inside the second
+            ]
+        );
+        assert_eq!(capped, plain);
+    }
+
+    #[test]
+    fn a_member_that_matches_nobody_is_carried_to_every_later_pass() {
+        // The singletons are what a naive cohort split loses: each one has to
+        // be offered to every pivot before it can be called unique.
+        let classes = *b"ABCDEFGHIJKLMNOPA";
+        let bench = Bench::new("singletons", &classes, 8192);
+        let (plain, capped) = bench.partitions(4096);
+        assert_eq!(capped, vec![vec![0, 16]]);
+        assert_eq!(capped, plain);
+    }
+
+    #[test]
+    fn a_group_taking_several_rounds_is_partitioned_the_same_way() {
+        // Chunk smaller than the file, so the comparison runs to several
+        // rounds inside each cohort and the divergence is in the last one.
+        let classes = *b"AABBBCAAAAABBCCCCA";
+        let bench = Bench::new("rounds", &classes, 32 * 1024);
+        let (plain, capped) = bench.partitions(4096);
+        assert_eq!(capped, plain);
+        assert_eq!(
+            capped,
+            vec![
+                vec![0, 1, 6, 7, 8, 9, 10, 17],
+                vec![2, 3, 4, 11, 12],
+                vec![5, 13, 14, 15, 16],
+            ]
+        );
+    }
+
+    #[test]
+    fn the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape() {
+        // The property that matters, over shapes nobody chose by hand: the two
+        // comparisons are the same function. A partition carried wrongly
+        // between passes shows up here as a group the plain comparison did not
+        // find, or one it did.
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |ceiling: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % ceiling
+        };
+        for shape in 0..40 {
+            let width = 2 + next(30) as usize;
+            let variety = 1 + next(6) as u8;
+            let classes: Vec<u8> = (0..width)
+                .map(|_| b'A' + next(variety as u64) as u8)
+                .collect();
+            let bench = Bench::new(&format!("shape{shape}"), &classes, 8192);
+            let (plain, capped) = bench.partitions(4096);
+            assert_eq!(
+                capped,
+                plain,
+                "shape {shape}: {:?}",
+                String::from_utf8_lossy(&classes)
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else() {
+        let classes = *b"AAAAAAAAAAAABBBBBB";
+        let bench = Bench::new("locked", &classes, 8192);
+        // One from each class, one of them the very first file — which is the
+        // first round's pivot, the case that has to unwind a whole sweep.
+        bench.lock(0);
+        bench.lock(13);
+        let members: Vec<usize> = (0..bench.records.len()).collect();
+        let effort = Effort::default();
+        let mut unreadable = Vec::new();
+        let capped = split_identical_capped(
+            &Compare {
+                root: &bench.root,
+                effort: &effort,
+                profile: Profile::Spinning,
+                solid: true,
+                learn: false,
+            },
+            &bench.records,
+            &members,
+            4096,
+            &mut unreadable,
+        );
+        assert_eq!(
+            tidy(capped.matched),
+            vec![
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                vec![12, 14, 15, 16, 17]
+            ]
+        );
+        unreadable.sort();
+        unreadable.dedup();
+        assert_eq!(unreadable, vec!["f000.bin", "f013.bin"]);
+    }
+
+    // ------------------------------------------- the sweep's own bookkeeping
+
+    #[test]
+    fn a_run_holding_the_pivot_brings_whole_clusters_with_it() {
+        let mut round = Round::around(vec![1, 2]);
+        let batch = vec![vec![3, 4], vec![5], vec![6, 7, 8]];
+        // 3 matched the pivot; 5 and 6 matched each other but not it.
+        round.fold(&batch, &[vec![1, 3], vec![5, 6]], &[]);
+        let mut matched = Vec::new();
+        let pool = round.close(&mut matched);
+        assert_eq!(matched, vec![vec![1, 2, 3, 4]]);
+        assert_eq!(pool, vec![vec![5, 6, 7, 8]]);
+    }
+
+    #[test]
+    fn a_cluster_whose_representative_goes_away_keeps_its_other_members() {
+        let mut round = Round::around(vec![1]);
+        let batch = vec![vec![2, 3, 4], vec![5]];
+        // 2 could not be read this pass. 3 and 4 were proved equal to it
+        // before it went, so they stay in the pool as a cluster.
+        round.fold(&batch, &[vec![1, 5]], &[2]);
+        let mut matched = Vec::new();
+        let pool = round.close(&mut matched);
+        assert_eq!(matched, vec![vec![1, 5]]);
+        assert_eq!(pool, vec![vec![3, 4]]);
+    }
+
+    #[test]
+    fn a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in() {
+        // The case a file on disk cannot be made to produce: the pivot is read
+        // for the first cohort and gone by the second. What it proved in the
+        // first is real, but the second cohort's members were never measured
+        // against it — so settling the class now would strand them.
+        let mut round = Round::around(vec![1]);
+        round.fold(&[vec![2], vec![3]], &[vec![1, 2], vec![3]], &[]);
+        round.fold(&[vec![4], vec![5]], &[vec![4, 5]], &[1]);
+        let mut matched = Vec::new();
+        let pool = round.close(&mut matched);
+        assert!(
+            matched.is_empty(),
+            "nothing may be settled on a pivot half the sweep could not read"
+        );
+        // 2 was proved equal to the pivot, so it leads the cluster now; 4 and
+        // 5 are still to be offered to it.
+        assert_eq!(pool, vec![vec![2], vec![3], vec![4, 5]]);
+    }
+
+    #[test]
+    fn a_pivot_alone_and_unreadable_leaves_nothing_behind() {
+        let mut round = Round::around(vec![9]);
+        round.fold(&[vec![1], vec![2]], &[vec![1, 2]], &[9]);
+        let mut matched = Vec::new();
+        let pool = round.close(&mut matched);
+        assert!(matched.is_empty());
+        assert_eq!(pool, vec![vec![1, 2]], "9 is in no group and no pool");
+    }
+
+    #[test]
+    fn the_cohorts_never_hold_more_than_the_cap_open_at_once() {
+        // The whole point of the profile. `split_identical` opens every member
+        // it is given and charges an open for each, so the widest cohort is
+        // visible in the open count: a sweep of 24 files that opened them all
+        // at once would be the unchanged comparison wearing a new name.
+        let bench = Bench::new("width", &[b'A'; 24], 8192);
+        let members: Vec<usize> = (0..24).collect();
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        split_identical_capped(
+            &Compare {
+                root: &bench.root,
+                effort: &effort,
+                profile: Profile::Spinning,
+                solid: true,
+                learn: false,
+            },
+            &bench.records,
+            &members,
+            4096,
+            &mut sink,
+        );
+        // One round of four cohorts: 8 + 8 + 8 + 3 files, the pivot re-opened
+        // in each. Anything wider would mean the cap is not being applied.
+        assert_eq!(effort.opens(), 27);
     }
 }

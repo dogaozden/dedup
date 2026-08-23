@@ -1723,3 +1723,134 @@ by the script above, which is where a real pty belongs.
 
 **Verdict:** KEPT. Touches approved M5 code; the diff is the `poll` call, the
 two endings converging, and the skipped cursor restore.
+
+---
+
+## 2026-08-23 — M6, the spinning profile
+
+Commissioned after a real scan of a USB spinning drive sat in the compare stage
+for tens of hours at 1.5% CPU. The access patterns were tuned on a RAM disk
+where seeks are free. This makes the algorithm device-aware.
+
+### What the profile actually changes
+
+Four things, all behind `--profile spinning`, none of them reachable by default
+unless the disk positively reports rotational media:
+
+| stage | flash | spinning |
+|---|---|---|
+| ends probe | head 4 KiB + tail 4 KiB, one open | head 4 KiB only |
+| deep head | `HEAD_BYTES..DEEP_HEAD` | unchanged |
+| sample | 8 windows × 64 KiB past 8 MiB | skipped |
+| compare run | 4 MiB, shrinking with group width | 16 MiB, fixed |
+| compare width | the whole group at once | 8 at a time, partition carried |
+| readers | 8 random / 8 sequential on flash | 1 and 1 |
+
+The removed stages only ever narrowed, so removing them cannot change an
+answer — it only sends more candidates to the comparison, which reads bytes.
+That is the whole correctness argument for items 1 and 2, and it is why the
+differential found nothing to fix there.
+
+### The capped comparison, and why it is exact
+
+The one real algorithm change. A cluster is a set of records already proved
+byte-equal. Each round takes one cluster's representative as pivot and compares
+it, in cohorts of at most 8, against every other cluster's representative.
+`split_identical` on a cohort is the unchanged lockstep comparison, so its runs
+are exactly the cohort members whose bytes agree to the last one; byte equality
+is transitive, so a representative that matches the pivot brings its cluster,
+and two representatives that match each other fuse theirs. It is the same
+reasoning `partition_blocks` has always rested on, where a run is every block
+equal to the run's first.
+
+For the ordinary case — a wide group of genuine copies — this is one sweep: the
+pivot is re-read once per cohort and everyone else once. At 32 copies of a
+20 MiB file that is 720 MiB read against flash's 656 MiB, for 172 seeks against
+512.
+
+### Numbers
+
+Seeks, `-j 1`, one group of N identical files (`evidence/m6-seeks.txt`):
+
+| files | MiB each | flash | spinning |
+|---|---|---|---|
+| 4 | 20 | 64 | 20 |
+| 8 | 20 | 128 | 40 |
+| 16 | 20 | 256 | 86 |
+| 32 | 20 | 512 | 172 |
+| 6 | 100 | 216 | 60 |
+
+Between 3.0x and 3.6x fewer, and stable to the count across repeated runs at
+one reader. At 32 copies the flash total decomposes as 64 end probes (two
+seeks each), 32 deep heads, 256 sample windows and 192 compare rounds — the
+sample stage alone is half of it, which is why SPIN.md named it.
+
+**HDD wall-clock unvalidated.** No rotational drive is available; the only one
+on this machine is fenced. Nothing here claims a speedup, only a seek count and
+a proof of correctness.
+
+### The bug this milestone could have shipped
+
+The end probe's digest under `spinning` covers the head alone. Under `flash` it
+covers head and tail. Both were going to be written to the cache's `ends`
+column. A scan that found one file's digest remembered and had to read
+another's would then have compared a head against a head-and-tail — and two
+identical files would have landed in different buckets and never been reported.
+
+It is invisible to everything: the gate never passes `--profile`, a warm scan
+under one profile alone is self-consistent, and a cold scan has no cache to be
+wrong about. It needs a warm cache, a mixed state, and a profile switch.
+
+The fix is a column of its own (`Field::Head`, `CACHE_SCHEMA` 3 → 4, so caches
+written by an earlier build are discarded once). The regression check is in
+`evidence/scripts/spinning_meets_the_rest.py`, and `spinning_mutants.py` builds
+the one-column version and shows it losing the duplicate:
+
+```
+mutant one-cache-column           files the head-only probe and the two-ends probe in the same column
+  caught: warm flash then spinning reported [('a.bin', 'b.bin')], oracle [('a.bin', 'b.bin', 'e.bin')]
+```
+
+### Chosen divergences
+
+- **`auto` never guesses `spinning`.** An unknown medium gets `flash` plus one
+  line on stderr suggesting the flag. SPIN.md asks for this, and the reason is
+  that external SSD enclosures are the common case among devices that do not
+  report; treating one as a spinning disk costs far more than the reverse.
+- **The hint prints after the scan, not before it.** The volume probe is
+  collected inside `find_duplicates`, deliberately, so the walk runs while the
+  probe is in flight. Blocking on it in `main` to print advice sooner would
+  undo that. The advice is for next time either way.
+- **`seeks` is in the report JSON.** Not part of the conformance protocol —
+  `conformance/run.py:127` checks only that the six protocol keys are present,
+  and the oracle's own driver already emits three extra keys of its own. A
+  number nobody can read out of a run is a number nobody can check.
+- **Counting seeks costs a mutex per read block.** An atomic pair could tear
+  and report a jump that did not happen. The lock is held for two comparisons
+  against a read syscall that moves up to 16 MiB.
+- **`Device::random_jobs`/`sequential_jobs` take a profile.** The device says
+  what it is; the profile says what to do about it. Forcing `spinning` on a
+  disk that reports solid state has to give one reader, or forcing it would not
+  be worth having.
+
+### One that was worth the detour
+
+The first mutation run had a survivor. The branch that handles a pivot going
+away mid-sweep is only reachable if a file becomes unreadable *between* two
+cohorts of the same round — a race no filesystem test can stage, so the test
+suite could not reach it, and a mutant that deleted it passed everything.
+
+Rather than leave it or fake a test, the sweep's bookkeeping came out into
+`Round`, which moves members between clusters and reads nothing. The race is
+then three arguments, and
+`a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in` drives it
+directly. It also made the answer clearer: settling the pivot's class when half
+the sweep never saw the pivot would strand its members, because a file equal to
+them is still sitting in the pool and they have left it.
+
+All six mutants are caught now (`evidence/m6-mutants.txt`).
+
+### Standards
+
+`cargo test`: 131 passed, 0 failed (111 → 131; 20 new). clippy `-D warnings`
+clean, `fmt --check` clean, `--gate all` 33/33 with no profile flag.

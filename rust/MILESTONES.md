@@ -1097,3 +1097,238 @@ The `{stage}` token is in this template and only this one, for the reason set
 out under the M2 claim: the M1 gate grades the size-bucket candidate set, which
 a finished pipeline no longer reports by default. Each individual milestone
 claim above uses the prescribed template without it.
+
+---
+
+## M6 — the spinning profile — CLAIMED
+
+`--profile flash|spinning|auto`, default `auto`. `auto` picks `spinning` only
+for a disk that positively reports rotational media; solid state and "no idea"
+both get `flash`, which is today's behaviour byte for byte. `flash` is
+untouched, and the gate below is run with no profile flag at all, which is the
+proof of that.
+
+Under `spinning` the pipeline drops the tail probe (the end stage reads the
+head alone), drops the sample stage entirely, keeps the comparison run at
+`SLOW_CHUNK` however wide the group, reads with one thread, and compares groups
+wider than `SPIN_INTERLEAVE` (8) a cohort at a time, carrying the proved
+partition between passes. Members are read more than once by design.
+
+**HDD wall-clock unvalidated.** No rotational drive is available to an agent —
+the only one on this machine is fenced — so no speed claim is made here. What
+is claimed is correctness, which is proved against the oracle, and the access
+pattern, which is counted. A user-supervised run on a real spinning disk is
+still owed.
+
+### The gate, with no profile flag
+
+Run from the repository root:
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/m6-gate.txt`, quoted from the file:
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0. Nothing in the harness passes `--profile`, so every one
+of those 33 checks ran the flash pipeline exactly as M5 left it.
+
+### Groups are profile-independent
+
+```
+python3 rust/evidence/scripts/spinning_differential.py
+```
+
+Eight scratch trees, each shaped at something the profile removes — the tail
+page it no longer probes, the middle it no longer samples, a divergence in the
+last kilobyte, equal members either side of a cohort boundary, a group three
+times the cohort width, hardlink clusters, unreadable members, and a seeded
+jumble across every size class. On each tree the oracle, `--profile flash`,
+`--profile spinning` and a flagless run are compared. Captured to
+`evidence/m6-differential.txt`:
+
+```text
+tree                  files  groups   flash seeks  spinning seeks   flash bytes  spinning bytes  verdict
+tails                     5       2            18              19        319488          389120  same
+middles                   3       1            39              11      31002624        31457280  same
+last-chunk                3       1            29              14      38805504        56623104  same
+cohort-boundary          16       4            64              72      33554432        49807360  same
+wide                     24       1           336             102     239075328       254607360  same
+links                     6       2            15              16       1048576         1048576  same
+unreadable                5       1            39              12      29884416        28311552  same
+mixed                    46      10           102              83      20717575        45826056  same
+
+8 trees, every profile identical to the oracle
+```
+
+### Seek accounting
+
+```
+python3 rust/evidence/scripts/spinning_seeks.py
+```
+
+`seeks` counts reads that did not continue where the previous read stopped. It
+is incremented at the read, from the offsets the process asked for, and never
+derived from a file's size — the rule `opens` and `bytes_read` are already
+held to. It rides in the `--report-json` object beside them; the conformance
+protocol neither asks for it nor reads it.
+
+Every measured run is at `-j 1`: concurrent readers interleave, and that
+interleaving belongs to the scheduler rather than to the pipeline. Captured to
+`evidence/m6-seeks.txt`:
+
+```text
+One group of N identical files, one reader (-j 1).
+
+files    MiB   flash seeks   spinning seeks   ratio      flash MiB   spinning MiB   groups
+    4     20            64               20     3.2x        82.0           80.0        1
+    8     20           128               40     3.2x       164.0          160.0        1
+   16     20           256               86     3.0x       328.0          359.9        1
+   32     20           512              172     3.0x       656.0          719.8        1
+    6    100           216               60     3.6x       603.0          600.0        1
+
+Same corpora at the default reader count, for scale only (threads interleave, so these move between runs):
+files    MiB   flash seeks   spinning seeks
+    4     20            59               20
+    8     20           124               40
+   16     20           255               86
+   32     20           512              172
+    6    100           192               60
+
+spinning issues fewer seeks on every corpus: between 3.0x and 3.6x fewer
+HDD wall-clock unvalidated: no rotational drive is available here.
+```
+
+The bytes column is the price: at 32 copies, 10% more bytes read for a third of
+the seeks. That is the trade SPIN.md asks for by name.
+
+### Where `--profile` meets the other flags
+
+REVIEW-M4's first finding was a mode that changed what a group meant, in a
+combination no gate ran. `--profile` changes which bytes a digest covers, so
+the combinations were run rather than reasoned about:
+
+```
+python3 rust/evidence/scripts/spinning_meets_the_rest.py
+```
+
+```text
+cache: flash first, then spinning          ok (1 groups, the new copy joined its twins)
+cache: spinning first, then flash          ok (1 groups, the new copy joined its twins)
+cache: spinning twice                      ok (1 groups, the new copy joined its twins)
+--auto under either profile                ok (both kept a.bin, c.bin, d.bin)
+--stage size --auto --profile spinning     ok (exit 2, nothing removed): dedup-rs: --auto cannot act on a --stage size scan
+--profile with a name it does not know     ok (exit 2): dedup-rs: --profile takes flash, spinning or auto
+
+every combination behaves
+```
+
+The cache case is the one that matters. The `spinning` end probe reads the head
+alone; the `flash` one reads both ends. Those digests cover different bytes, so
+they get different cache columns (`CACHE_SCHEMA` 4 adds `head`). Sharing one
+column would let a scan compare a remembered head-and-tail against a freshly
+read head, and two identical files would land in different buckets — a
+duplicate lost, silently, with the gate still green.
+
+### The tests are guards, not decoration
+
+```
+python3 rust/evidence/scripts/spinning_mutants.py
+```
+
+Six deliberate breaks, each one a plausible implementation of the same feature,
+built and run. Captured to `evidence/m6-mutants.txt`:
+
+```text
+mutant cohort-width               reads SPIN_INTERLEAVE + 1 files at once instead of SPIN_INTERLEAVE
+  caught by the_cohorts_never_hold_more_than_the_cap_open_at_once
+
+mutant drop-leftovers             never offers a non-matching member to a later pivot
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, a_pivot_alone_and_unreadable_leaves_nothing_behind, a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in, a_run_holding_the_pivot_brings_whole_clusters_with_it, equal_members_split_across_cohorts_are_still_found, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape
+
+mutant forget-the-partition       carries only each cluster's representative, losing what a pass proved
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, a_run_holding_the_pivot_brings_whole_clusters_with_it, equal_members_split_across_cohorts_are_still_found, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape
+
+mutant settle-on-a-lost-pivot     settles the pivot's class even though a cohort could not read it
+  caught by a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in
+
+mutant strand-a-dead-cluster      drops the other members of a cluster whose representative went away
+  caught by a_cluster_whose_representative_goes_away_keeps_its_other_members
+
+mutant merge-on-the-first-cohort  stops sweeping once the pivot has matched somebody
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_wider_than_the_cap_still_comes_back_whole, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_cohorts_never_hold_more_than_the_cap_open_at_once
+
+Baseline: the same tree, built and run through spinning_meets_the_rest.py.
+  every combination behaves
+
+mutant one-cache-column           files the head-only probe and the two-ends probe in the same column
+  caught: warm flash then spinning reported [('a.bin', 'b.bin')], oracle [('a.bin', 'b.bin', 'e.bin')]
+
+every mutant was caught
+```
+
+The last one is the cache column, and its symptom is the exact silent data loss
+described above.
+
+### Standards
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 131 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+
+$ cargo fmt --check
+(no output: clean)
+```
