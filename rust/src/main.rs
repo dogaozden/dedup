@@ -6,6 +6,7 @@
 //! it read to find them.
 
 mod cache;
+mod cli;
 mod compare;
 mod consts;
 mod device;
@@ -26,9 +27,9 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use cache::ScanCache;
+use cli::{help_text, parse_arguments_from, Options, Parsed};
 use compare::Compare;
-use consts::DEFAULT_MIN_SIZE;
-use device::{Device, VolumeProbe, Wanted};
+use device::{Device, VolumeProbe};
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
 use pipeline::{find_duplicates, report_names, size_stage};
@@ -52,86 +53,14 @@ struct Report<'a> {
     seeks: u64,
 }
 
-#[derive(Default)]
-struct Options {
-    root: PathBuf,
-    report_json: Option<PathBuf>,
-    min_size: u64,
-    jobs: Option<usize>,
-    excludes: Vec<String>,
-    ext: Vec<String>,
-    skip_ext: Vec<String>,
-    list: bool,
-    /// Ask for the browser outright. Without it the browser is what a terminal
-    /// gets when nothing else was asked for, which is the oracle's behaviour;
-    /// with it, no terminal is an error rather than a silent fallback.
-    interactive: bool,
-    auto: Option<String>,
-    yes: bool,
-    hard: bool,
-    no_cache: bool,
-    /// "size" stops after the walk and size grouping. Only the M1 gate asks
-    /// for it; every other gate leaves it empty.
-    stage: String,
-    profile: Wanted,
-}
-
-const KEEP_RULES: [&str; 3] = ["shortest", "oldest", "newest"];
-
-fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
-    let mut options = Options {
-        min_size: DEFAULT_MIN_SIZE,
-        ..Options::default()
-    };
-    let mut root = None;
-    let mut arguments = std::env::args().skip(1).peekable();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--report-json" | "--min-size" | "-j" | "--jobs" | "-x" | "--exclude" | "--ext"
-            | "--skip-ext" | "--stage" | "--profile" => {
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| format!("{argument} needs a value"))?;
-                match argument.as_str() {
-                    "--report-json" => options.report_json = Some(PathBuf::from(value)),
-                    "--min-size" => options.min_size = value.parse()?,
-                    "-j" | "--jobs" => options.jobs = Some(value.parse()?),
-                    "-x" | "--exclude" => options.excludes.push(value),
-                    "--ext" => options.ext.push(value),
-                    "--stage" => options.stage = value,
-                    "--profile" => {
-                        options.profile = Wanted::parse(&value)
-                            .ok_or("--profile takes flash, spinning or auto")?;
-                    }
-                    _ => options.skip_ext.push(value),
-                }
-            }
-            "--auto" => {
-                // The rule is optional, so a following word is only consumed
-                // when it is one of the rules rather than the next flag.
-                let named = arguments
-                    .peek()
-                    .is_some_and(|next| KEEP_RULES.contains(&next.as_str()));
-                options.auto = Some(if named {
-                    arguments.next().expect("peeked a rule")
-                } else {
-                    "shortest".to_string()
-                });
-            }
-            "-l" | "--list" => options.list = true,
-            "-i" | "--interactive" => options.interactive = true,
-            "-y" | "--yes" => options.yes = true,
-            "--hard" => options.hard = true,
-            "--no-cache" => options.no_cache = true,
-            "-q" | "--quiet" | "--verify" => {}
-            other if root.is_none() && !other.starts_with('-') => {
-                root = Some(PathBuf::from(other));
-            }
-            other => return Err(format!("unknown argument: {other}").into()),
-        }
-    }
-    options.root = root.ok_or("usage: dedup-rs <root> [options]")?;
-    Ok(options)
+/// Whether this run is one the browser will open for.
+///
+/// The menu appears under exactly this condition and no other, because the
+/// menu is the browser's front door: a run that will not browse must not stop
+/// to be asked about, and a piped or flagged run must be byte-for-byte what it
+/// has always been.
+fn browsing(options: &Options) -> bool {
+    tui::has_terminal() && options.auto.is_none() && (options.interactive || !options.list)
 }
 
 fn print_report(groups: &[Vec<&str>]) {
@@ -149,10 +78,33 @@ fn print_report(groups: &[Vec<&str>]) {
 }
 
 fn run() -> Result<i32, Box<dyn std::error::Error>> {
-    let options = parse_arguments()?;
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut options = match parse_arguments_from(arguments.iter().cloned())? {
+        Parsed::Help => {
+            print!("{}", help_text());
+            return Ok(0);
+        }
+        Parsed::Scan(options) => *options,
+    };
     if !options.root.is_dir() {
         eprintln!("dedup-rs: not a directory: {}", options.root.display());
         return Ok(2);
+    }
+
+    // The pre-flight menu, before anything has been read. What it hands back
+    // is a command line, and it goes through the same parser and the same
+    // checks the real one did — the form has no way to say anything the flags
+    // cannot say.
+    if browsing(&options) {
+        match tui::menu::ask(&arguments)? {
+            None => return Ok(0),
+            Some(chosen) => match parse_arguments_from(chosen.into_iter())? {
+                Parsed::Scan(chosen) => options = *chosen,
+                // The form emits no --help, so this cannot happen; refusing to
+                // scan is the safe reading of it if it ever did.
+                Parsed::Help => return Ok(2),
+            },
+        }
     }
     let root = fs::canonicalize(&options.root)?;
 

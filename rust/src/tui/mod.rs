@@ -6,6 +6,7 @@
 //! `--auto` uses. Splitting it that way is what makes a program that deletes
 //! files testable without a terminal in the test.
 
+pub mod menu;
 pub mod model;
 pub mod view;
 
