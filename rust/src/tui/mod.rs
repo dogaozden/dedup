@@ -120,7 +120,10 @@ enum Ended {
 }
 
 /// Whether the terminal has gone away, asked without waiting for anything.
-fn hung_up() -> bool {
+///
+/// Shared with the pre-flight menu, which asks the same question one screen
+/// earlier and must answer it the same way.
+pub(super) fn hung_up() -> bool {
     sys::wait_for_terminal_input(std::time::Duration::ZERO) == sys::Input::HungUp
 }
 

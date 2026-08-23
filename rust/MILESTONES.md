@@ -1249,6 +1249,15 @@ HDD wall-clock unvalidated: no rotational drive is available here.
 The bytes column is the price: at 32 copies, 10% more bytes read for a third of
 the seeks. That is the trade SPIN.md asks for by name.
 
+**Where the win is, and where it is not.** These ratios belong to the corpus
+SPIN.md commissioned the profile for: wide groups of large files, which is what
+a USB disk full of media looks like and what the real scan that prompted this
+was stuck on. On small-file trees `spinning` issues slightly MORE seeks than
+`flash`, because re-reading a pivot costs more than the skipped tail probes
+save — the differential table above shows it (`tails` 18 → 19,
+`cohort-boundary` 64 → 72). Read "3.0x-3.6x fewer" as a statement about large
+wide groups, not about every tree.
+
 ### What the counter costs the profile that is scored
 
 The counter takes a lock on every read block, and `read_block` is the default
@@ -1393,6 +1402,13 @@ argument means, `help_text()` renders it, and the menu asks it for its fields,
 their prompts and their defaults. No flag is spelled twice anywhere, and a word
 becomes a setting in exactly one function — `Flag::apply` — so the menu
 validating a field and the parser reading an argument are the same code.
+
+Strictly there are two tables, not one: `HELP_FLAGS` sits beside `FLAGS` and is
+matched by hand before the `FLAGS` lookup, because `--help` has to win before a
+missing root can be an error. It is not a drift hole — `help_text()` renders it
+from that same constant and the golden test chains it into the set it diffs —
+but "a single source of flag truth" is a sentence about `FLAGS`, and this is
+the exception to it.
 
 ```
 $ dedup-rs --help
@@ -1615,3 +1631,182 @@ $ cargo clippy --all-targets -- -D warnings
 $ cargo fmt --check
 (no output: clean)
 ```
+
+---
+
+## M5.1 — RE-CLAIMED after REVIEW-M5_1.md
+
+Binding item 1 is fixed. It was two defects in the same eight lines, and the
+review found the first; running the fix down found the second.
+
+**The spin.** `menu.rs`'s loop read one of `wait_for_terminal_input`'s three
+answers. On `Waited` — nothing typed inside 250 ms, which is the ordinary state
+of a form somebody is reading — it fell through to a blocking `event::read()`,
+and from there the hangup check was unreachable. A terminal that dies while the
+process sits in that read is readable forever and empty forever, and crossterm
+answers by looping on `read` inside `try_read`: no event, no error, one core at
+100%. The browser has consumed all three answers since `09599c6`; the menu,
+added one screen in front of it, did not.
+
+Reproduced before it was touched, with the review's own deterministic driver
+(kept as `evidence/scripts/hangup_deterministic.py`; the delay before the
+terminal dies is a parameter, so the process is provably past the poll). Both
+builds identified by sha256, because a shared `CARGO_TARGET_DIR` will otherwise
+hand you the wrong binary and a clean result you did not earn. Captured to `evidence/m5_1-hangup-before-and-after.txt`:
+
+```text
+b102625 (the claimed tip REVIEW-M5_1 read), sha256 a78699545e1f789d:
+$ python3 rust/evidence/scripts/hangup_deterministic.py <b102625 build> 1.5 3
+  run 1: SPINNING(menu, 5.03 CPU-s in 5s)
+  run 2: SPINNING(menu, 5.04 CPU-s in 5s)
+  run 3: SPINNING(menu, 5.06 CPU-s in 5s)
+SPUN 3/3
+exit=1
+
+and the same script against this branch, sha256 d7002edcf24a6b5c:
+$ python3 rust/evidence/scripts/hangup_deterministic.py rust/target/release/dedup-rs 1.5 3
+  run 1: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 2: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 3: LEFT(menu, exit=1, 0.01 CPU-s)
+SPUN 0/3
+exit=0
+```
+
+The fix is the browser's own `match`, all three arms, so `event::read()` is
+entered only when poll has just said bytes are waiting.
+
+**The panic on the way out.** The review's step 2 asked why its patched build
+left with 101 where the browser leaves with 1. It is ratatui's `Terminal::drop`,
+which shows the cursor and `eprintln!`s when it cannot — onto the descriptor
+that just died. The browser already carries the answer (`std::mem::forget` on
+the terminal-gone path) and the menu did not. Confirmed by building the
+in-between version rather than reasoning about it: three arms and no
+`mem::forget` leaves with 101 on every run; with it, 1.
+
+`ask` now returns `Answer::Scan | Quit | TerminalGone`, and `main` gives
+`TerminalGone` exit 1 — the same ending the browser gives the same event.
+
+### The regression test, and what it was missing
+
+`tui-terminal-death.py` now runs four scenarios instead of two, each of which
+**asserts which screen it reached**:
+
+```text
+  keys/menu        PASS  'q' left the menu in 0.64s, exit 0
+  keys/browser     PASS  'q' left the browser in 0.64s, exit 0
+  hangup/menu      PASS  the menu left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+  hangup/browser   PASS  the browser left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+
+all scenarios passed
+```
+
+Three changes, all of them things the old script's shape allowed to go wrong:
+
+- **A fixed delay past the poll** before the terminal is taken away. Closing
+  the master as soon as the paint pauses lands inside the 250 ms window about
+  half the time, which is why the review warns not to read one green run as a
+  fix.
+- **Each screen is driven and named separately.** This is the coverage that
+  quietly disappeared when M5.1 landed: `-i` used to reach the browser, so the
+  hangup case tested the browser; after the menu went in front, the same script
+  tested the menu instead and never said so. A test that does not assert which
+  screen it is on stops covering the screen it was written for the moment
+  somebody adds another.
+- **A panic exit is a failure**, not a pass. Leaving is not enough; leaving on
+  purpose is the requirement.
+
+The `keys` cases are kept and extended to both screens, because a view that
+ignored input altogether would also not spin and would pass a hangup test on
+its own.
+
+### Both halves of the fix are guarded
+
+`menu_mutants.py` gained the two whole-program mutants, built and driven
+through a pty. Each is caught, each with its own symptom, and each **only on
+the menu** — the browser stays green, which is the per-screen pinning working:
+
+```text
+mutant one-of-three-answers         enters the blocking read when poll said nothing was typed
+  caught: hangup/menu      FAIL  the menu was still running 5s after the terminal died, 5.00 CPU-seconds in that window — SPINNING
+
+mutant drop-the-dead-terminal       lets ratatui print to a descriptor that is gone, panicking on the way out
+  caught: hangup/menu      FAIL  the menu left in 0.05s but by panicking (exit 101)
+
+every mutant was caught
+```
+
+### Standards and the gate
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+$ cargo fmt --check
+(no output: clean)
+```
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The end-to-end pty suite is unchanged and still passes all seven cases
+(`evidence/m5_1-end-to-end.txt`).
+
+### Non-binding notes taken
+
+- The M6 claim now says where the seek win lives — wide groups of large files —
+  and that small-file trees seek slightly more, which its own differential table
+  already showed.
+- `LOG.md`'s three stale prose numbers are corrected: 158 and 159 tests to 163,
+  and "six mutants" to seven for M6's script. The evidence files were right
+  throughout; only the prose had drifted.
+- The one-table section now says plainly that there are strictly two tables,
+  `HELP_FLAGS` beside `FLAGS`, and why that is not a drift hole.

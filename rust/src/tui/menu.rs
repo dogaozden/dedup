@@ -395,8 +395,28 @@ impl Drop for Restore {
     }
 }
 
-/// Show the form. `Some(arguments)` to scan with, `None` to leave.
-pub fn ask(arguments: &[String]) -> io::Result<Option<Vec<String>>> {
+/// What the form came back with.
+pub enum Answer {
+    /// Scan with these arguments.
+    Scan(Vec<String>),
+    /// Esc or q: leave without scanning.
+    Quit,
+    /// The terminal went away while the form was up. Nothing was scanned, and
+    /// there is nobody left to tell about it.
+    TerminalGone,
+}
+
+/// Show the form.
+///
+/// The loop is the browser's loop, and deliberately so. `wait_for_terminal_input`
+/// has three answers and all three are consumed here: a terminal that has gone
+/// away is readable forever and empty forever, and crossterm answers that by
+/// looping inside `read` — no error comes back, so `?` never fires and the
+/// process burns a core. Entering `event::read()` only when poll has just said
+/// bytes are waiting is what makes that unreachable. Falling through to the
+/// read on `Waited` — the ordinary state of a form somebody is looking at —
+/// puts it straight back.
+pub fn ask(arguments: &[String]) -> io::Result<Answer> {
     let mut form = Form::new(arguments);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -410,13 +430,26 @@ pub fn ask(arguments: &[String]) -> io::Result<Option<Vec<String>>> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
 
-    loop {
-        let painted = terminal.draw(|frame| draw(frame, &form))?.area;
+    let answer = loop {
+        // A paint that fails on a terminal which has since hung up is that
+        // terminal dying, not a fault; on one that is still there it is still
+        // an error.
+        let painted = match terminal.draw(|frame| draw(frame, &form)) {
+            Ok(frame) => frame.area,
+            Err(error) => {
+                if super::hung_up() {
+                    break Answer::TerminalGone;
+                }
+                return Err(error);
+            }
+        };
         form.resize(painted.width, painted.height);
-        if crate::sys::wait_for_terminal_input(std::time::Duration::from_millis(250))
-            == crate::sys::Input::HungUp
-        {
-            return Ok(None);
+        match crate::sys::wait_for_terminal_input(super::WAIT_FOR_KEY) {
+            crate::sys::Input::Ready => {}
+            crate::sys::Input::HungUp => break Answer::TerminalGone,
+            // Nothing typed. Round the loop to repaint, which is also how a
+            // window resized while nobody was typing gets its new size.
+            crate::sys::Input::Waited => continue,
         }
         let Event::Key(key) = event::read()? else {
             continue;
@@ -428,11 +461,21 @@ pub fn ask(arguments: &[String]) -> io::Result<Option<Vec<String>>> {
             Step::Stay => {}
             Step::Scan => {
                 debug_assert!(form.legible(), "scanned on a screen nobody could read");
-                return Ok(Some(form.to_arguments()));
+                break Answer::Scan(form.to_arguments());
             }
-            Step::Quit => return Ok(None),
+            Step::Quit => break Answer::Quit,
         }
+    };
+
+    if matches!(answer, Answer::TerminalGone) {
+        // `Terminal`'s own `Drop` tries to show the cursor and, when it cannot,
+        // `eprintln!`s about it — which panics when the descriptor it would
+        // print to is the terminal that just died. There is no cursor to put
+        // back on a terminal that is gone. The guard above still runs, and
+        // still restores a terminal that is really there.
+        std::mem::forget(terminal);
     }
+    Ok(answer)
 }
 
 #[cfg(test)]

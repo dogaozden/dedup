@@ -81,8 +81,42 @@ INVENT = (
 )
 
 
-def run(command, cwd):
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+# Mutants whose damage only shows in a running program on a real terminal.
+# Each is verified by building it and running `tui-terminal-death.py` against
+# it, and each must fail a scenario naming the screen it broke.
+WHOLE_PROGRAM = [
+    (
+        "one-of-three-answers",
+        "enters the blocking read when poll said nothing was typed",
+        "src/tui/menu.rs",
+        """        match crate::sys::wait_for_terminal_input(super::WAIT_FOR_KEY) {
+            crate::sys::Input::Ready => {}
+            crate::sys::Input::HungUp => break Answer::TerminalGone,
+            // Nothing typed. Round the loop to repaint, which is also how a
+            // window resized while nobody was typing gets its new size.
+            crate::sys::Input::Waited => continue,
+        }""",
+        """        if crate::sys::wait_for_terminal_input(super::WAIT_FOR_KEY)
+            == crate::sys::Input::HungUp
+        {
+            break Answer::TerminalGone;
+        }""",
+    ),
+    (
+        "drop-the-dead-terminal",
+        "lets ratatui print to a descriptor that is gone, panicking on the way out",
+        "src/tui/menu.rs",
+        "    if matches!(answer, Answer::TerminalGone) {",
+        "    if false && matches!(answer, Answer::TerminalGone) {",
+    ),
+]
+
+
+def run(command, cwd, extra_env=None):
+    environment = dict(os.environ)
+    environment.update(extra_env or {})
+    return subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                          env=environment)
 
 
 def failing_tests(output: str):
@@ -139,9 +173,51 @@ def main() -> int:
         with open(os.path.join(tree, where), "w") as fh:
             fh.write(source)
 
+    # The terminal-death mutants. These need a release build and a pty, so the
+    # target directory lives in scratch and is reused between them.
+    target = os.path.join(BASE, "target")
+    binary = os.path.join(target, "release", "dedup-rs")
+    checker = os.path.join(REPO, "rust", "evidence", "scripts",
+                           "tui-terminal-death.py")
+    env = {"CARGO_TARGET_DIR": target}
+    print("Baseline: the same tree, built and run through tui-terminal-death.py.")
+    if run(["cargo", "build", "--release"], tree, env).returncode != 0:
+        raise SystemExit("the unmutated tree does not build")
+    clean = run([sys.executable, checker, binary], REPO)
+    if clean.returncode != 0:
+        print(clean.stdout[-2000:])
+        raise SystemExit("the unmutated tree fails its own terminal-death scenarios")
+    print("  every scenario passed\n")
+
+    for name, what, where, before, after in WHOLE_PROGRAM:
+        source_path = os.path.join(REPO, "rust", where)
+        with open(source_path) as fh:
+            source = fh.read()
+        if source.count(before) != 1:
+            raise SystemExit(
+                "mutant {}: its anchor appears {} times in {}, not once".format(
+                    name, source.count(before), where))
+        with open(os.path.join(tree, where), "w") as fh:
+            fh.write(source.replace(before, after))
+        built = run(["cargo", "build", "--release"], tree, env)
+        print("mutant {:<28} {}".format(name, what))
+        if built.returncode != 0:
+            print("  did not build\n")
+        else:
+            result = run([sys.executable, checker, binary], REPO)
+            broke = [line.strip() for line in result.stdout.splitlines()
+                     if "FAIL" in line]
+            if broke:
+                print("  caught: {}\n".format(broke[0]))
+            else:
+                print("  SURVIVED — no scenario noticed\n")
+                survived += 1
+        with open(os.path.join(tree, where), "w") as fh:
+            fh.write(source)
+
     shutil.rmtree(BASE, ignore_errors=True)
     if survived:
-        print("{} mutant(s) survived: the one-table rule is not enforced".format(survived))
+        print("{} mutant(s) survived: the net has holes".format(survived))
         return 1
     print("every mutant was caught")
     return 0

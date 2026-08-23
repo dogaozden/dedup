@@ -1,0 +1,11 @@
+$ python3 rust/evidence/scripts/tui-terminal-death.py rust/target/release/dedup-rs
+
+dedup-rs: /Users/dogaozden/AI_Projects/dedup-features/rust/target/release/dedup-rs
+  keys/menu        PASS  'q' left the menu in 0.64s, exit 0
+  keys/browser     PASS  'q' left the browser in 0.64s, exit 0
+  hangup/menu      PASS  the menu left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+  hangup/browser   PASS  the browser left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+
+all scenarios passed
+
+exit=0

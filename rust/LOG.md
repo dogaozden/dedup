@@ -1848,7 +1848,8 @@ directly. It also made the answer clearer: settling the pivot's class when half
 the sweep never saw the pivot would strand its members, because a file equal to
 them is still sitting in the pool and they have left it.
 
-All six mutants are caught now (`evidence/m6-mutants.txt`).
+All seven mutants are caught now — six against the sweep, one whole-program
+mutant against the cache column (`evidence/m6-mutants.txt`).
 
 ### Standards
 
@@ -1943,7 +1944,7 @@ not merely asserted.
 
 ### Standards
 
-`cargo test`: 158 passed, 0 failed (131 → 158; 27 new, 21 of them the menu's
+`cargo test`: 163 passed, 0 failed (131 → 163; 32 new, 21 of them the menu's
 and the table's). clippy `-D warnings` clean, `fmt --check` clean, `--gate all`
 33/33. M6's differential and combination checks were re-run after the parser
 was rebuilt on the table, and both still pass.
@@ -1969,7 +1970,7 @@ them:
   It now asserts that something was removed before comparing, and both profiles
   remove `b.bin` and `nested/a-copy.bin` and keep the other three.
 
-Final: `cargo test` 159 passed, clippy and fmt clean, `--gate all` 33/33, and
+Final: `cargo test` 163 passed, clippy and fmt clean, `--gate all` 33/33, and
 every evidence script re-run against the branch tip.
 
 ### What the seek counter costs
@@ -2020,3 +2021,90 @@ tree does". Round one replaced that subprocess with the IOKit calls in
 `sys.rs`, so the reason given for the probe being on a thread is no longer the
 true reason — the thread may well still be worth having, but not for that. It
 is not this branch's code and not this branch's change to make.
+
+---
+
+## 2026-08-23 — REVIEW-M5_1 binding item 1: the menu spun on a dead terminal
+
+The reviewer is right and the diagnosis is exact. `menu.rs` read one of
+`wait_for_terminal_input`'s three answers and fell through to a blocking
+`event::read()` on the other two. `Waited` — nothing typed in 250 ms — is the
+ordinary state of a form somebody is reading, so the process spent almost all
+its time inside that read, where the hangup check cannot be reached. A terminal
+dying there is readable forever and empty forever, and crossterm loops on
+`read` inside `try_read` producing no event and no error. One core, until
+somebody notices.
+
+This is the bug `09599c6` ended for the browser. I put it back one screen in
+front, in a loop I wrote by looking at the browser's and taking the shape but
+not the reason. The browser's `match` has three arms because there are three
+answers; I read the one I was thinking about.
+
+### Two defects, not one
+
+Fixing the poll left the exit code at 101 — the number the review noticed and
+asked to have run down. It is ratatui's `Terminal::drop`, which shows the
+cursor and `eprintln!`s when it cannot, onto the descriptor that just died. The
+browser already carries the answer four lines from the code I copied
+(`std::mem::forget` on the terminal-gone path) and I had not copied that either.
+
+I built the in-between version rather than reasoning about it: three arms and
+no `mem::forget` leaves with 101 on all three runs; with it, 1. That is the
+same ending the browser gives the same event, so `ask` now returns
+`Answer::Scan | Quit | TerminalGone` and `main` turns the last into exit 1.
+
+### The test that stopped testing what it said
+
+`tui-terminal-death.py` passed on the broken build about half the time, and its
+`hangup` case had silently stopped covering the browser altogether — `-i` used
+to reach the browser directly, and once the menu went in front, the same script
+was testing the menu and never said which. The old script asserted nothing
+about the screen it was on, so adding a screen changed what it covered without
+changing a line of it.
+
+Three changes:
+
+- A fixed 1.5 s delay before the terminal is taken away, so the process is
+  provably past the poll and inside the read. Closing the master as soon as the
+  paint pauses lands inside the 250 ms window about half the time.
+- Four scenarios instead of two — `keys` and `hangup`, each for the menu and
+  for the browser — and each one asserts which screen it reached before it
+  tests anything. `reach()` fails the scenario if the screen is not the one it
+  names.
+- A panic exit is a failure. Leaving is not enough; leaving on purpose is the
+  requirement, and 101 is how the second defect showed itself.
+
+Both halves are now mutants in `menu_mutants.py`, built and driven through a
+pty: `one-of-three-answers` fails `hangup/menu` with SPINNING, and
+`drop-the-dead-terminal` fails it with the panic. Both leave `hangup/browser`
+green, which is the per-screen pinning doing its job.
+
+### Numbers
+
+`evidence/m5_1-hangup-before-and-after.txt`, both builds named by sha256
+because a shared `CARGO_TARGET_DIR` will otherwise hand you the wrong binary
+and a clean result you did not earn:
+
+| | b102625 (`a7869954`) | this branch (`d7002edc`) |
+|---|---|---|
+| 3 runs, 1.5 s delay | SPINNING ×3, ~5.0 CPU-s each in a 5 s window | LEFT ×3, exit 1, 0.01 CPU-s |
+
+`cargo test` 163 passed, clippy and fmt clean, `--gate all` 33/33.
+
+### Non-binding notes taken
+
+- The M6 claim now names where the seek win lives — wide groups of large files
+  — and says small-file trees seek slightly more. Its own differential table
+  showed that already, but a reader who saw only the seeks table would have
+  taken 3.0x-3.6x as universal.
+- Three stale prose numbers corrected in the entries above: 158 and 159 tests
+  to 163, and "six mutants" to seven for M6's script. Corrected in place rather
+  than in a new note because they are arithmetic about this branch, not
+  findings; the evidence files were right throughout and only the prose drifted.
+  Recording the correction here so the change is not silent.
+- The one-table section now says plainly that there are two tables, `HELP_FLAGS`
+  beside `FLAGS`, and why that is not a drift hole.
+
+I did not touch the non-binding items the reviewer marked "not this branch's":
+the `-j1` attached-short-option gap, which `main` shares, and `VolumeProbe`'s
+stale doc comment.

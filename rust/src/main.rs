@@ -104,8 +104,11 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // cannot say.
     if menu_wanted(&options) {
         match tui::menu::ask(&arguments)? {
-            None => return Ok(0),
-            Some(chosen) => match parse_arguments_from(chosen.into_iter())? {
+            tui::menu::Answer::Quit => return Ok(0),
+            // The same ending the browser gives the same event, and for the
+            // same reason: nothing was done and nobody is there to be told.
+            tui::menu::Answer::TerminalGone => return Ok(1),
+            tui::menu::Answer::Scan(chosen) => match parse_arguments_from(chosen.into_iter())? {
                 Parsed::Scan(chosen) => options = *chosen,
                 // The form emits no --help, so this cannot happen; refusing to
                 // scan is the safe reading of it if it ever did.
