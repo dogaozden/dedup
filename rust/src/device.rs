@@ -216,7 +216,7 @@ fn cpu_bound(ceiling: usize) -> usize {
 /// streams whole files wants the opposite and keeps `cpu_bound`.
 ///
 /// Where the cores are all alike this is exactly `cpu_bound`.
-fn fast_bound(ceiling: usize) -> usize {
+pub fn fast_bound(ceiling: usize) -> usize {
     let cores = crate::sys::performance_cores().unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
     });

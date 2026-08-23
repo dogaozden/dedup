@@ -5,12 +5,17 @@
 //! counted after the name filters and before the size filter, which is the
 //! order `dedup.py`'s walkers use and the order the protocol asks for.
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 
 use crate::filters::{excluded, extension_allowed, Filters};
 use crate::sys::{BulkDir, VDIR, VLNK, VREG};
@@ -122,51 +127,151 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
 /// intermediate would have to stay alive while the records were built beside
 /// it, and holding two per-file structures at once is what put the peak over
 /// REWRITE.md §6's budget.
-pub fn walk(
-    root: &Path,
-    filters: Filters,
+/// Where the directory tasks put what they found.
+///
+/// The lock is taken once per directory and never per file: a task builds its
+/// own directory's records into a local vector and appends the whole of it in
+/// one move. Directories outnumber nothing and are outnumbered by files by
+/// two or three orders of magnitude, which is what makes a plain mutex the
+/// right shape here.
+#[derive(Default)]
+struct Harvest {
+    survivors: Mutex<Vec<FileRec>>,
+    unreadable: Mutex<Vec<String>>,
+    files_seen: AtomicU64,
+    bytes_seen: AtomicU64,
+}
+
+/// The pool the walk runs in.
+///
+/// Its own, rather than rayon's global one, for two reasons. It is sized like
+/// the small-file pool and for the same reason — these are directory reads
+/// against one catalog, and past a reader per performance core the extra ones
+/// queue. And the global pool would be a third set of threads alive beside
+/// the two the read stages build, on a machine that has ten cores to give.
+///
+/// Built once per process and only when there is a tree to walk, so a run
+/// that scans nothing never pays for it.
+fn walk_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(crate::device::fast_bound(8))
+            .thread_name(|n| format!("walk-{n}"))
+            .build()
+            .expect("a thread pool of a positive size")
+    })
+}
+
+thread_local! {
+    /// One kernel buffer and name arena per worker, rather than one per
+    /// directory: `BulkDir` carries 128 KiB and a walk visits thousands of
+    /// directories. Nothing inside the borrow spawns or recurses, so it can
+    /// never be re-entered on its own thread.
+    static SCRATCH: RefCell<BulkDir> = RefCell::new(BulkDir::default());
+}
+
+pub fn walk<'a>(
+    root: &'a Path,
+    filters: Filters<'a>,
     files_seen: &mut u64,
     bytes_seen: &mut u64,
     unreadable: &mut Vec<String>,
 ) -> Vec<FileRec> {
-    let mut survivors = Vec::new();
-    // Each directory carries the relative path it was reached by, so a child's
-    // relative name is one push onto its parent's rather than a fresh strip of
-    // the whole path.
-    let mut directories = vec![(root.to_path_buf(), String::new())];
-    let mut bulk = BulkDir::default();
+    let harvest = Harvest::default();
+    // Sibling directories have nothing to say to each other, and since the
+    // bulk read landed the walk is most of what a warm rescan does at all —
+    // 87% of that scan's clock, measured. So they are read concurrently.
+    walk_pool().in_place_scope(|scope| {
+        visit(
+            scope,
+            root,
+            root.to_path_buf(),
+            String::new(),
+            filters,
+            &harvest,
+        );
+    });
 
-    while let Some((directory, prefix)) = directories.pop() {
+    *files_seen += harvest.files_seen.load(Ordering::Relaxed);
+    *bytes_seen += harvest.bytes_seen.load(Ordering::Relaxed);
+    unreadable.append(&mut harvest.unreadable.into_inner().expect("no walker panics"));
+    harvest.survivors.into_inner().expect("no walker panics")
+}
+
+/// Read one directory, hand its subdirectories to the pool, and post what it
+/// held.
+///
+/// The order records come back in is now the order tasks happen to finish,
+/// which changes nothing downstream: `candidates` sorts by size then by
+/// (device, inode), and after hardlink folding that is a unique key, so the
+/// records it returns are in the same order whatever order they arrived in.
+/// `unreadable` is sorted in `main` before it is reported.
+fn visit<'scope>(
+    scope: &Scope<'scope>,
+    root: &'scope Path,
+    directory: PathBuf,
+    prefix: String,
+    filters: Filters<'scope>,
+    harvest: &'scope Harvest,
+) {
+    let mut survivors = Vec::new();
+    let mut children: Vec<(PathBuf, String)> = Vec::new();
+    let mut missed: Vec<String> = Vec::new();
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+
+    SCRATCH.with(|scratch| {
+        let mut bulk = scratch.borrow_mut();
         // One call for the whole directory, names and attributes together.
         // Anything the kernel will not describe completely comes back `false`
         // with nothing reported, and that directory alone takes the portable
-        // path below.
+        // path.
         if bulk.read(&directory) {
             gather_bulk(
                 &bulk,
                 &directory,
                 &prefix,
                 filters,
-                files_seen,
-                bytes_seen,
+                &mut files,
+                &mut bytes,
                 &mut survivors,
-                &mut directories,
+                &mut children,
             );
-            continue;
+        } else {
+            gather_portable(
+                root,
+                &directory,
+                filters,
+                &mut files,
+                &mut bytes,
+                &mut missed,
+                &mut survivors,
+                &mut children,
+            );
         }
-        gather_portable(
-            root,
-            &directory,
-            filters,
-            files_seen,
-            bytes_seen,
-            unreadable,
-            &mut survivors,
-            &mut directories,
-        );
+    });
+
+    for (child, child_prefix) in children {
+        scope.spawn(move |scope| visit(scope, root, child, child_prefix, filters, harvest));
     }
 
-    survivors
+    harvest.files_seen.fetch_add(files, Ordering::Relaxed);
+    harvest.bytes_seen.fetch_add(bytes, Ordering::Relaxed);
+    if !survivors.is_empty() {
+        harvest
+            .survivors
+            .lock()
+            .expect("no walker panics")
+            .append(&mut survivors);
+    }
+    if !missed.is_empty() {
+        harvest
+            .unreadable
+            .lock()
+            .expect("no walker panics")
+            .append(&mut missed);
+    }
 }
 
 /// A directory the kernel described in bulk.
