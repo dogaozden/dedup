@@ -147,6 +147,14 @@ exit 0. `cargo fmt --check` exit 0, all from a clean rebuild
 
 ### Note on `--stage size`
 
+The M1 gate grades candidates against size buckets, on the harness premise that
+an M1 binary has no content stages yet. Once stage 3 landed, the finished
+pipeline fails that gate 9 of 13 — by reporting only the files whose bytes
+match — so the binary carries a `--stage size` switch, mirroring the harness's
+own oracle driver, used only by the m1 line of `--gate all` below. The M1
+transcript above was captured at the M1 commit, when the prescribed template
+still passed. Full write-up in LOG.md.
+
 REVIEW-M2 ruled the switch acceptable and flagged that shipping it unguarded on
 a deletion tool was not. That is binding item 1 of REVIEW-M4 and is fixed; see
 the M4 claim below.
