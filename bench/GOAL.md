@@ -1,5 +1,12 @@
 # GOAL — autonomous optimization of `dedup`
 
+> **RETIRED (2026-08-23).** The Python bytes-optimization rounds are closed:
+> final `SCORE: 0.484` against the `012acc4` baseline (1.000), most scored
+> scenarios at or near the harness's own byte floor — see `bench/LOG.md`.
+> Python (`dedup.py`) is now frozen. Future performance rounds run against
+> the Rust binary in `rust/` under a wall-clock bench (spec to land as
+> `RBENCH.md`).
+
 You are an optimizer. You have a shell on this Mac and write access to this
 repository, and you have no prior context about it. This file is the whole
 briefing: the mission, the machine, the harness, the rules, and the map of the

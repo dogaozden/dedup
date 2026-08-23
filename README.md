@@ -8,6 +8,17 @@ dedup ~/Downloads     # scan somewhere else
 dedup --list          # print a report, don't open the browser
 ```
 
+## Status (2026-08-23)
+
+The tool people should run is now the Rust implementation in `rust/` (build
+with `cargo build --release` inside `rust/`). `dedup.py` at the repo root is
+FROZEN as the correctness oracle — no further optimization, it defines
+correct behavior for conformance and stays that way forever. `conformance/`
+is the referee that holds any implementation to the oracle. `bench/` is the
+retired Python benchmark, kept as the historical record of the 2026-08
+optimizer rounds. The port's spec is `REWRITE.md`; its milestone reviews
+live in `rust/REVIEW-M*.md`.
+
 ## What counts as a duplicate
 
 Two files are duplicates when their **contents are identical**. Names and

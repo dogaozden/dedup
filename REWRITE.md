@@ -1,5 +1,10 @@
 # REWRITE.md — dedup-rs
 
+> **STATUS (2026-08-23): port COMPLETE.** All milestones M1-M4 claimed and
+> APPROVED (re-reviews at `rust/REVIEW-M2.md` and `rust/REVIEW-M4.md`). Code
+> merged into this repo at `rust/`. Python (`dedup.py`) is now frozen as the
+> correctness oracle.
+
 You are an autonomous implementer. Your job: port `dedup` — a duplicate-file
 finder that deletes files — from Python to Rust, as a new project `dedup-rs`,
 implementing the design lessons measured against fclones. This document is
