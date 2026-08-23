@@ -1576,6 +1576,70 @@ believe them.)*
 
 ---
 
+## 2026-08-23 — needle re-measured against a correct floor, and the last three
+
+**The probe correction had one more victim and I nearly missed it.** When I
+found my C probes were 2.5x too pessimistic, I re-ran `widegroup` and
+`typical` and left it there. I never re-ran **`needle`** — the largest
+scenario, and the one whose "at the floor" verdict rested entirely on the
+broken probe. Re-run with the batched handout:
+
+```
+  needle, 50,000 files          1 thread   1.0934 s
+                                4 threads  0.3960 s   <- best
+                                8 threads  0.5342 s
+                               10 threads  0.6657 s
+```
+
+**0.3960 s, not the 0.5718 s I had been quoting.** The tool's candidate is
+0.5174 s, so `needle` had about **85 ms of slack (17%)** and was not at its
+floor at all. (The curve peaking at four threads is also independent
+confirmation that sizing the small-file pool to the performance cores was
+right — at ten readers the same work takes 68% longer.)
+
+**Where the 85 ms actually is.** Decomposed by measurement rather than by
+profile, since the profiler inlines everything worth naming:
+
+```
+  needle, full scan                                     504.55 ms
+    open + read + close, batched C floor, 4 threads     396.00 ms   78%
+    walk + startup                                       22.76 ms    4.5%
+    the tiny tier's grouping (hash 13.4 + map 33)        46.70 ms    9.3%
+    everything else (sort, allocations, rayon, report)  ~39     ms    7.7%
+```
+
+Both grouping figures are measured with throwaway builds: hashing only the
+first 256 bytes of each key saved 13.4 ms, and removing the tiny tier's
+grouping altogether saved 46.7 ms. **The grouping is the algorithm** — it is
+what proves the duplicates — so the 46.7 ms is not available, and what is left
+is a scatter of ten-millisecond pieces.
+
+### The last three, all measured, none kept
+
+**1. Hashing a prefix instead of the whole key.** 491.14 ms against 504.55 —
+2.7%, under the floor. And it should not be kept at any price: the index
+resolves collisions by scanning a bucket with full comparisons, so content
+that shares a prefix would go quadratic. `prefixtrap` is in the gate set
+because of exactly this class of mistake.
+
+**2. `par_sort_unstable_by_key` in `candidates()`, re-tried on `needle`**,
+which has 50,000 records where `typical` has 19,200. 501.03 ms against 500.44
+on `needle` and 97.36 against 103.16 on `typical` — mixed, small, and already
+scored once this round at 0.6746.
+
+**3. An inline single-slot bucket for `Ordered`'s index.** It is
+`HashMap<u64, Vec<usize>>`, so a tree of distinct small files allocates a
+vector per key — fifty thousand of them on `needle`, each holding one number.
+An enum that stores the first slot inline removed all of them. Locally it
+looked like a win: `needle` 491.55 ms against 500.44, `typical` 99.41 against
+103.16. Scored, on baselines within 0.3% of the comparison run:
+**0.6648 against 0.6537** — neutral at best. Local timing flatters; the
+harness is the measurement that counts, and it said no.
+
+**Three consecutive ideas inside the floor. This is the stop under §12.**
+
+---
+
 ## 12. The loop, and when to stop
 
 For each idea:
