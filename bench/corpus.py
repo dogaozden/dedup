@@ -23,16 +23,54 @@ import random
 import unicodedata
 from collections import defaultdict
 
-# Bump this whenever a builder changes what it writes. Corpora stamped with an
-# older version are regenerated rather than trusted.
-GENERATOR_VERSION = 2
+# Bump this whenever a builder changes what it writes — or what a scenario
+# expects to be found in what it wrote. Corpora stamped with an older version
+# are regenerated rather than trusted.
+#
+# 3: round two moved `rescan` off `photos` and onto `typical`, and raised its
+#    min_size. Note that a min_size change alters the answer key without
+#    altering a single byte of the tree, so nothing but this counter can catch
+#    it: `ensure_corpus` compares the scale factor and this version, and a
+#    stale corpus is otherwise indistinguishable from a fresh one.
+GENERATOR_VERSION = 3
 
 # randbytes(n) builds one n*8-bit integer, so it is asked for the corpus in
 # pieces. The chunk size is part of the corpus definition: change it and every
 # file changes with it.
 RAND_CHUNK = 4 << 20
 
-SCALES = {"default": 1.0, "smoke": 0.1}
+SCALES = {"default": 1.0, "smoke": 0.1, "r2": 1.0}
+
+# A scale may multiply individual scenarios on top of its base factor. What a
+# scenario costs in wall clock and what it costs in RAM disk are not the same
+# ratio for every shape — a small-file tree buys milliseconds by the hundred per
+# megabyte and a few-large-files tree buys them by the twentieth — so one scalar
+# cannot size seven shapes to a common wall clock. See RGOAL.md's round-2 entry
+# for the measurements these came from.
+#
+# `r2` is stamped with the round it was cut for, not named for its purpose,
+# because a scale whose sizes move is a scale whose numbers stop comparing. When
+# the sizes need to move again, add `r3`; do not edit these.
+#
+# These are sized against DISK usage, not against total_bytes. The volume is
+# HFS+ with a 4 KiB allocation block, so a tree of small files costs
+# considerably more than it contains: `needle`'s files average 2.6 KB and each
+# one occupies a whole block, which is 136 MB of difference on its own. Sizing
+# this table from the manifests' byte counts is what made the first cut of `r2`
+# overflow the volume silently — `needle` and `bigheader` were evicted and
+# rebuilt on every single run.
+#
+# `needle` and `typical` are held below what would fit because they have the
+# slack to spare: at these sizes they still run 0.69 s and 0.17 s against a
+# 3.6 ms startup, and the megabytes buy far more on `rescan`, which had none.
+SCALE_TWEAKS = {
+    "r2": {"needle": 0.5, "typical": 1.2, "widegroup": 3.6, "rescan": 0.7},
+}
+
+
+def scale_factor(scenario: str, scale: str) -> float:
+    """The generator factor for one scenario at one scale."""
+    return SCALES[scale] * SCALE_TWEAKS.get(scale, {}).get(scenario, 1.0)
 
 # dedup's stage-4 constants, mirrored so `bigheader` can place a difference in
 # the gap between two sample windows. They are only used to aim a scenario; if
@@ -570,11 +608,33 @@ SCENARIOS = {
     "prefixtrap":  (1 << 20,       True,  _prefixtrap),
     "adversarial": (1,             False, _adversarial),
     "deletion":    (1,             False, _deletion),
-    # The re-scan scenario has no shape of its own on purpose: it is the
-    # `photos` corpus, scanned twice and then interfered with. Its own name
-    # only buys it its own directory, so mutating it cannot disturb the
-    # scored run of the same profile.
-    "rescan":      (1 << 20,       False, _photos),
+    # The re-scan scenario still has no shape of its own — it borrows one, and
+    # its own name buys it its own directory so that mutating it cannot disturb
+    # the scored run of the profile it borrowed from.
+    #
+    # It borrows `typical` rather than `photos` as of round two. A warm re-scan
+    # reads nothing by design, so the only work it can possibly do is walk the
+    # tree, stat every file and ask the cache about each one — all of which is
+    # per-file. Over `photos`' hundred large files that came to about a
+    # millisecond, and the scenario spent its life measuring process startup
+    # instead of the cache. A cache test that cannot see the cache measures
+    # nothing. See RGOAL.md's round-two entry.
+    #
+    # min_size sits one byte above DEEP_HEAD, and that is load-bearing rather
+    # than tidy. dedup settles files at or below DEEP_HEAD in a single-pass
+    # small-file stage that only ever remembers a digest for a file it *proved*
+    # to be a duplicate, and it settles a size class from the cache only when
+    # every member of it carries one. A small file found unique is therefore
+    # read again on every scan, so a tree of small files cannot produce a warm
+    # scan that reads nothing: measured at min_size 1, this corpus re-read 69%
+    # of its cold bytes and failed WARM_CEILING outright. Above DEEP_HEAD the
+    # staged pipeline caches a digest for every file it opens, unique ones
+    # included, and the warm scan reads exactly zero.
+    #
+    # The whole tree is still walked and stat'd — min_size decides what is
+    # considered, not what is visited — so the file count is undiminished,
+    # which is the entire point of the shape.
+    "rescan":      (DEEP_HEAD + 1, False, _typical),
 }
 
 # Rough on-disk cost, used only to refuse to start a corpus that will not fit.
@@ -590,7 +650,8 @@ ESTIMATE = {
     "prefixtrap":  (68e6, 412e6),
     "adversarial": (14e6, 14e6),
     "deletion":    (10e6, 70e6),
-    "rescan":      (60e6, 430e6),
+    # Borrows `typical`'s shape as of round two, so it borrows its cost too.
+    "rescan":      (8e6, 330e6),
 }
 
 

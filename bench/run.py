@@ -996,7 +996,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scenario", action="append", metavar="NAME",
                    help="run only this scenario (repeatable)")
     p.add_argument("--seed", type=int, default=1, help="corpus seed (default: 1)")
-    p.add_argument("--scale", choices=sorted(corpus.SCALES), default="default")
+    # Not sorted(corpus.SCALES): this bench multiplies every scenario by one
+    # scalar, and a scale carrying per-scenario factors (rbench's `r2`) would
+    # build a differently sized corpus under the same directory name. rbench
+    # catches that on the manifest's recorded factor and rebuilds, so it is
+    # churn rather than corruption — but there is no reason to offer it.
+    p.add_argument("--scale", choices=("default", "smoke"), default="default")
     p.add_argument("--rounds", type=int, default=3,
                    help="interleaved rounds per side; the minimum is reported")
     p.add_argument("--no-tests", action="store_true", help="skip the pytest gate")

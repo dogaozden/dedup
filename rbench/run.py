@@ -69,9 +69,28 @@ import corpus                                          # noqa: E402
 SCORE_SCENARIOS = ("needle", "typical", "samesize", "widegroup", "photos",
                    "bigheader", "rescan")
 
+# Scenarios that run, and void the run when a gate fires, but never contribute
+# a term to the score. This is the door §3 leaves open for a scenario that
+# arrives after the freeze.
+#
+# `prefixtrap` is the first through it, and it is here because the seven scored
+# shapes are blind to one specific idea: reading less of the head. On every one
+# of them a shorter head probe reads fewer bytes and separates just as much, so
+# the bytes fall (legal — the ceiling only looks upward), the clock falls with
+# them, and the score improves. Only where same-size files agree for a few
+# kilobytes and then part company does a shortened head stop separating
+# anything: the band arrives at the byte-for-byte stage as one bucket and is
+# read far past the head, far past anything the baseline paid. Real trees are
+# full of that shape and none of the scored seven contain it.
+#
+# It gates rather than scores because a term added now would not compare with
+# any number recorded before today, and because the thing it detects is a wrong
+# turn rather than a slow one.
+GATE_SCENARIOS = ("prefixtrap",)
+
 # Order the table is printed in. Anything here that is not scored still runs
 # and still gates.
-ORDER = list(SCORE_SCENARIOS)
+ORDER = list(SCORE_SCENARIOS) + list(GATE_SCENARIOS)
 
 # `rescan` is the one scenario that runs with the cache switched on: its
 # cold/warm split is the whole point of it. Every other scenario passes
@@ -79,10 +98,17 @@ ORDER = list(SCORE_SCENARIOS)
 # corpus the harness is about to ask about nine more times.
 CACHE_ON = ("rescan",)
 
-# `rescan` always builds at smoke scale whatever --scale asked for. It is a
-# warm-cache measurement — everything it reports is a ratio — and its 430 MB
-# at default scale is what tips the corpora past what the RAM disk holds.
-GATE_SCALE = {"rescan": "smoke"}
+# `prefixtrap` is pinned to smoke whatever --scale asked for: it is a gate, not
+# a term, so nothing about it is a timing, and the trap survives the small
+# scale intact — every band still exists and still diverges on the byte after
+# its shared prefix. Paying for a full-scale corpus would buy the gate nothing
+# and cost the scored scenarios the room.
+#
+# `rescan` used to be pinned here too, because its `photos` corpus cost 430 MB
+# at full scale and bought a warm scan that read nothing over a hundred files.
+# Round two moved it onto `typical`'s shape, where the file count is the whole
+# measurement, so it takes a scale factor like everything else.
+GATE_SCALE = {"prefixtrap": "smoke"}
 
 # A warm scan of a corpus nobody has touched should read essentially nothing.
 # Five percent is a ceiling with room in it; the real figure is zero.
@@ -982,7 +1008,10 @@ def render(scenarios: dict) -> str:
         if entry is None:
             continue
         rows.append((
-            name,
+            # A gate's ratio is printed because it is free and occasionally
+            # informative, and marked because a number in a scored table is
+            # read as a scored number unless something says otherwise.
+            name + ("*" if name in GATE_SCENARIOS else ""),
             "{:.4f}".format(entry["baseline_seconds"]),
             "{:.4f}".format(entry["candidate_seconds"]),
             "{:.4f}".format(entry["ratio"]),
@@ -998,6 +1027,9 @@ def render(scenarios: dict) -> str:
                                for j, cell in enumerate(row)).rstrip())
         if i == 0:
             lines.append("─" * len(lines[0]))
+    if any(name in scenarios for name in GATE_SCENARIOS):
+        lines.append("")
+        lines.append("* gate only — runs and voids, never scored.")
     return "\n".join(lines)
 
 
@@ -1034,6 +1066,22 @@ elif report and os.path.exists(report):
         data["bytes_read"] = int(data.get("bytes_read", 0)) * 3 + (1 << 20)
     elif MODE == "underreport-bytes":
         data["bytes_read"] = int(data.get("bytes_read", 0)) // 4
+    elif MODE == "shrunk-head" and root:
+        # What a candidate whose head probe stopped separating a band actually
+        # pays: that band reaches the byte-for-byte stage as one bucket and is
+        # read end to end. Taken from the corpus, not from a multiplier, so the
+        # number is the corpus's own and not one chosen to clear the bar.
+        least = int(args[args.index("--min-size") + 1]) if "--min-size" in args else 1
+        total = 0
+        for path, _dirs, leaves in os.walk(root):
+            for leaf in leaves:
+                try:
+                    st = os.stat(os.path.join(path, leaf))
+                except OSError:
+                    continue
+                if st.st_size >= least:
+                    total += st.st_size
+        data["bytes_read"] = total
     with open(report, "w") as fh:
         json.dump(data, fh)
 
@@ -1066,7 +1114,7 @@ def selftest(volume: str, seed: int, baseline: str, oracle_py: str,
     cannot see — and it is small enough to rebuild between cases.
     """
     name, scale = "samesize", "smoke"
-    factor = corpus.SCALES[scale]
+    factor = corpus.scale_factor(name, scale)
     print("rbench selftest: {} at {} scale\n".format(name, scale))
     passed = True
 
@@ -1102,8 +1150,75 @@ def selftest(volume: str, seed: int, baseline: str, oracle_py: str,
             base, manifest, ceiling = fresh()
             tree = os.path.join(base, "tree")
 
+    passed = trap_selftest(volume, seed, baseline, oracle_py, oracle_sha) and passed
+
     print("\nselftest {}".format("passed" if passed else "FAILED"))
     return 0 if passed else 1
+
+
+def trap_selftest(volume: str, seed: int, baseline: str, oracle_py: str,
+                  oracle_sha: str) -> bool:
+    """The trap gate: prove `prefixtrap` prices a head probe the seven cannot.
+
+    On every scored shape a shorter head probe reads fewer bytes and separates
+    exactly the same population — the bytes fall, which is legal because the
+    ceiling only looks upward, and the clock falls with them. `prefixtrap` is
+    the one corpus where a shortened head stops separating anything: its bands
+    are same-size files that agree for a few kilobytes and then part company,
+    so a band the head no longer splits arrives at the byte-for-byte stage as a
+    single bucket and is read end to end.
+
+    The sabotage reports what that costs on this corpus — every file at or
+    above min_size, read to the end — rather than a multiple of an honest
+    figure, so what the ceiling is being held against is the corpus's own
+    arithmetic. What a real shrunk-head candidate does here was measured when
+    the scenario was built: `bench/corpus.py`'s `_prefixtrap` records DEEP_HEAD
+    at 4 KiB reading 147.2 MB where the baseline read 44.2 MB.
+
+    The honest control runs first. A corpus that voids for everybody would
+    catch this sabotage too and prove nothing by it.
+    """
+    name = "prefixtrap"
+    scale = GATE_SCALE[name]
+    print("\nrbench selftest: {} at {} scale — the trap gate\n"
+          .format(name, scale))
+    base, _manifest, ceiling = ensure_corpus(
+        volume, name, scale, seed, corpus.scale_factor(name, scale),
+        oracle_py, oracle_sha)
+    tree = os.path.join(base, "tree")
+
+    full = sum(size for size, _mtime in fingerprint(tree).values()
+               if size >= ceiling["min_size"])
+    print("  ceiling {} · floor {} · a band read to the end costs {}".format(
+        human(ceiling["oracle_bytes_read"]), human(ceiling["byte_floor"]),
+        human(full)))
+    if full <= ceiling["oracle_bytes_read"]:
+        print("  the trap has no headroom: reading every file costs no more "
+              "than the oracle already read, so this corpus cannot price a "
+              "shortened head. The scenario is broken, not the candidate.")
+        return False
+
+    passed = True
+    try:
+        measure_scenario(name, tree, ceiling,
+                         {"baseline": baseline, "candidate": baseline}, rounds=1)
+        print("  control, no sabotage      clean")
+    except Void as e:
+        print("  control, no sabotage      UNEXPECTED VOID: {}".format(e))
+        passed = False
+
+    cheat = sabotaged(baseline, "shrunk-head")
+    try:
+        measure_scenario(name, tree, ceiling,
+                         {"baseline": baseline, "candidate": cheat}, rounds=1)
+        print("\n  {:<24}  MISSED — the bytes ceiling did not fire on {}"
+              .format("shrunk-head", name))
+        passed = False
+    except Void as e:
+        print("\n  {:<24}  caught by the bytes ceiling on {}"
+              .format("shrunk-head", name))
+        print("      {}".format(str(e)[:150]))
+    return passed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1120,7 +1235,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scenario", action="append", metavar="NAME",
                    help="run only this scenario (repeatable)")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--scale", choices=sorted(corpus.SCALES), default="default")
+    p.add_argument("--scale", choices=sorted(corpus.SCALES), default="r2",
+                   help="corpus size set (default: r2, the scored one; smoke "
+                        "is a tenth-size set for development)")
     p.add_argument("--rounds", type=int, default=MIN_ROUNDS,
                    help="interleaved rounds per side (minimum {})".format(MIN_ROUNDS))
     p.add_argument("--calibrate", action="store_true",
@@ -1213,7 +1330,7 @@ def _locked(args, root, note, halve, busy) -> int:
                            setup, SETUP_CEILING))
         for name in names:
             scale = GATE_SCALE.get(name, args.scale)
-            factor = corpus.SCALES[scale] * (0.5 if halve else 1.0)
+            factor = corpus.scale_factor(name, scale) * (0.5 if halve else 1.0)
             base, manifest, ceiling = ensure_corpus(
                 root, name, scale, args.seed, factor, oracle_py, oracle_sha)
             print("rbench: {} ...".format(name), end=" ", flush=True)
@@ -1282,6 +1399,11 @@ def _locked(args, root, note, halve, busy) -> int:
               "has not moved.")
         return 0
 
+    if not scored:
+        # Reachable by asking for gate scenarios only, which is a legitimate
+        # thing to want and has no geomean to print.
+        print("\nno scored scenario ran, so there is no geomean.")
+        return 0
     if not complete:
         # A subset of the scored scenarios is a reading, not a score, and
         # printing it on the SCORE line is how a reading gets quoted as one.
