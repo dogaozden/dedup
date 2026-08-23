@@ -88,16 +88,39 @@ pub fn compare_chunk(profile: Profile, members: usize, solid: bool) -> usize {
 ///
 /// That stays byte-exact. A digest only picks which slot to look in — equality
 /// still decides, because each slot is re-partitioned by the same pivot loop.
+/// Below this many bytes in a pass, the pivot comparison is done on one
+/// thread: splitting it costs more than the `memcmp` saves. Above it, on a
+/// wide group of large blocks, this is the whole cost of the stage.
+const PARTITION_SPREAD: usize = 256 * 1024;
+
 fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> {
     let mut runs: Vec<Vec<(usize, Vec<u8>)>> = Vec::new();
     let mut pending = items;
     while !pending.is_empty() {
-        let mut rest = Vec::new();
         let mut iter = pending.into_iter();
-        let mut same = vec![iter.next().expect("pending is not empty")];
-        for item in iter {
-            let equal = item.1 == same[0].1;
-            if equal {
+        let pivot = iter.next().expect("pending is not empty");
+        let others: Vec<(usize, Vec<u8>)> = iter.collect();
+
+        // Every block is compared against the pivot and against nothing else,
+        // so the comparisons are independent — and on a wide group of large
+        // blocks they are the whole of what this stage does: `widegroup` puts
+        // 227 blocks of a quarter of a megabyte through here, per group, and
+        // used to do it on one thread.
+        //
+        // The verdicts are collected in order and the split is done after, so
+        // a run holds its members in the same order it always did. Nothing but
+        // the `memcmp` moves.
+        let bytes = others.len().saturating_mul(pivot.1.len());
+        let equal: Vec<bool> = if bytes >= PARTITION_SPREAD {
+            others.par_iter().map(|item| item.1 == pivot.1).collect()
+        } else {
+            others.iter().map(|item| item.1 == pivot.1).collect()
+        };
+
+        let mut same = vec![pivot];
+        let mut rest = Vec::new();
+        for (item, alike) in others.into_iter().zip(equal) {
+            if alike {
                 same.push(item);
             } else {
                 rest.push(item);
