@@ -26,8 +26,11 @@ diskutil info "$(df "$TREE" | tail -1 | awk '{print $1}')" 2>&1 | \
 log ""
 log "== walk only (metadata seeks) =="
 log "-- find, cold-ish:"
-( time find "$TREE" -type f | wc -l ) 2>&1 | tee -a "$OUT"
-NFILES=$(find "$TREE" -type f | wc -l | tr -d ' ')
+FLIST=$(mktemp)
+( time find "$TREE" -type f 2>/dev/null > "$FLIST" ) 2>&1 | tee -a "$OUT"
+NFILES=$(wc -l < "$FLIST" | tr -d ' ')
+rm -f "$FLIST"
+log "$NFILES files"
 if [[ "$NFILES" -lt 100 ]]; then
   log "WARNING: only $NFILES files in this tree — too small to measure anything."
   log "Pick a subtree with thousands of files (2-10 GB) and rerun."
