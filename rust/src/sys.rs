@@ -89,6 +89,36 @@ extern "C" {
     fn CFRelease(value: CfTypeRef);
 }
 
+/// How many cores of the fastest kind this machine has, on a machine whose
+/// cores are not all alike.
+///
+/// Apple silicon numbers its performance levels fastest first, so
+/// `perflevel0` is the performance cores and `perflevel1` the efficiency
+/// ones. A machine with a single performance level answers with all of its
+/// cores, which is the same answer as not distinguishing, and one that does
+/// not carry the key at all says `None`.
+pub fn performance_cores() -> Option<usize> {
+    let name = CString::new("hw.perflevel0.logicalcpu").expect("no interior NUL");
+    let mut cores: u32 = 0;
+    let mut size = std::mem::size_of::<u32>();
+    // SAFETY: `name` is NUL-terminated and outlives the call; `cores` is
+    // writable storage of exactly `size` bytes, which is what a sysctl of
+    // this integer type writes. A nonzero return means it wrote nothing.
+    let answered = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!(cores).cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if answered != 0 || size != std::mem::size_of::<u32>() || cores == 0 {
+        return None;
+    }
+    Some(cores as usize)
+}
+
 /// Whether the volume `path` sits on is backed by a disk image rather than by
 /// a physical device — a RAM disk, a `.dmg`, a sparsebundle, a VM volume.
 ///

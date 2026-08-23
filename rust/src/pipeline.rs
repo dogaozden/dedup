@@ -216,8 +216,20 @@ pub fn find_duplicates(
 
     let mut remembered: Vec<Vec<usize>> = Vec::new();
     if !small.is_empty() {
+        // Its own pool, because it is the one stage whose reads are all open
+        // and no seek; see `Device::small_file_jobs`. Built here rather than
+        // beside the others so a tree with nothing small in it never pays for
+        // the threads, and skipped entirely where the two counts agree.
+        let small_jobs = device.small_file_jobs(profile);
+        let dedicated = (small_jobs != random_jobs).then(|| pool_of(small_jobs));
+        let small_reader = Reader {
+            root,
+            effort,
+            pool: dedicated.as_ref().unwrap_or(&random_pool),
+            jobs: small_jobs,
+        };
         let (proven, attested, fallback) = small_file_stage(
-            &reader,
+            &small_reader,
             &records,
             &small,
             &mut unreadable,
