@@ -1070,6 +1070,7 @@ against any of it.
 | `--gate all` | 0 — 33 checks, 0 failed |
 | end-to-end browser runs, 7 scenarios | 0 differing |
 | terminal restore, 3 exit paths | 0 differing |
+| CLI dispatch, 7 flag and terminal combinations | 0 differing |
 
 The suite went from 45 tests to 101. The 56 new ones are 27 on the model, 12
 on the paint through `TestBackend`, 9 on `run_selected` against real scratch

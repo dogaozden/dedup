@@ -670,6 +670,64 @@ $ cargo fmt --check
 (no output: clean)
 ```
 
+### How a run reaches the browser, and what a piped run still does
+
+Adding an interactive mode to a tool the harness drives as a subprocess is a
+chance to change non-interactive behaviour by accident, so this is checked
+rather than assumed. The browser opens on the oracle's own condition — a
+terminal, and neither `--list` nor `--auto` — and `-i` asks for it outright,
+which is the only case where a pipe is an error rather than a fall-through.
+A piped run with no flags still writes its report and prints nothing, exactly
+as before M5.
+
+```
+python3 rust/evidence/scripts/m5_dispatch.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5-dispatch.txt`, quoted from the file:
+
+```text
+=== no flags: the oracle's default is the browser ===
+    terminal: True   flags: (none)
+    exit: 0   entered the browser: True
+    said: dedup…d6-546b-4ac1-8468-9ebe21560ca6/scratchpad/m5-dispatch/m5-dispatch/case-0/tree─────────────
+
+=== --list: prints the groups and stops ===
+    terminal: True   flags: ['--list']
+    exit: 0   entered the browser: False
+    said: 1 duplicate group(s) keep a.bin b.bin
+
+=== nothing duplicated: says so and stops ===
+    terminal: True   flags: (none)
+    exit: 0   entered the browser: False
+    said: No duplicates found.
+
+=== -i with nothing duplicated: not an error ===
+    terminal: True   flags: ['-i']
+    exit: 0   entered the browser: False
+    said: No duplicates found.
+
+=== no flags through a pipe: exactly as before M5 ===
+    terminal: False   flags: (none)
+    exit: 0   entered the browser: False
+    said: 
+
+=== --list through a pipe: exactly as before M5 ===
+    terminal: False   flags: ['--list']
+    exit: 0   entered the browser: False
+    said: 1 duplicate group(s) keep a.bin b.bin
+
+=== -i through a pipe: refuses, and says what to use ===
+    terminal: False   flags: ['-i']
+    exit: 2   entered the browser: False
+    said: dedup-rs: the interactive browser needs a terminal on stdin and stdout. Use --list to see the gr
+
+every case left both files where they were
+```
+
+The command exited 0.
+
 ### Fence conditions this run was made under
 
 `ls /Volumes` immediately before and after the gate run: `dedupbench`, which is
