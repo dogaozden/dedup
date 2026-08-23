@@ -381,8 +381,7 @@ mod tests {
             ino,
             nlink: 1,
             mtime_ns,
-            head: Vec::new(),
-            tail: Vec::new(),
+            retained: None,
         }
     }
 

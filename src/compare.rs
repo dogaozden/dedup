@@ -130,14 +130,14 @@ pub fn split_identical(
     if members.len() > 1
         && held
             .iter()
-            .all(|record| record.head.len() >= record.size as usize)
+            .all(|record| record.head().len() >= record.size as usize)
         && unchanged(context.root, &held)
     {
         let blocks = members
             .iter()
             .map(|&index| {
                 let record = &records[index];
-                (index, record.head[..record.size as usize].to_vec())
+                (index, record.head()[..record.size as usize].to_vec())
             })
             .collect();
         for run in partition_blocks(blocks) {
@@ -179,12 +179,12 @@ pub fn split_identical(
     // puts the whole group back on reading from zero.
     let mut prefix = opened
         .iter()
-        .map(|&index| records[index].head.len())
+        .map(|&index| records[index].head().len())
         .min()
         .unwrap_or(0);
     let mut tail = opened
         .iter()
-        .map(|&index| records[index].tail.len())
+        .map(|&index| records[index].tail().len())
         .min()
         .unwrap_or(0);
     if tail > 0
@@ -234,7 +234,7 @@ pub fn split_identical(
             .map(|&index| {
                 let mut hasher = Sha256::new();
                 if prefix > 0 {
-                    hasher.update(&records[index].head[..prefix]);
+                    hasher.update(&records[index].head()[..prefix]);
                 }
                 hasher
             })
@@ -250,7 +250,7 @@ pub fn split_identical(
             opened
                 .iter()
                 .enumerate()
-                .map(|(slot, &index)| (slot, records[index].head[..prefix].to_vec()))
+                .map(|(slot, &index)| (slot, records[index].head()[..prefix].to_vec()))
                 .collect(),
         )
         .into_iter()
@@ -330,7 +330,7 @@ pub fn split_identical(
         let blocks = group
             .into_iter()
             .map(|slot| {
-                let kept = &records[opened[slot]].tail;
+                let kept = records[opened[slot]].tail();
                 (slot, kept[kept.len() - tail..].to_vec())
             })
             .collect();

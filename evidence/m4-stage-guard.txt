@@ -1,0 +1,23 @@
+=== REVIEW-M4 item 1 reproduction: --stage size --auto must not delete ===
+before:
+  alpha.bin    791235c06f572a70cb55f829507b4926
+  bravo.bin    64caede5d77a72aaaf89add5cd1defde
+  charlie.bin  5db22b7a73818e9172cd65da96a9fb8c
+dedup-rs: --auto cannot act on a --stage size scan. Size buckets are files that merely share a length; nothing has read their contents, so removing one would not be removing a duplicate. Re-run without --stage.
+EXIT: 2
+after:  alpha.bin bravo.bin charlie.bin 
+
+=== same tree, no --stage: normal behaviour, three distinct files, nothing to remove ===
+
+  Nothing to remove.
+
+EXIT: 0
+after:  alpha.bin bravo.bin charlie.bin 
+
+=== and a real duplicate still deletes, with the oracle's lowercase wording ===
+
+  Keeping the shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 16 bytes reclaimed
+
+after:  alpha.bin bravo.bin charlie.bin 
+trash:  zz-copy.bin 

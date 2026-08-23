@@ -12,16 +12,6 @@ use std::path::{Path, PathBuf};
 
 use crate::filters::{excluded, extension_allowed, Filters};
 
-/// One directory entry the walk accepted, before hardlinks are collapsed.
-pub struct Entry {
-    pub relative: String,
-    pub size: u64,
-    pub dev: u64,
-    pub ino: u64,
-    pub nlink: u64,
-    pub mtime_ns: i64,
-}
-
 /// One file. A hardlinked inode is one record wearing several names, because
 /// deleting fewer than all of them frees nothing.
 pub struct FileRec {
@@ -36,10 +26,20 @@ pub struct FileRec {
     /// scan can see.
     pub nlink: u64,
     pub mtime_ns: i64,
-    /// Bytes stage 3 read from offset 0, kept so stage 5 can compare them
+    /// Bytes stage 3 read from each end, kept so stage 5 can compare them
     /// instead of reading them a second time.
+    ///
+    /// Boxed, and absent by default, because most records never carry any: a
+    /// tree of small files settles before stage 3 ever runs, and two empty
+    /// vectors cost 48 bytes on every record to say nothing.
+    pub retained: Option<Box<Retained>>,
+}
+
+/// One contiguous run from offset 0 and one that ends at EOF. Stages read each
+/// end strictly outward, so that is the only shape either can take.
+#[derive(Default)]
+pub struct Retained {
     pub head: Vec<u8>,
-    /// ...and the same for the page at the far end.
     pub tail: Vec<u8>,
 }
 
@@ -50,6 +50,32 @@ impl FileRec {
 
     pub fn layout(&self) -> (u64, u64) {
         (self.dev, self.ino)
+    }
+
+    pub fn head(&self) -> &[u8] {
+        self.retained.as_ref().map_or(&[], |kept| &kept.head)
+    }
+
+    pub fn tail(&self) -> &[u8] {
+        self.retained.as_ref().map_or(&[], |kept| &kept.tail)
+    }
+
+    /// Keep what the end probe read. Only ever called on a record carrying
+    /// nothing, which is what makes the run contiguous from offset 0.
+    pub fn keep_ends(&mut self, head: Vec<u8>, tail: Vec<u8>) {
+        self.retained = Some(Box::new(Retained { head, tail }));
+    }
+
+    /// Continue the head with the block behind it.
+    pub fn extend_head(&mut self, block: &[u8]) {
+        if let Some(kept) = self.retained.as_mut() {
+            kept.head.extend_from_slice(block);
+        }
+    }
+
+    /// Drop kept bytes no later stage will look at again.
+    pub fn release(&mut self) {
+        self.retained = None;
     }
 
     /// True when removing our copies actually frees the bytes.
@@ -77,13 +103,20 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Collect every regular file under `root`, one record per directory entry.
+///
+/// Hardlinks are folded together afterwards by `candidates`, in place. The walk
+/// builds `FileRec`s rather than a lighter intermediate on purpose: an
+/// intermediate would have to stay alive while the records were built beside
+/// it, and holding two per-file structures at once is what put the peak over
+/// REWRITE.md §6's budget.
 pub fn walk(
     root: &Path,
     filters: Filters,
     files_seen: &mut u64,
     bytes_seen: &mut u64,
     unreadable: &mut Vec<String>,
-) -> Vec<Entry> {
+) -> Vec<FileRec> {
     let mut survivors = Vec::new();
     let mut directories = vec![root.to_path_buf()];
 
@@ -142,13 +175,14 @@ pub fn walk(
             if metadata.len() < filters.min_size {
                 continue;
             }
-            survivors.push(Entry {
-                relative,
+            survivors.push(FileRec {
+                names: vec![relative],
                 size: metadata.len(),
                 dev: metadata.dev(),
                 ino: metadata.ino(),
                 nlink: metadata.nlink(),
                 mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                retained: None,
             });
         }
     }
@@ -156,90 +190,80 @@ pub fn walk(
     survivors
 }
 
-/// Fold one inode's directory entries into a single record.
+/// Fold the names of one inode, whose records sit at `[..]`, onto the first.
 ///
 /// Several names for one inode is normally a hardlink, and those are separate
 /// directory entries that all have to go together. But overlapping roots or a
 /// symlinked root can hand us two spellings of a single entry, and deleting it
 /// twice would report a failure for work already done — so only multi-name
 /// records pay for resolving that.
-fn fold_inode(root: &Path, entries: &mut [Entry]) -> FileRec {
-    let first = &entries[0];
-    let mut record = FileRec {
-        names: Vec::with_capacity(entries.len()),
-        size: first.size,
-        dev: first.dev,
-        ino: first.ino,
-        nlink: first.nlink,
-        mtime_ns: first.mtime_ns,
-        head: Vec::new(),
-        tail: Vec::new(),
-    };
-    for entry in entries.iter_mut() {
-        if !record.names.contains(&entry.relative) {
-            record.names.push(std::mem::take(&mut entry.relative));
+fn fold_names(root: &Path, first: &mut FileRec, rest: &mut [FileRec]) {
+    for other in rest.iter_mut() {
+        let name = std::mem::take(&mut other.names[0]);
+        if !first.names.contains(&name) {
+            first.names.push(name);
         }
     }
-    if record.names.len() > 1 {
+    if first.names.len() > 1 {
         let mut seen: Vec<(PathBuf, String)> = Vec::new();
-        for name in record.names.drain(..) {
+        for name in first.names.drain(..) {
             let real = fs::canonicalize(root.join(&name)).unwrap_or_else(|_| root.join(&name));
             if !seen.iter().any(|(known, _)| known == &real) {
                 seen.push((real, name));
             }
         }
-        record.names = seen.into_iter().map(|(_, name)| name).collect();
+        first.names = seen.into_iter().map(|(_, name)| name).collect();
     }
-    record
+    first
         .names
         .sort_by(|left, right| name_order(left).cmp(&name_order(right)));
-    record
 }
 
 /// Stage 2: collapse hardlinks, then discard every size only one record holds.
 ///
 /// One sort by (size, device, inode) does all the grouping this stage needs —
 /// a size's entries land in one run and an inode's names land adjacent inside
-/// it — which keeps the whole stage to the entry list and the records it
-/// produces. Grouping through hash maps instead cost about three times the
-/// peak, against REWRITE.md §6's per-record budget.
+/// it — and the compaction then happens in place, so no second per-file
+/// structure is ever live beside the first.
 ///
 /// The records come back in the volume's layout order rather than the grouping
 /// order, so a later stage is one sweep across the disk instead of a jump per
 /// file.
-pub fn candidates(root: &Path, mut entries: Vec<Entry>) -> Vec<FileRec> {
-    entries.sort_unstable_by_key(|entry| (entry.size, entry.dev, entry.ino));
+pub fn candidates(root: &Path, mut records: Vec<FileRec>) -> Vec<FileRec> {
+    records.sort_unstable_by_key(|record| (record.size, record.dev, record.ino));
 
-    let mut out: Vec<FileRec> = Vec::new();
-    let mut run_start = 0;
-    while run_start < entries.len() {
-        let size = entries[run_start].size;
-        let mut run_end = run_start;
-        while run_end < entries.len() && entries[run_end].size == size {
-            run_end += 1;
-        }
-
-        let first_record = out.len();
-        let mut name_start = run_start;
-        while name_start < run_end {
-            let inode = (entries[name_start].dev, entries[name_start].ino);
-            let mut name_end = name_start;
-            while name_end < run_end && (entries[name_end].dev, entries[name_end].ino) == inode {
-                name_end += 1;
+    // `write` trails `read`: everything before it is a kept record, everything
+    // between them is a husk whose name has already been moved onto its
+    // cluster's first record. Nothing is dropped until the truncate, so no
+    // element is ever duplicated.
+    let mut write = 0;
+    let mut read = 0;
+    while read < records.len() {
+        let size = records[read].size;
+        let run_start = write;
+        while read < records.len() && records[read].size == size {
+            let inode = (records[read].dev, records[read].ino);
+            records.swap(write, read);
+            let mut last = read + 1;
+            while last < records.len() && (records[last].dev, records[last].ino) == inode {
+                last += 1;
             }
-            out.push(fold_inode(root, &mut entries[name_start..name_end]));
-            name_start = name_end;
+            // `rest` starts at absolute `write + 1`; the cluster's other
+            // names start at absolute `read + 1`.
+            let (kept, rest) = records[write..last].split_at_mut(1);
+            fold_names(root, &mut kept[0], &mut rest[read - write..]);
+            read = last;
+            write += 1;
         }
         // A size only one record holds is nobody's duplicate, and a hardlink
         // cluster matching nothing else is one record wearing several names.
-        if out.len() - first_record < 2 {
-            out.truncate(first_record);
+        if write - run_start < 2 {
+            write = run_start;
         }
-        run_start = run_end;
     }
-
-    out.sort_unstable_by_key(FileRec::layout);
-    out
+    records.truncate(write);
+    records.sort_unstable_by_key(FileRec::layout);
+    records
 }
 
 /// Whether every file is still the one whose bytes we kept. Kept bytes only
@@ -268,14 +292,15 @@ pub fn basename(path: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn entry(relative: &str, size: u64, ino: u64) -> Entry {
-        Entry {
-            relative: relative.to_string(),
+    fn entry(relative: &str, size: u64, ino: u64) -> FileRec {
+        FileRec {
+            names: vec![relative.to_string()],
             size,
             dev: 1,
             ino,
             nlink: 1,
             mtime_ns: 0,
+            retained: None,
         }
     }
 
@@ -319,6 +344,61 @@ mod tests {
     }
 
     #[test]
+    fn a_discarded_size_run_does_not_disturb_the_runs_around_it() {
+        // The compaction writes over the husks it leaves behind, so a run that
+        // turns out to be a single record has to be reclaimed without
+        // corrupting the run that follows it.
+        let root = Path::new("/nowhere");
+        let records = candidates(
+            root,
+            vec![
+                entry("lone-a.bin", 1, 1), // size 1: one record, discarded
+                entry("pair-a.bin", 2, 2), // size 2: a real pair
+                entry("pair-b.bin", 2, 3),
+                entry("lone-b.bin", 3, 4), // size 3: one record, discarded
+                entry("trio-a.bin", 4, 5), // size 4: a real trio
+                entry("trio-b.bin", 4, 6),
+                entry("trio-c.bin", 4, 7),
+            ],
+        );
+        let mut got: Vec<&str> = records.iter().map(FileRec::path).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [
+                "pair-a.bin",
+                "pair-b.bin",
+                "trio-a.bin",
+                "trio-b.bin",
+                "trio-c.bin"
+            ]
+        );
+        assert!(records.iter().all(|record| record.names.len() == 1));
+    }
+
+    #[test]
+    fn a_cluster_beside_a_discarded_run_keeps_all_its_names() {
+        let root = Path::new("/nowhere");
+        let records = candidates(
+            root,
+            vec![
+                entry("lone.bin", 1, 1),
+                entry("c/x.bin", 2, 2),
+                entry("c/y.bin", 2, 2),
+                entry("c/z.bin", 2, 2),
+                entry("twin.bin", 2, 3),
+            ],
+        );
+        assert_eq!(records.len(), 2);
+        let cluster = records
+            .iter()
+            .find(|record| record.ino == 2)
+            .expect("the cluster survives");
+        assert_eq!(cluster.names, ["c/x.bin", "c/y.bin", "c/z.bin"]);
+        assert!(records.iter().any(|record| record.path() == "twin.bin"));
+    }
+
+    #[test]
     fn a_record_fits_the_per_file_memory_budget() {
         // REWRITE.md §6 allows 230 bytes per file record, §4 says 180-230 is
         // the shape to aim for. A record is the struct, the vector holding its
@@ -331,12 +411,15 @@ mod tests {
             ino: 1,
             nlink: 1,
             mtime_ns: 0,
-            head: Vec::new(),
-            tail: Vec::new(),
+            retained: None,
         };
         let footprint = std::mem::size_of::<FileRec>()
             + record.names.capacity() * std::mem::size_of::<String>()
             + record.names.iter().map(String::capacity).sum::<usize>();
+        // Retained bytes are not part of this: they exist only for records
+        // that reach stage 3, are bounded by RETAIN_BUDGET rather than by the
+        // file count, and are dropped by `release` as soon as a stage is done
+        // with them.
         assert!(
             footprint <= 230,
             "{footprint} bytes per record, over the 230-byte budget"

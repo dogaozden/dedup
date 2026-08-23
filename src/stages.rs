@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use crate::cache::{Field, ScanCache};
 use crate::consts::{
     DEEP_HEAD, HASH_BATCH, HEAD_BYTES, RETAIN_BUDGET, RETAIN_CHECK_SPAN, SAMPLE_BYTES,
-    SAMPLE_POINTS, TAIL_BYTES,
+    SAMPLE_POINTS, SAMPLE_SPAN, TAIL_BYTES,
 };
 use crate::effort::Effort;
 use crate::ordered::Ordered;
@@ -54,6 +54,12 @@ pub fn has_tail(size: u64) -> bool {
 /// tail page onward has already been read, so the windows spread across what
 /// is left and no byte is read twice.
 fn sample_points(size: u64) -> Vec<u64> {
+    // Only groups past SAMPLE_SPAN reach stage 4 (see the `big` split in
+    // `find_duplicates`), which is what keeps the subtraction below in range.
+    debug_assert!(
+        size > SAMPLE_SPAN,
+        "stage 4 is only for files worth sampling"
+    );
     let first = DEEP_HEAD as u64;
     let last = size - TAIL_BYTES as u64 - SAMPLE_BYTES as u64;
     let step = (last - first) / (SAMPLE_POINTS as u64 - 1);
@@ -226,14 +232,13 @@ pub fn hash_stage(
             let record = &mut records[index];
             match probe {
                 Probe::Ends { keep: true } => {
-                    if record.head.is_empty() && record.tail.is_empty() {
-                        record.head = outcome.head;
-                        record.tail = outcome.tail;
+                    if record.retained.is_none() {
+                        record.keep_ends(outcome.head, outcome.tail);
                     }
                 }
                 Probe::DeepHead { keep: true } => {
-                    if record.head.len() == HEAD_BYTES {
-                        record.head.extend_from_slice(&outcome.head);
+                    if record.head().len() == HEAD_BYTES {
+                        record.extend_head(&outcome.head);
                     }
                 }
                 _ => {}
@@ -255,8 +260,7 @@ pub fn release(records: &mut [FileRec], considered: &[usize], pending: &[Vec<usi
         .collect();
     for &index in considered {
         if !live.contains(&index) {
-            records[index].head = Vec::new();
-            records[index].tail = Vec::new();
+            records[index].release();
         }
     }
 }

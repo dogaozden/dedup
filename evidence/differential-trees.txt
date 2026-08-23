@@ -33,5 +33,12 @@
   links2 --min-size 4096             same (2 groups, 84096 bytes, 9 opens)
   links2 --min-size 1 --ext bin      same (2 groups, 84096 bytes, 9 opens)
   links2 --min-size 1 -x d0*         same (2 groups, 84096 bytes, 9 opens)
+  unicode --min-size 0               same (1 groups, 25000 bytes, 10 opens)
+  unicode --min-size 1               same (1 groups, 25000 bytes, 10 opens)
+  unicode --min-size 1 -j 1          same (1 groups, 25000 bytes, 10 opens)
+  unicode --min-size 1 -j 4          same (1 groups, 25000 bytes, 10 opens)
+  unicode --min-size 4096            same (1 groups, 25000 bytes, 10 opens)
+  unicode --min-size 1 --ext bin     same (1 groups, 25000 bytes, 10 opens)
+  unicode --min-size 1 -x d0*        same (1 groups, 25000 bytes, 10 opens)
 
-35 differential check(s), 0 differing
+42 differential check(s), 0 differing

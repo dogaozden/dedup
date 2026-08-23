@@ -31,10 +31,44 @@ pub struct DupGroup {
 
 pub struct Scan {
     pub records: Vec<FileRec>,
-    pub groups: Vec<DupGroup>,
+    /// Private on purpose. The only ways out are `reported`, for the protocol
+    /// report, where a size bucket is an honest answer; and `proven`, for
+    /// deletion, where it is not.
+    groups: Vec<DupGroup>,
+    proven: bool,
     pub files_seen: u64,
     pub bytes_seen: u64,
     pub unreadable: Vec<String>,
+}
+
+/// A borrow of groups that trace to bytes compared this scan — or to a cache
+/// attestation that `verify_attested` re-proves from bytes before anything is
+/// removed.
+///
+/// `Scan::proven` is the only way to obtain one and it returns `None` for a
+/// scan that merely grouped by size, so the deletion path cannot be reached
+/// from one. The guard is the type: `run_auto` will not accept anything else,
+/// and no later caller can reintroduce the hole by forgetting a comparison on
+/// a mode string.
+pub struct ProvenGroups<'a>(&'a [DupGroup]);
+
+impl<'a> ProvenGroups<'a> {
+    pub fn groups(self) -> &'a [DupGroup] {
+        self.0
+    }
+}
+
+impl Scan {
+    /// Every group the scan found, for reporting.
+    pub fn reported(&self) -> &[DupGroup] {
+        &self.groups
+    }
+
+    /// The groups deletion may act on, or `None` when nothing has read a byte
+    /// of any file's contents.
+    pub fn proven(&self) -> Option<ProvenGroups<'_>> {
+        self.proven.then_some(ProvenGroups(&self.groups))
+    }
 }
 
 /// How much the end probe reads — for the retention decision.
@@ -79,6 +113,8 @@ pub fn size_stage(root: &Path, filters: Filters) -> Scan {
     Scan {
         records,
         groups,
+        // Files that merely share a length. Nothing here has read a byte.
+        proven: false,
         files_seen,
         bytes_seen,
         unreadable,
@@ -117,6 +153,7 @@ pub fn find_duplicates(
     let mut records = candidates(root, entries);
     let mut scan = Scan {
         groups: Vec::new(),
+        proven: true,
         files_seen,
         bytes_seen,
         unreadable,
@@ -340,14 +377,14 @@ pub fn sort_groups(records: &[FileRec], groups: &mut [DupGroup]) {
     });
 }
 
-pub fn report_names(records: &[FileRec], groups: &[DupGroup]) -> Vec<Vec<String>> {
+pub fn report_names<'a>(records: &'a [FileRec], groups: &[DupGroup]) -> Vec<Vec<&'a str>> {
     groups
         .iter()
         .map(|group| {
             group
                 .members
                 .iter()
-                .map(|&index| records[index].path().to_string())
+                .map(|&index| records[index].path())
                 .collect()
         })
         .collect()

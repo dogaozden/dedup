@@ -223,24 +223,38 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
         contained != *negated
     }
 
-    fn inner(tokens: &[Token], text: &[char]) -> bool {
-        match (tokens.first(), text.first()) {
-            (None, None) => true,
-            (Some(Token::Any), _) => {
-                // Only the longest run of a leading `*` needs trying, and only
-                // from each position once: without the early exit a pattern
-                // like `*a*a*a*` backtracks exponentially over a long name.
-                (0..=text.len()).any(|index| inner(&tokens[1..], &text[index..]))
-            }
-            (Some(Token::One), Some(_)) => inner(&tokens[1..], &text[1..]),
-            (Some(token), Some(&actual)) if matches!(token, Token::Set { .. }) => {
-                matches_set(token, actual) && inner(&tokens[1..], &text[1..])
-            }
-            _ => false,
+    // Whether tokens[t..] matches text[c..], filled bottom-up.
+    //
+    // Recursing on `*` instead — trying every split point and letting each try
+    // recurse again — is exponential: `*a*a*a*a*b` against forty a's took two
+    // minutes here, against fnmatch's third of a second, because fnmatch
+    // compiles to a regex and a regex does not re-derive the same subproblem
+    // twice. Neither does this: each (token, position) pair is decided once,
+    // which makes the whole match O(tokens x characters). A `-x` pattern comes
+    // from the user and gets pointed at large trees, so its cost has to be a
+    // function of the input rather than of the input's shape.
+    let tokens = parse(pattern);
+    let text: Vec<char> = text.chars().collect();
+    let width = text.len() + 1;
+    let mut matches = vec![false; (tokens.len() + 1) * width];
+    matches[tokens.len() * width + text.len()] = true; // both exhausted
+
+    for t in (0..tokens.len()).rev() {
+        for c in (0..=text.len()).rev() {
+            let here = match &tokens[t] {
+                // `*` either stands for nothing, or eats one more character.
+                Token::Any => {
+                    matches[(t + 1) * width + c] || (c < text.len() && matches[t * width + c + 1])
+                }
+                Token::One => c < text.len() && matches[(t + 1) * width + c + 1],
+                set => {
+                    c < text.len() && matches_set(set, text[c]) && matches[(t + 1) * width + c + 1]
+                }
+            };
+            matches[t * width + c] = here;
         }
     }
-
-    inner(&parse(pattern), &text.chars().collect::<Vec<_>>())
+    matches[0]
 }
 
 #[cfg(test)]
@@ -297,6 +311,38 @@ mod tests {
         assert!(!glob_match("[a-z].bin", "Q.bin"));
         assert!(glob_match("[[]literal]", "[literal]"));
         assert!(glob_match("literal[", "literal["));
+    }
+
+    #[test]
+    fn a_pathological_pattern_still_finishes_promptly() {
+        // The shape that used to backtrack exponentially: many `*x*` groups
+        // against a long run of the same character, with a final literal that
+        // can never match, so every split point is explored. REVIEW-M2 measured
+        // 121 seconds here; bottom-up it is a few hundred microseconds.
+        let name = "a".repeat(40) + ".bin";
+        let start = std::time::Instant::now();
+        assert!(!glob_match("*a*a*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(glob_match("*a*a*a*a*a*a*a*a*a*a*a*n", &name));
+        assert!(!glob_match(&"*a".repeat(30), &name));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "pathological patterns took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_star_matches_across_and_at_the_ends() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("**", "anything"));
+        assert!(glob_match("a*", "a"));
+        assert!(glob_match("*a", "a"));
+        assert!(glob_match("a*c", "abbbc"));
+        assert!(!glob_match("a*c", "abbbd"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
     }
 
     #[test]

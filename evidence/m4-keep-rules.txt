@@ -1,0 +1,15 @@
+case                     rule       oracle keeps   dedup-rs keeps 
+all mtimes equal         shortest   c.bin          c.bin          same
+all mtimes equal         oldest     c.bin          c.bin          same
+all mtimes equal         newest     c.bin          c.bin          same
+two tied newest          shortest   c.bin          c.bin          same
+two tied newest          oldest     c.bin          c.bin          same
+two tied newest          newest     bb.bin         bb.bin         same
+sub-microsecond oldest   shortest   c.bin          c.bin          same
+sub-microsecond oldest   oldest     bb.bin         bb.bin         same
+sub-microsecond oldest   newest     c.bin          c.bin          same
+plainly ordered          shortest   c.bin          c.bin          same
+plainly ordered          oldest     aaa.bin        aaa.bin        same
+plainly ordered          newest     c.bin          c.bin          same
+
+0 rule check(s) differing

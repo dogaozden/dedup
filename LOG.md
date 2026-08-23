@@ -111,29 +111,7 @@ The candidate worktree and oracle clone were both clean afterward.
 Captured stdout from:
 
 ```text
-python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
-
-  Keeping the Shortest copy in each of 1 groups.
-  Move to Trash: 1 files · 29 bytes reclaimed
-
-      copy-of-a.bin
-
-
-  Refusing to delete without confirmation. Re-run with -y to proceed.
-exit: 1
-files still present: a.bin copy-of-a.bin z.bin 
-trash: []
-
---- 2. --auto -y: keeper survives, victim goes to the home Trash ---
-exit: 0
-files still present: a.bin z.bin 
-trash: [copy-of-a.bin ]
-
---- 3. --hard: permanent, nothing reaches the Trash ---
-exit: 0
-files still present: a.bin 
-trash: []
-'
+python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
 ```
 
 Final lines:
@@ -363,10 +341,14 @@ first.
   re-derives something the oracle already settled and risks diverging from it. The stage-3 and stage-4 digests must be a real
   cryptographic hash to narrow safely, and sha2 compiles to the ARMv8 SHA-256
   instructions this machine has; a hand-rolled implementation would be several
-  times slower for no behavioural gain. It is a pure-Rust, no-std-capable crate
-  with no transitive dependencies beyond `digest`/`generic-array`/
-  `cpufeatures`. Nothing is ever reported or deleted on the strength of one of
-  its digests — §3.1 is enforced by stage 5, not by the hash.
+  times slower for no behavioural gain. Its full transitive set is `cfg-if`,
+  `cpufeatures` (which pulls `libc`), `digest`, `block-buffer`,
+  `generic-array`, `typenum`, `crypto-common` and the `version_check` build
+  dependency — eight crates, all long-standing RustCrypto infrastructure, and
+  `libc` is on §7's allowlist in its own right. (An earlier draft of this entry
+  named only three of them; REVIEW-M2 was right that the list was short.)
+  Nothing is ever reported or deleted on the strength of one of its digests —
+  §3.1 is enforced by stage 5, not by the hash.
 
 `clap` is allowed but unused: the argument surface is a dozen flags and the
 oracle's own parser is `argparse` with no subcommands, so hand-parsing keeps
@@ -701,8 +683,11 @@ on every record and that costs §6's memory budget.
 - The curses browser (M5) does not exist and is out of scope.
 - `getattrlistbulk(2)` is still deferred, as recorded at M1. The walk is
   portable `read_dir`. The protocol excludes directory opens from `opens`, so no
-  gate can see it, and §6's wall-time targets are already met without it. It is
-  the obvious next performance item.
+  gate can see it, and §6's wall-time targets are already met without it.
+  **Intended milestone: M5**, alongside the TUI, or in a dedicated performance
+  pass if M5 is never commissioned — it is the only remaining item from
+  REWRITE.md §4 that this port does not implement, and naming a milestone for it
+  is REVIEW-M1 item 6, which I answered vaguely the first time.
 
 ### Fence
 

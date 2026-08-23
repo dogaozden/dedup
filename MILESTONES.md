@@ -9,29 +9,7 @@ macOS `getattrlistbulk(2)` remains explicitly deferred in `LOG.md`.
 
 - Implementation commit addressing all binding review items:
   `06a5f640c11d7cdde9b98842f0f383960d36de00`
-- Gate command: `python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
-
-  Keeping the Shortest copy in each of 1 groups.
-  Move to Trash: 1 files · 29 bytes reclaimed
-
-      copy-of-a.bin
-
-
-  Refusing to delete without confirmation. Re-run with -y to proceed.
-exit: 1
-files still present: a.bin copy-of-a.bin z.bin 
-trash: []
-
---- 2. --auto -y: keeper survives, victim goes to the home Trash ---
-exit: 0
-files still present: a.bin z.bin 
-trash: [copy-of-a.bin ]
-
---- 3. --hard: permanent, nothing reaches the Trash ---
-exit: 0
-files still present: a.bin 
-trash: []
-'`
+- Gate command: `python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'`
 
 Final gate output, captured to `/tmp/dedup-rs-m1-gate.txt` by redirecting
 stdout of the command above:
@@ -72,29 +50,7 @@ revalidated by `fstat` before they are trusted. `-j` is honoured by both pools.
 
 ```
 python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m2 \
-  --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
-
-  Keeping the Shortest copy in each of 1 groups.
-  Move to Trash: 1 files · 29 bytes reclaimed
-
-      copy-of-a.bin
-
-
-  Refusing to delete without confirmation. Re-run with -y to proceed.
-exit: 1
-files still present: a.bin copy-of-a.bin z.bin 
-trash: []
-
---- 2. --auto -y: keeper survives, victim goes to the home Trash ---
-exit: 0
-files still present: a.bin z.bin 
-trash: [copy-of-a.bin ]
-
---- 3. --hard: permanent, nothing reaches the Trash ---
-exit: 0
-files still present: a.bin 
-trash: []
-'
+  --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
 ```
 
 Captured to `evidence/m2-gate.txt` by redirecting that command's stdout, and
@@ -175,29 +131,7 @@ column by column.
 
 ```
 python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m3 \
-  --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
-
-  Keeping the Shortest copy in each of 1 groups.
-  Move to Trash: 1 files · 29 bytes reclaimed
-
-      copy-of-a.bin
-
-
-  Refusing to delete without confirmation. Re-run with -y to proceed.
-exit: 1
-files still present: a.bin copy-of-a.bin z.bin 
-trash: []
-
---- 2. --auto -y: keeper survives, victim goes to the home Trash ---
-exit: 0
-files still present: a.bin z.bin 
-trash: [copy-of-a.bin ]
-
---- 3. --hard: permanent, nothing reaches the Trash ---
-exit: 0
-files still present: a.bin 
-trash: []
-'
+  --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
 ```
 
 Captured to `evidence/m3-gate.txt` by redirecting that command's stdout, and

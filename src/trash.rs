@@ -8,12 +8,22 @@
 //! §3.2: a group always keeps one copy, enforced here rather than by whatever
 //! is asking.
 
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::cache::ScanCache;
+use crate::compare::{verify_attested, Compare};
 use crate::device::mount_point;
-use crate::pipeline::DupGroup;
+use crate::pipeline::{DupGroup, ProvenGroups, Scan};
 use crate::walk::{name_order, FileRec};
+
+/// What a non-interactive run was asked to do.
+pub struct Removal {
+    pub rule: Rule,
+    pub hard: bool,
+    pub assume_yes: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
@@ -41,16 +51,30 @@ impl Rule {
     }
 
     /// Which member survives. Returns a position within `members`.
+    ///
+    /// Python's `min` and `max` both return the FIRST extreme; Rust's
+    /// `max_by_key` returns the LAST. Members arrive shortest-name-first, so an
+    /// unadjusted `max` would keep the longest-named copy on a tie where the
+    /// oracle keeps the shortest-named one. Reversing the comparator and taking
+    /// the minimum gets the first maximum, which is what `dedup.py:2226` does.
     fn keeper(self, records: &[FileRec], members: &[usize]) -> usize {
-        let key = |&(_, &index): &(usize, &usize)| records[index].mtime_ns;
+        let time = |&(_, &index): &(usize, &usize)| oracle_mtime(&records[index]);
         match self {
             Rule::Shortest => members
                 .iter()
                 .enumerate()
                 .min_by_key(|&(_, &index)| name_order(records[index].path()))
                 .map(|(position, _)| position),
-            Rule::Oldest => members.iter().enumerate().min_by_key(key).map(|(p, _)| p),
-            Rule::Newest => members.iter().enumerate().max_by_key(key).map(|(p, _)| p),
+            Rule::Oldest => members
+                .iter()
+                .enumerate()
+                .min_by(|left, right| time(left).total_cmp(&time(right)))
+                .map(|(position, _)| position),
+            Rule::Newest => members
+                .iter()
+                .enumerate()
+                .min_by(|left, right| time(right).total_cmp(&time(left)))
+                .map(|(position, _)| position),
         }
         .expect("a group always has members")
     }
@@ -62,6 +86,22 @@ impl std::fmt::Display for Rule {
     }
 }
 
+/// The modification time the oracle compares, which is `os.stat`'s `st_mtime`:
+/// a float64 built as `seconds + 1e-9 * nanoseconds`.
+///
+/// At current epoch values a float64 resolves about 240 ns, so two files a
+/// nanosecond apart are *tied* for the oracle and ordered for anything reading
+/// `st_mtime_ns`. Which copy survives is the whole user-visible contract of a
+/// keep rule and REWRITE.md §0 makes the oracle authoritative for behaviour, so
+/// the coarser quantity is the right one to compare here. The finer `mtime_ns`
+/// is still what the cache key and the retained-bytes revalidation use, where
+/// being stricter than the oracle only ever means reading more.
+fn oracle_mtime(record: &FileRec) -> f64 {
+    let seconds = record.mtime_ns.div_euclid(1_000_000_000);
+    let nanoseconds = record.mtime_ns.rem_euclid(1_000_000_000);
+    seconds as f64 + 1e-9 * nanoseconds as f64
+}
+
 /// Pick one keeper per group and return the records to remove.
 ///
 /// The survivor guard is this function: the keeper is never added to the list,
@@ -69,7 +109,7 @@ impl std::fmt::Display for Rule {
 /// cannot free — because a name outside the tree still pins the inode — is
 /// never a victim however duplicate it is, since removing what we can see
 /// would free nothing.
-pub fn plan_auto(records: &[FileRec], groups: &[DupGroup], rule: Rule) -> Vec<usize> {
+fn plan_auto(records: &[FileRec], groups: &[DupGroup], rule: Rule) -> Vec<usize> {
     let mut doomed = Vec::new();
     for group in groups {
         let keeper = rule.keeper(records, &group.members);
@@ -189,6 +229,128 @@ pub fn remove_record(root: &Path, record: &FileRec, hard: bool) -> Result<(), St
     }
 }
 
+/// Non-interactive cleanup: keep one copy per group by `rule`, remove the rest.
+///
+/// Taking `ProvenGroups` rather than a slice is the guard: the only way to
+/// build one is `Scan::proven`, which refuses a scan that merely grouped by
+/// size. A caller cannot reach this function with groups whose members have
+/// never been compared, however the modes are spelled on the command line.
+pub fn run_auto(
+    scan: &Scan,
+    proven: ProvenGroups<'_>,
+    removal: &Removal,
+    context: &Compare,
+    cache: Option<&mut ScanCache>,
+) -> i32 {
+    // Groups matched from the cache have not been read yet. They are read here,
+    // before a plan is even printed, so the plan describes files that really
+    // are identical rather than files a digest said were.
+    let candidates = proven
+        .groups()
+        .iter()
+        .map(|group| DupGroup {
+            members: group.members.clone(),
+            attested: group.attested,
+        })
+        .collect();
+    let (groups, refused) = verify_attested(context, &scan.records, candidates, cache);
+    report_refusals(&scan.records, &refused);
+
+    let doomed = plan_auto(&scan.records, &groups, removal.rule);
+    if doomed.is_empty() {
+        println!("\n  Nothing to remove.\n");
+        return 0;
+    }
+
+    let total: u64 = doomed.iter().map(|&index| scan.records[index].size).sum();
+    let verb = if removal.hard {
+        "Delete permanently"
+    } else {
+        "Move to Trash"
+    };
+    println!(
+        "\n  Keeping the {} copy in each of {} groups.",
+        removal.rule,
+        groups.len()
+    );
+    println!(
+        "  {verb}: {} files · {total} bytes reclaimed\n",
+        doomed.len()
+    );
+    for &index in doomed.iter().take(15) {
+        println!("      {}", scan.records[index].path());
+    }
+    if doomed.len() > 15 {
+        println!("      … and {} more", doomed.len() - 15);
+    }
+    println!();
+
+    if !removal.assume_yes {
+        if !std::io::stdin().is_terminal() {
+            let _ = std::io::stdout().flush(); // keep the plan above the refusal
+            eprintln!("  Refusing to delete without confirmation. Re-run with -y to proceed.");
+            return 1;
+        }
+        let mut answer = String::new();
+        print!("  Type 'yes' to proceed: ");
+        let _ = std::io::stdout().flush();
+        if std::io::stdin().lock().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+            println!("  Aborted. Nothing deleted.");
+            return 1;
+        }
+    }
+
+    let (mut done, mut freed) = (0_usize, 0_u64);
+    let mut failures = Vec::new();
+    for &index in &doomed {
+        let record = &scan.records[index];
+        match remove_record(context.root, record, removal.hard) {
+            Ok(()) => {
+                done += record.names.len();
+                freed += record.size;
+            }
+            Err(error) => failures.push(error),
+        }
+    }
+
+    let where_to = if removal.hard {
+        "deleted"
+    } else {
+        "moved to Trash"
+    };
+    println!("\n  {done} files {where_to} · {freed} bytes reclaimed");
+    if !failures.is_empty() {
+        eprintln!("  {} could not be removed:", failures.len());
+        for line in failures.iter().take(10) {
+            eprintln!("    {line}");
+        }
+    }
+    println!();
+    0
+}
+
+/// Say plainly that some groups were not what the cache thought they were.
+fn report_refusals(records: &[FileRec], refused: &[DupGroup]) {
+    if refused.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\n  Refusing to touch {} group(s): their copies no longer match.",
+        refused.len()
+    );
+    for group in refused.iter().take(10) {
+        eprintln!(
+            "    {} (+{} more)",
+            records[group.members[0]].path(),
+            group.members.len() - 1
+        );
+    }
+    eprintln!(
+        "  Nothing was removed from them, and what was remembered about them \
+         has been discarded."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,8 +363,7 @@ mod tests {
             ino: 1,
             nlink: 1,
             mtime_ns,
-            head: Vec::new(),
-            tail: Vec::new(),
+            retained: None,
         }
     }
 
@@ -224,6 +385,60 @@ mod tests {
         let members = vec![0, 1, 2];
         assert_eq!(Rule::Shortest.keeper(&records, &members), 1);
         assert_eq!(Rule::Oldest.keeper(&records, &members), 1);
+        assert_eq!(Rule::Newest.keeper(&records, &members), 0);
+    }
+
+    #[test]
+    fn a_tie_keeps_the_first_member_the_way_python_does() {
+        // Python's min and max both return the first extreme. Members arrive
+        // shortest-name-first, so a tie must keep the shortest name — an
+        // unadjusted Rust max_by_key would keep the last, the longest.
+        let records = vec![
+            record("c.bin", 500),
+            record("bb.bin", 500),
+            record("aaa.bin", 500),
+        ];
+        let members = vec![0, 1, 2];
+        assert_eq!(
+            Rule::Newest.keeper(&records, &members),
+            0,
+            "newest on a tie"
+        );
+        assert_eq!(
+            Rule::Oldest.keeper(&records, &members),
+            0,
+            "oldest on a tie"
+        );
+
+        // ...and with only the later two tied for newest, the first of those.
+        let records = vec![
+            record("c.bin", 100),
+            record("bb.bin", 500),
+            record("aaa.bin", 500),
+        ];
+        assert_eq!(Rule::Newest.keeper(&records, &members), 1);
+    }
+
+    #[test]
+    fn mtimes_closer_than_the_oracle_can_see_count_as_tied() {
+        // The oracle compares st_mtime as a float64, which resolves about
+        // 240 ns at current epoch values, so one nanosecond apart is a tie and
+        // the tie-break decides. Comparing mtime_ns instead would order them
+        // and keep a different file.
+        let base = 1_700_000_000_i64 * 1_000_000_000;
+        let records = vec![
+            record("c.bin", base + 8_000_000_000),
+            record("bb.bin", base + 1),
+            record("aaa.bin", base),
+        ];
+        let members = vec![0, 1, 2];
+        assert_eq!(
+            Rule::Oldest.keeper(&records, &members),
+            1,
+            "bb.bin ties aaa.bin"
+        );
+        assert!(oracle_mtime(&records[1]) == oracle_mtime(&records[2]));
+        // A whole second apart is still plainly ordered.
         assert_eq!(Rule::Newest.keeper(&records, &members), 0);
     }
 

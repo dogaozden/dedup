@@ -18,28 +18,30 @@ mod trash;
 mod walk;
 
 use std::fs;
-use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::BufWriter;
+use std::path::PathBuf;
 
 use serde::Serialize;
 
 use cache::ScanCache;
-use compare::{verify_attested, Compare};
+use compare::Compare;
 use consts::DEFAULT_MIN_SIZE;
 use device::Device;
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
-use pipeline::{find_duplicates, report_names, size_stage, DupGroup, Scan};
-use trash::{plan_auto, remove_record, Rule};
-use walk::FileRec;
+use pipeline::{find_duplicates, report_names, size_stage};
+use trash::{run_auto, Removal, Rule};
 
-#[derive(Debug, Default, Serialize)]
-struct Report {
-    groups: Vec<Vec<String>>,
+/// The conformance protocol object. Paths are borrowed from the scan's records
+/// rather than copied: a clone of every reported name is a per-file cost on top
+/// of the records themselves, and REWRITE.md §6 counts per-file costs.
+#[derive(Serialize)]
+struct Report<'a> {
+    groups: Vec<Vec<&'a str>>,
     bytes_read: u64,
     files_seen: u64,
     bytes_seen: u64,
-    unreadable: Vec<String>,
+    unreadable: &'a [String],
     opens: u64,
 }
 
@@ -115,7 +117,7 @@ fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
     Ok(options)
 }
 
-fn print_report(groups: &[Vec<String>]) {
+fn print_report(groups: &[Vec<&str>]) {
     if groups.is_empty() {
         println!("\n  No duplicates found.\n");
         return;
@@ -162,28 +164,30 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let effort = Effort::default();
     let device = Device::probe(&root, options.jobs);
     let mut cache = (!options.no_cache && options.stage != "size").then(ScanCache::new);
-    let scan = if options.stage == "size" {
+    let mut scan = if options.stage == "size" {
         size_stage(&root, filters)
     } else {
         find_duplicates(&root, filters, device, &effort, cache.as_mut())
     };
+    scan.unreadable.sort();
+    scan.unreadable.dedup();
 
-    let mut report = Report {
-        groups: report_names(&scan.records, &scan.groups),
+    let report = Report {
+        groups: report_names(&scan.records, scan.reported()),
         bytes_read: effort.bytes_read(),
         files_seen: scan.files_seen,
         bytes_seen: scan.bytes_seen,
-        unreadable: scan.unreadable.clone(),
+        unreadable: &scan.unreadable,
         opens: effort.opens(),
     };
-    report.unreadable.sort();
-    report.unreadable.dedup();
 
     let destination = options
         .report_json
         .clone()
         .unwrap_or_else(default_report_path);
-    fs::write(destination, serde_json::to_vec_pretty(&report)?)?;
+    // Straight to the file: building the whole document in memory first costs
+    // another copy of every reported path.
+    serde_json::to_writer_pretty(BufWriter::new(fs::File::create(destination)?), &report)?;
 
     if options.list {
         print_report(&report.groups);
@@ -194,145 +198,36 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // purpose: a group it vouched for has to be read again before anything in
     // it goes.
     let code = match rule {
-        Some(rule) => run_auto(
-            &root,
-            &scan,
-            rule,
-            &options,
-            device,
-            &effort,
-            cache.as_mut(),
-        ),
         None => 0,
+        Some(rule) => match scan.proven() {
+            Some(proven) => {
+                let context = Compare {
+                    root: &root,
+                    effort: &effort,
+                    solid: device.all_solid_state(),
+                    learn: false,
+                };
+                let removal = Removal {
+                    rule,
+                    hard: options.hard,
+                    assume_yes: options.yes,
+                };
+                run_auto(&scan, proven, &removal, &context, cache.as_mut())
+            }
+            None => {
+                eprintln!(
+                    "dedup-rs: --auto cannot act on a --stage size scan. Size buckets are \
+                     files that merely share a length; nothing has read their contents, so \
+                     removing one would not be removing a duplicate. Re-run without --stage."
+                );
+                2
+            }
+        },
     };
     if let Some(cache) = cache.as_mut() {
         cache.close();
     }
     Ok(code)
-}
-
-/// Non-interactive cleanup: keep one copy per group by `rule`, remove the rest.
-fn run_auto(
-    root: &Path,
-    scan: &Scan,
-    rule: Rule,
-    options: &Options,
-    device: Device,
-    effort: &Effort,
-    cache: Option<&mut ScanCache>,
-) -> i32 {
-    // Groups matched from the cache have not been read yet. They are read here,
-    // before a plan is even printed, so the plan describes files that really
-    // are identical rather than files a digest said were.
-    let context = Compare {
-        root,
-        effort,
-        solid: device.all_solid_state(),
-        learn: false,
-    };
-    let groups = scan
-        .groups
-        .iter()
-        .map(|group| DupGroup {
-            members: group.members.clone(),
-            attested: group.attested,
-        })
-        .collect();
-    let (groups, refused) = verify_attested(&context, &scan.records, groups, cache);
-    report_refusals(&scan.records, &refused);
-
-    let doomed = plan_auto(&scan.records, &groups, rule);
-    if doomed.is_empty() {
-        println!("\n  Nothing to remove.\n");
-        return 0;
-    }
-
-    let total: u64 = doomed.iter().map(|&index| scan.records[index].size).sum();
-    let verb = if options.hard {
-        "Delete permanently"
-    } else {
-        "Move to Trash"
-    };
-    println!(
-        "\n  Keeping the {rule:?} copy in each of {} groups.",
-        groups.len()
-    );
-    println!(
-        "  {verb}: {} files · {total} bytes reclaimed\n",
-        doomed.len()
-    );
-    for &index in doomed.iter().take(15) {
-        println!("      {}", scan.records[index].path());
-    }
-    if doomed.len() > 15 {
-        println!("      … and {} more", doomed.len() - 15);
-    }
-    println!();
-
-    if !options.yes && !std::io::stdin().is_terminal() {
-        println!();
-        eprintln!("  Refusing to delete without confirmation. Re-run with -y to proceed.");
-        return 1;
-    }
-    if !options.yes {
-        let mut answer = String::new();
-        print!("  Type 'yes' to proceed: ");
-        let _ = std::io::stdout().flush();
-        if std::io::stdin().lock().read_line(&mut answer).is_err() || answer.trim() != "yes" {
-            println!("  Aborted. Nothing deleted.");
-            return 1;
-        }
-    }
-
-    let (mut done, mut freed) = (0_usize, 0_u64);
-    let mut failures = Vec::new();
-    for &index in &doomed {
-        let record = &scan.records[index];
-        match remove_record(root, record, options.hard) {
-            Ok(()) => {
-                done += record.names.len();
-                freed += record.size;
-            }
-            Err(error) => failures.push(error),
-        }
-    }
-
-    let where_to = if options.hard {
-        "deleted"
-    } else {
-        "moved to Trash"
-    };
-    println!("\n  {done} files {where_to} · {freed} bytes reclaimed");
-    if !failures.is_empty() {
-        eprintln!("  {} could not be removed:", failures.len());
-        for line in failures.iter().take(10) {
-            eprintln!("    {line}");
-        }
-    }
-    println!();
-    0
-}
-
-/// Say plainly that some groups were not what the cache thought they were.
-fn report_refusals(records: &[FileRec], refused: &[DupGroup]) {
-    if refused.is_empty() {
-        return;
-    }
-    eprintln!(
-        "\n  Refusing to touch {} group(s): their copies no longer match.",
-        refused.len()
-    );
-    for group in refused.iter().take(10) {
-        eprintln!(
-            "    {} (+{} more)",
-            records[group.members[0]].path(),
-            group.members.len() - 1
-        );
-    }
-    eprintln!(
-        "  Nothing was removed from them, and what was remembered about them \
-         has been discarded."
-    );
 }
 
 fn default_report_path() -> PathBuf {

@@ -1,12 +1,3 @@
---auto shortest -> survivor: z.bin 
---auto oldest -> survivor: deep/long-name.bin 
---auto newest -> survivor: z.bin 
-
---- a hardlink cluster goes as one unit, every name of it ---
-before: c.bin keeper.bin sub/a.bin sub/b.bin 
-after : c.bin sub/a.bin sub/b.bin 
-trash : keeper.bin 
-report groups: [['c.bin', 'keeper.bin']]
 --- the cluster is the victim: all three of its names must go together ---
 before: k.bin sub/xa.bin sub/xb.bin sub/xc.bin 
 after : k.bin 
