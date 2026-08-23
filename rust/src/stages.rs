@@ -82,6 +82,15 @@ pub enum Probe {
     /// share a header are the ordinary case, and the page at the other end is
     /// where they part — asking for it costs a seek rather than another open.
     Ends { keep: bool },
+    /// The first page alone, for the `spinning` profile, where that seek to
+    /// the far end is the expensive part and the bytes it saves are not.
+    /// Files it cannot separate fall through to the stages behind it, which
+    /// read more and seek less.
+    ///
+    /// A separate variant rather than a flag on `Ends` because the digest
+    /// covers different bytes and so is a different digest, with a cache
+    /// column of its own. Nothing may compare one against the other.
+    Head { keep: bool },
     /// `HEAD_BYTES..DEEP_HEAD`, the part of the head not already read. Only
     /// files a one-page head left in a bucket with someone else get this far.
     DeepHead { keep: bool },
@@ -95,11 +104,15 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
     match probe {
         Probe::Ends { keep } => {
             let mut file = effort.open(&path).ok()?;
-            let head = effort.read_block(&mut file, HEAD_BYTES).ok()?;
+            let head = effort
+                .read_block(&mut file, HEAD_BYTES, record.at(0))
+                .ok()?;
             let tail = if has_tail(record.size) {
-                file.seek(SeekFrom::Start(record.size - TAIL_BYTES as u64))
-                    .ok()?;
-                effort.read_block(&mut file, TAIL_BYTES).ok()?
+                let from = record.size - TAIL_BYTES as u64;
+                file.seek(SeekFrom::Start(from)).ok()?;
+                effort
+                    .read_block(&mut file, TAIL_BYTES, record.at(from))
+                    .ok()?
             } else {
                 Vec::new()
             };
@@ -110,11 +123,25 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
                 tail: if keep { tail } else { Vec::new() },
             })
         }
+        Probe::Head { keep } => {
+            let mut file = effort.open(&path).ok()?;
+            let head = effort
+                .read_block(&mut file, HEAD_BYTES, record.at(0))
+                .ok()?;
+            let digest = digest_of(&[&head]);
+            Some(Probed {
+                digest,
+                head: if keep { head } else { Vec::new() },
+                tail: Vec::new(),
+            })
+        }
         Probe::DeepHead { keep } => {
             let want = (record.size.min(DEEP_HEAD as u64) as usize).saturating_sub(HEAD_BYTES);
             let mut file = effort.open(&path).ok()?;
             file.seek(SeekFrom::Start(HEAD_BYTES as u64)).ok()?;
-            let block = effort.read_block(&mut file, want).ok()?;
+            let block = effort
+                .read_block(&mut file, want, record.at(HEAD_BYTES as u64))
+                .ok()?;
             let digest = digest_of(&[&block]);
             Some(Probed {
                 digest,
@@ -130,7 +157,9 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
             let mut file = effort.open(&path).ok()?;
             for offset in sample_points(record.size) {
                 file.seek(SeekFrom::Start(offset)).ok()?;
-                let block = effort.read_block(&mut file, SAMPLE_BYTES).ok()?;
+                let block = effort
+                    .read_block(&mut file, SAMPLE_BYTES, record.at(offset))
+                    .ok()?;
                 if block.is_empty() {
                     break;
                 }
@@ -192,6 +221,7 @@ pub fn hash_stage(
 ) -> Vec<Vec<usize>> {
     let field = match probe {
         Probe::Ends { .. } => Field::Ends,
+        Probe::Head { .. } => Field::Head,
         Probe::DeepHead { .. } => Field::Deep,
         Probe::Sample => Field::Sample,
     };
@@ -231,7 +261,7 @@ pub fn hash_stage(
         {
             let record = &mut records[index];
             match probe {
-                Probe::Ends { keep: true } => {
+                Probe::Ends { keep: true } | Probe::Head { keep: true } => {
                     if record.retained.is_none() {
                         record.keep_ends(outcome.head, outcome.tail);
                     }
@@ -453,19 +483,23 @@ pub fn small_file_stage(
 /// head page stage 3 would read for a bigger file.
 fn read_whole(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>> {
     let mut file = effort.open(&root.join(record.path())).ok()?;
-    effort.read_block(&mut file, record.size as usize).ok()
+    effort
+        .read_block(&mut file, record.size as usize, record.at(0))
+        .ok()
 }
 
 fn read_head(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>> {
     let mut file = effort.open(&root.join(record.path())).ok()?;
-    effort.read_block(&mut file, HEAD_BYTES).ok()
+    effort.read_block(&mut file, HEAD_BYTES, record.at(0)).ok()
 }
 
 fn read_rest(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>> {
     let want = (record.size as usize).saturating_sub(HEAD_BYTES);
     let mut file = effort.open(&root.join(record.path())).ok()?;
     file.seek(SeekFrom::Start(HEAD_BYTES as u64)).ok()?;
-    effort.read_block(&mut file, want).ok()
+    effort
+        .read_block(&mut file, want, record.at(HEAD_BYTES as u64))
+        .ok()
 }
 
 #[cfg(test)]

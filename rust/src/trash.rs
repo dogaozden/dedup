@@ -683,6 +683,10 @@ mod selection {
         }
 
         fn scan(&self, effort: &Effort) -> Scan {
+            self.scan_with(effort, crate::device::Wanted::Flash)
+        }
+
+        fn scan_with(&self, effort: &Effort, wanted: crate::device::Wanted) -> Scan {
             find_duplicates(
                 &self.root,
                 Filters {
@@ -694,6 +698,7 @@ mod selection {
                 &mut crate::device::VolumeProbe::start(&self.root, Some(1)),
                 effort,
                 None,
+                wanted,
             )
         }
 
@@ -740,9 +745,18 @@ mod selection {
     }
 
     fn context<'a>(tree: &'a Tree, effort: &'a Effort) -> Compare<'a> {
+        context_for(tree, effort, crate::device::Profile::Flash)
+    }
+
+    fn context_for<'a>(
+        tree: &'a Tree,
+        effort: &'a Effort,
+        profile: crate::device::Profile,
+    ) -> Compare<'a> {
         Compare {
             root: &tree.root,
             effort,
+            profile,
             solid: true,
             learn: false,
         }

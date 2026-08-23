@@ -28,7 +28,7 @@ use serde::Serialize;
 use cache::ScanCache;
 use compare::Compare;
 use consts::DEFAULT_MIN_SIZE;
-use device::{Device, VolumeProbe};
+use device::{Device, VolumeProbe, Wanted};
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
 use pipeline::{find_duplicates, report_names, size_stage};
@@ -45,6 +45,11 @@ struct Report<'a> {
     bytes_seen: u64,
     unreadable: &'a [String],
     opens: u64,
+    /// Not part of the conformance protocol — the referee neither asks for it
+    /// nor reads it. It is here because SPIN.md judges the `spinning` profile
+    /// on it, and a number nobody can read out of a run is a number nobody can
+    /// check.
+    seeks: u64,
 }
 
 #[derive(Default)]
@@ -68,6 +73,7 @@ struct Options {
     /// "size" stops after the walk and size grouping. Only the M1 gate asks
     /// for it; every other gate leaves it empty.
     stage: String,
+    profile: Wanted,
 }
 
 const KEEP_RULES: [&str; 3] = ["shortest", "oldest", "newest"];
@@ -82,7 +88,7 @@ fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--report-json" | "--min-size" | "-j" | "--jobs" | "-x" | "--exclude" | "--ext"
-            | "--skip-ext" | "--stage" => {
+            | "--skip-ext" | "--stage" | "--profile" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| format!("{argument} needs a value"))?;
@@ -93,6 +99,10 @@ fn parse_arguments() -> Result<Options, Box<dyn std::error::Error>> {
                     "-x" | "--exclude" => options.excludes.push(value),
                     "--ext" => options.ext.push(value),
                     "--stage" => options.stage = value,
+                    "--profile" => {
+                        options.profile = Wanted::parse(&value)
+                            .ok_or("--profile takes flash, spinning or auto")?;
+                    }
                     _ => options.skip_ext.push(value),
                 }
             }
@@ -169,6 +179,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let effort = Effort::default();
+
     // Started rather than answered: what kind of disk this is takes a
     // subprocess to find out, and nothing needs it until the pools are sized.
     let mut probe = VolumeProbe::start(&root, options.jobs);
@@ -176,8 +187,18 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut scan = if options.stage == "size" {
         size_stage(&root, filters)
     } else {
-        find_duplicates(&root, filters, &mut probe, &effort, cache.as_mut())
+        find_duplicates(
+            &root,
+            filters,
+            &mut probe,
+            &effort,
+            cache.as_mut(),
+            options.profile,
+        )
     };
+    if let Some(hint) = scan.hint {
+        eprintln!("{hint}");
+    }
     scan.unreadable.sort();
     scan.unreadable.dedup();
 
@@ -188,6 +209,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         bytes_seen: scan.bytes_seen,
         unreadable: &scan.unreadable,
         opens: effort.opens(),
+        seeks: effort.seeks(),
     };
 
     let destination = options
@@ -214,6 +236,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 let context = Compare {
                     root: &root,
                     effort: &effort,
+                    profile: scan.profile,
                     solid: device.all_solid_state(),
                     learn: false,
                 };
@@ -281,6 +304,7 @@ fn browse(
     let context = Compare {
         root,
         effort,
+        profile: scan.profile,
         solid: device.all_solid_state(),
         learn: false,
     };

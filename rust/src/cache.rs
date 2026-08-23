@@ -37,6 +37,14 @@ use crate::stages::Digest;
 use crate::walk::FileRec;
 
 /// One column per set of bytes a stage actually reads.
+///
+/// The set of bytes is what makes a column, not the stage that read them. The
+/// `spinning` profile's end probe reads the head alone, so its digest covers
+/// different bytes from `Ends` and gets a column of its own: a run of either
+/// profile has to be able to read a cache the other one wrote and still bucket
+/// files by digests that mean the same thing. Sharing the column would let a
+/// scan compare one file's head against another file's head-and-tail, and two
+/// identical files would land in different buckets and never be reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
     /// The two end pages hashed together.
@@ -48,14 +56,17 @@ pub enum Field {
     /// The whole file. Only ever learned from bytes that were compared rather
     /// than merely hashed.
     Full = 3,
+    /// The first page alone — what the `spinning` profile reads where `flash`
+    /// reads both ends.
+    Head = 4,
 }
 
-const COLUMNS: [&str; 4] = ["ends", "deep", "sample", "full"];
+const COLUMNS: [&str; 5] = ["ends", "deep", "sample", "full", "head"];
 
 struct Row {
     size: u64,
     mtime_ns: i64,
-    digests: [Option<Digest>; 4],
+    digests: [Option<Digest>; COLUMNS.len()],
     cached_at: i64,
 }
 
@@ -193,14 +204,14 @@ impl ScanCache {
         let row = volume.rows.entry(record.ino).or_insert_with(|| Row {
             size: record.size,
             mtime_ns: record.mtime_ns,
-            digests: [None; 4],
+            digests: [None; COLUMNS.len()],
             cached_at,
         });
         if row.size != record.size || row.mtime_ns != record.mtime_ns {
             *row = Row {
                 size: record.size,
                 mtime_ns: record.mtime_ns,
-                digests: [None; 4],
+                digests: [None; COLUMNS.len()],
                 cached_at,
             };
         }
@@ -287,7 +298,8 @@ fn prepare(connection: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS files (
              ino INTEGER PRIMARY KEY, size INTEGER NOT NULL,
              mtime_ns INTEGER NOT NULL, ends BLOB, deep BLOB, sample BLOB,
-             full BLOB, cached_at INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+             full BLOB, head BLOB, cached_at INTEGER NOT NULL,
+             last_seen INTEGER NOT NULL);
          PRAGMA user_version = {CACHE_SCHEMA};"
     ))
 }
@@ -303,12 +315,14 @@ fn read_rows(database: &Path) -> rusqlite::Result<HashMap<u64, Row>> {
         return Ok(HashMap::new());
     }
     prepare(&connection)?;
-    let mut statement = connection
-        .prepare("SELECT ino, size, mtime_ns, ends, deep, sample, full, cached_at FROM files")?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT ino, size, mtime_ns, {}, cached_at FROM files",
+        COLUMNS.join(", ")
+    ))?;
     let mut rows = HashMap::new();
     let mut cursor = statement.query([])?;
     while let Some(row) = cursor.next()? {
-        let mut digests = [None; 4];
+        let mut digests = [None; COLUMNS.len()];
         for (slot, digest) in digests.iter_mut().enumerate() {
             *digest = row
                 .get::<_, Option<Vec<u8>>>(3 + slot)?
@@ -320,7 +334,7 @@ fn read_rows(database: &Path) -> rusqlite::Result<HashMap<u64, Row>> {
                 size: row.get::<_, i64>(1)? as u64,
                 mtime_ns: row.get(2)?,
                 digests,
-                cached_at: row.get(7)?,
+                cached_at: row.get(3 + COLUMNS.len())?,
             },
         );
     }
@@ -340,7 +354,7 @@ fn write_rows(
     {
         let mut insert = transaction.prepare(&format!(
             "INSERT OR REPLACE INTO files (ino, size, mtime_ns, {}, cached_at, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             COLUMNS.join(", ")
         ))?;
         let mut delete = transaction.prepare("DELETE FROM files WHERE ino = ?1")?;
@@ -358,6 +372,7 @@ fn write_rows(
                         row.digests[1].map(|d| d.to_vec()),
                         row.digests[2].map(|d| d.to_vec()),
                         row.digests[3].map(|d| d.to_vec()),
+                        row.digests[4].map(|d| d.to_vec()),
                         row.cached_at,
                         now,
                     ])?;

@@ -18,7 +18,10 @@ use rayon::ThreadPool;
 use sha2::{Digest as _, Sha256};
 
 use crate::cache::ScanCache;
-use crate::consts::{CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, SLOW_CHUNK};
+use crate::consts::{
+    CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, SLOW_CHUNK, SPIN_INTERLEAVE,
+};
+use crate::device::Profile;
 use crate::effort::Effort;
 use crate::ordered::Ordered;
 use crate::pipeline::DupGroup;
@@ -28,6 +31,7 @@ use crate::walk::{still_the_same, unchanged, FileRec};
 pub struct Compare<'a> {
     pub root: &'a Path,
     pub effort: &'a Effort,
+    pub profile: Profile,
     pub solid: bool,
     /// Whether whole-file digests are worth building as the bytes go past. The
     /// bytes are being read anyway and SHA-256 runs at a few GB/s where a disk
@@ -59,7 +63,16 @@ impl Settled {
 /// the next file in the group, so it wants big ones. Either way a round holds
 /// one chunk per member, so a group with a lot of copies gets a smaller chunk
 /// to stay inside the budget.
-pub fn compare_chunk(members: usize, solid: bool) -> usize {
+///
+/// The `spinning` profile does not shrink it, because it does not have to: it
+/// never reads more than `SPIN_INTERLEAVE` files at once, and that many
+/// `SLOW_CHUNK`s is exactly `COMPARE_BUDGET`. Shrinking the run is the one
+/// thing that would undo the profile — a wide group is where the reads most
+/// need to stay long.
+pub fn compare_chunk(profile: Profile, members: usize, solid: bool) -> usize {
+    if profile == Profile::Spinning {
+        return SLOW_CHUNK;
+    }
     let preferred = if solid { CHUNK } else { SLOW_CHUNK };
     MIN_CHUNK.max(preferred.min(COMPARE_BUDGET / members.max(1)))
 }
@@ -262,6 +275,11 @@ pub fn split_identical(
     };
 
     let mut matched: Vec<Vec<usize>> = Vec::new();
+    // Where each handle actually is, counted from the bytes that came back
+    // rather than from the bytes asked for: a read stopped short by the end of
+    // the file leaves the handle where the bytes stopped, and a seek count
+    // built on the request instead would charge for a jump nobody made.
+    let mut positions: Vec<u64> = vec![prefix as u64; opened.len()];
     let mut position = prefix;
     loop {
         if live.is_empty() {
@@ -277,18 +295,28 @@ pub fn split_identical(
         position += span;
         let mut following: Vec<Vec<usize>> = Vec::new();
         for group in std::mem::take(&mut live) {
-            let read = |slot: &usize| -> (usize, Option<Vec<u8>>) {
-                let mut file = handles[*slot].lock().expect("no reader panics");
-                (*slot, context.effort.read_block(&mut file, span).ok())
-            };
-            let blocks: Vec<(usize, Option<Vec<u8>>)> = match pool {
-                Some(pool) => pool.install(|| group.par_iter().map(read).collect()),
-                None => group.iter().map(read).collect(),
+            let blocks: Vec<(usize, Option<Vec<u8>>)> = {
+                let at = &positions;
+                let read = |slot: &usize| -> (usize, Option<Vec<u8>>) {
+                    let mut file = handles[*slot].lock().expect("no reader panics");
+                    let where_from = records[opened[*slot]].at(at[*slot]);
+                    (
+                        *slot,
+                        context.effort.read_block(&mut file, span, where_from).ok(),
+                    )
+                };
+                match pool {
+                    Some(pool) => pool.install(|| group.par_iter().map(read).collect()),
+                    None => group.iter().map(read).collect(),
+                }
             };
             let mut good = Vec::with_capacity(blocks.len());
             for (slot, block) in blocks {
                 match block {
-                    Some(block) => good.push((slot, block)),
+                    Some(block) => {
+                        positions[slot] += block.len() as u64;
+                        good.push((slot, block));
+                    }
                     None => unreadable.push(records[opened[slot]].path().to_string()),
                 }
             }
@@ -358,6 +386,165 @@ pub fn split_identical(
     settled
 }
 
+/// The exact partition of one cohort, and which of its members could not be
+/// read.
+///
+/// `split_identical` reports only the runs worth having — two or more members
+/// that agree to the last byte — because that is all its caller wants. The
+/// capped comparison wants the whole partition: a file that matched nobody in
+/// this cohort still has to be carried to the next pivot, where it may match
+/// somebody. A file that could not be READ must not be, so the two are told
+/// apart here rather than guessed at.
+fn compare_cohort(
+    context: &Compare,
+    records: &[FileRec],
+    cohort: &[usize],
+    chunk: usize,
+    settled: &mut Settled,
+    unreadable: &mut Vec<String>,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut reported: Vec<String> = Vec::new();
+    let outcome = split_identical(context, records, cohort, chunk, &mut reported, None);
+    settled.learned.extend(outcome.learned);
+    let mut runs = outcome.matched;
+    let accounted: std::collections::HashSet<usize> = runs.iter().flatten().copied().collect();
+    let mut lost = Vec::new();
+    for &index in cohort {
+        if accounted.contains(&index) {
+            continue;
+        }
+        // Every path in `reported` came from this call, and a record's path is
+        // unique in the scan, so this says exactly whether THIS member is the
+        // one that failed.
+        if reported.iter().any(|path| path == records[index].path()) {
+            lost.push(index);
+        } else {
+            runs.push(vec![index]); // read, and equal to nobody here
+        }
+    }
+    unreadable.extend(reported);
+    (runs, lost)
+}
+
+/// Compare a group without ever holding more than `SPIN_INTERLEAVE` files open
+/// at once, carrying what each pass proved into the next.
+///
+/// A round of the ordinary comparison reads one chunk from every member in
+/// turn. On flash that is free. On a spinning disk a group of forty copies
+/// means the heads visit forty places to advance one chunk, over and over, and
+/// the read that should have been sequential becomes a seek per member per
+/// chunk. So the group is compared a cohort at a time instead, and members are
+/// read more than once — which SPIN.md asks for by name: the profile trades
+/// bytes for seeks.
+///
+/// **Why the answer is the same answer.** A *cluster* here is a set of records
+/// already proved byte-equal to each other. Each round takes one cluster's
+/// representative as the pivot and compares it, in cohorts of at most
+/// `SPIN_INTERLEAVE`, against the representative of every other cluster. Two
+/// facts make that exact:
+///
+/// - `split_identical` on a cohort is the same lockstep comparison the flash
+///   profile runs, so its runs are exactly the members of that cohort whose
+///   bytes agree to the last one.
+/// - Byte equality is transitive, so a representative that matches the pivot
+///   brings its whole cluster with it, and two representatives that match each
+///   other fuse their clusters. Every pair in a reported group is joined by a
+///   chain of comparisons that each read real bytes this scan, which is what
+///   §3.1 asks for. It is the same reasoning `partition_blocks` already
+///   depends on, where a run is every block equal to the run's first.
+///
+/// Nothing is lost, either: a member that does not match the pivot goes back
+/// into the pool and is offered to every later pivot, and each round removes
+/// exactly one cluster from the pool, so every pair meets.
+pub fn split_identical_capped(
+    context: &Compare,
+    records: &[FileRec],
+    members: &[usize],
+    chunk: usize,
+    unreadable: &mut Vec<String>,
+) -> Settled {
+    let mut settled = Settled::default();
+    if members.len() <= SPIN_INTERLEAVE {
+        // Narrow enough to compare in one pass, which is the ordinary
+        // comparison exactly.
+        return split_identical(context, records, members, chunk, unreadable, None);
+    }
+
+    let mut clusters: Vec<Vec<usize>> = members.iter().map(|&index| vec![index]).collect();
+    while clusters.len() > 1 {
+        let mut merged = clusters.remove(0);
+        let pivot = merged[0];
+        let mut leftovers: Vec<Vec<usize>> = Vec::new();
+        let mut pivot_lost = false;
+
+        for batch in clusters.chunks(SPIN_INTERLEAVE - 1) {
+            let mut cohort = Vec::with_capacity(batch.len() + 1);
+            cohort.push(pivot);
+            cohort.extend(batch.iter().map(|cluster| cluster[0]));
+            let (runs, lost) =
+                compare_cohort(context, records, &cohort, chunk, &mut settled, unreadable);
+            pivot_lost |= lost.contains(&pivot);
+
+            for run in runs {
+                let mut fused: Vec<usize> = Vec::new();
+                let with_pivot = run.contains(&pivot);
+                for representative in run {
+                    if representative == pivot {
+                        continue;
+                    }
+                    let cluster = batch
+                        .iter()
+                        .find(|cluster| cluster[0] == representative)
+                        .expect("every representative came from this batch");
+                    if with_pivot {
+                        merged.extend_from_slice(cluster);
+                    } else {
+                        fused.extend_from_slice(cluster);
+                    }
+                }
+                if !fused.is_empty() {
+                    leftovers.push(fused);
+                }
+            }
+            // A cluster whose representative could not be read this pass keeps
+            // its other members: they were proved equal to each other before
+            // the file went away.
+            for index in lost {
+                if index == pivot {
+                    continue;
+                }
+                let rest: Vec<usize> = batch
+                    .iter()
+                    .find(|cluster| cluster[0] == index)
+                    .expect("every lost member came from this batch")[1..]
+                    .to_vec();
+                if !rest.is_empty() {
+                    leftovers.push(rest);
+                }
+            }
+        }
+
+        if pivot_lost {
+            // The pivot proved nothing about anybody, so its cluster goes back
+            // in without it and is offered a new representative next round.
+            merged.retain(|&index| index != pivot);
+            if !merged.is_empty() {
+                leftovers.insert(0, merged);
+            }
+        } else if merged.len() > 1 {
+            settled.matched.push(merged);
+        }
+        clusters = leftovers;
+    }
+    // Whatever the last round left: already proved equal among themselves.
+    if let Some(last) = clusters.pop() {
+        if last.len() > 1 {
+            settled.matched.push(last);
+        }
+    }
+    settled
+}
+
 /// Run `split_identical` over every candidate group.
 ///
 /// A group big enough on its own gets the whole pool to itself, members read
@@ -376,6 +563,20 @@ pub fn compare_stage(
     pool: &ThreadPool,
     unreadable: &mut Vec<String>,
 ) -> Settled {
+    // One disk, one queue, one group at a time, in the order the buckets were
+    // sorted into — which is inode order, so the whole stage walks the platter
+    // forwards. Waves exist to keep several readers busy and there is only one.
+    if context.profile == Profile::Spinning {
+        let mut out = Settled::default();
+        for bucket in buckets {
+            let chunk = compare_chunk(context.profile, bucket.len(), context.solid);
+            out.absorb(split_identical_capped(
+                context, records, bucket, chunk, unreadable,
+            ));
+        }
+        return out;
+    }
+
     // 4x the reader count so there is enough work to keep every reader busy
     // even once a group or two settles early, floored at 16 so a low -j does
     // not turn nearly everything into a wave of two.
@@ -386,7 +587,7 @@ pub fn compare_stage(
     let mut index = 0;
     while index < buckets.len() {
         if buckets[index].len() >= wave_members {
-            let chunk = compare_chunk(buckets[index].len(), context.solid);
+            let chunk = compare_chunk(context.profile, buckets[index].len(), context.solid);
             out.absorb(split_identical(
                 context,
                 records,
@@ -411,14 +612,14 @@ pub fn compare_stage(
         if wave.len() == 1 {
             // Nothing left to pack it with, and it never reached the threshold
             // alone either.
-            let chunk = compare_chunk(wave[0].len(), context.solid);
+            let chunk = compare_chunk(context.profile, wave[0].len(), context.solid);
             out.absorb(split_identical(
                 context, records, &wave[0], chunk, unreadable, spread,
             ));
             continue;
         }
 
-        let wave_chunk = compare_chunk(total, context.solid);
+        let wave_chunk = compare_chunk(context.profile, total, context.solid);
         let results: Vec<(Settled, Vec<String>)> = pool.install(|| {
             wave.par_iter()
                 .map(|group| {
@@ -460,15 +661,22 @@ pub fn verify_attested(
             continue;
         }
         let mut unreadable = Vec::new();
-        let chunk = compare_chunk(group.members.len(), context.solid);
-        let settled = split_identical(
-            context,
-            records,
-            &group.members,
-            chunk,
-            &mut unreadable,
-            None,
-        );
+        let chunk = compare_chunk(context.profile, group.members.len(), context.solid);
+        // The same width cap as the scan used, for the same reason: a wide
+        // attested group re-proved at deletion time would otherwise open every
+        // member at once on the one disk that cannot afford it.
+        let settled = if context.profile == Profile::Spinning {
+            split_identical_capped(context, records, &group.members, chunk, &mut unreadable)
+        } else {
+            split_identical(
+                context,
+                records,
+                &group.members,
+                chunk,
+                &mut unreadable,
+                None,
+            )
+        };
         if settled.matched.len() == 1
             && settled.matched[0].len() == group.members.len()
             && unreadable.is_empty()
@@ -532,9 +740,21 @@ mod tests {
 
     #[test]
     fn the_chunk_shrinks_with_the_member_count_but_not_below_the_floor() {
-        assert_eq!(compare_chunk(2, true), CHUNK);
-        assert_eq!(compare_chunk(2, false), SLOW_CHUNK);
-        assert_eq!(compare_chunk(64, true), COMPARE_BUDGET / 64);
-        assert_eq!(compare_chunk(100_000, true), MIN_CHUNK);
+        let flash = Profile::Flash;
+        assert_eq!(compare_chunk(flash, 2, true), CHUNK);
+        assert_eq!(compare_chunk(flash, 2, false), SLOW_CHUNK);
+        assert_eq!(compare_chunk(flash, 64, true), COMPARE_BUDGET / 64);
+        assert_eq!(compare_chunk(flash, 100_000, true), MIN_CHUNK);
+    }
+
+    #[test]
+    fn the_spinning_chunk_stays_long_however_wide_the_group_is() {
+        let spin = Profile::Spinning;
+        for members in [2, 8, 64, 100_000] {
+            assert_eq!(compare_chunk(spin, members, true), SLOW_CHUNK);
+            assert_eq!(compare_chunk(spin, members, false), SLOW_CHUNK);
+        }
+        // ...and the width cap is what keeps that inside the budget.
+        assert_eq!(SLOW_CHUNK * SPIN_INTERLEAVE, COMPARE_BUDGET);
     }
 }

@@ -14,7 +14,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use crate::cache::ScanCache;
 use crate::compare::{compare_stage, Compare};
 use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
-use crate::device::VolumeProbe;
+use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
 use crate::ordered::Ordered;
@@ -32,6 +32,11 @@ pub struct DupGroup {
 
 pub struct Scan {
     pub records: Vec<FileRec>,
+    /// Which profile the scan actually ran with, and the one line to say about
+    /// it if `auto` had nothing to go on. Printing belongs to `main`; deciding
+    /// belongs here, where the volume probe has been collected.
+    pub profile: Profile,
+    pub hint: Option<&'static str>,
     /// Private on purpose. The only ways out are `reported`, for the protocol
     /// report, where a size bucket is an honest answer; and `proven`, for
     /// deletion, where it is not.
@@ -73,8 +78,15 @@ impl Scan {
 }
 
 /// How much the end probe reads — for the retention decision.
-fn ends_bytes(size: u64) -> usize {
-    size.min(HEAD_BYTES as u64) as usize + usize::from(has_tail(size)) * TAIL_BYTES
+///
+/// The `spinning` profile does not go to the far end, so it has no tail to
+/// hold and its budget is the heads alone.
+fn ends_bytes(profile: Profile, size: u64) -> usize {
+    let head = size.min(HEAD_BYTES as u64) as usize;
+    match profile {
+        Profile::Spinning => head,
+        Profile::Flash => head + usize::from(has_tail(size)) * TAIL_BYTES,
+    }
 }
 
 /// Stage 1 and 2 alone: the candidate set, which is all a walk and a size
@@ -113,6 +125,9 @@ pub fn size_stage(root: &Path, filters: Filters) -> Scan {
     sort_groups(&records, &mut groups);
     Scan {
         records,
+        // Nothing here reads, so nothing here has a profile worth the name.
+        profile: Profile::Flash,
+        hint: None,
         groups,
         // Files that merely share a length. Nothing here has read a byte.
         proven: false,
@@ -135,6 +150,7 @@ pub fn find_duplicates(
     probe: &mut VolumeProbe,
     effort: &Effort,
     mut cache: Option<&mut ScanCache>,
+    wanted: Wanted,
 ) -> Scan {
     if let Some(cache) = cache.as_deref_mut() {
         cache.open_path(root);
@@ -153,6 +169,8 @@ pub fn find_duplicates(
     // stage 2 — group by size, collapse hardlinks, discard unique sizes
     let mut records = candidates(root, entries);
     let mut scan = Scan {
+        profile: Profile::Flash,
+        hint: None,
         groups: Vec::new(),
         proven: true,
         files_seen,
@@ -171,8 +189,11 @@ pub fn find_duplicates(
     // The volume probe has been running since the root was known; this is the
     // first thing that needs its answer.
     let device = probe.device();
-    let random_jobs = device.random_jobs();
-    let sequential_jobs = device.sequential_jobs();
+    let (profile, hint) = wanted.resolve(device);
+    scan.profile = profile;
+    scan.hint = hint;
+    let random_jobs = device.random_jobs(profile);
+    let sequential_jobs = device.sequential_jobs(profile);
     let random_pool = pool_of(random_jobs);
     let reader = Reader {
         root,
@@ -217,16 +238,23 @@ pub fn find_duplicates(
     // fits in RETAIN_BUDGET.
     let keep = staged
         .iter()
-        .map(|&index| ends_bytes(records[index].size))
+        .map(|&index| ends_bytes(profile, records[index].size))
         .sum::<usize>()
         <= RETAIN_BUDGET;
 
-    // stage 3 — one page from each end, in one open.
+    // stage 3 — one page from each end, in one open. On a spinning disk the
+    // page at the far end costs a seek per file and saves only the files that
+    // differ there, so the profile reads the head alone and lets the stages
+    // behind it do the separating.
+    let ends = match profile {
+        Profile::Flash => Probe::Ends { keep },
+        Profile::Spinning => Probe::Head { keep },
+    };
     let end_buckets = hash_stage(
         &reader,
         &mut records,
         &staged,
-        Probe::Ends { keep },
+        ends,
         &mut unreadable,
         cache.as_deref_mut(),
     );
@@ -274,11 +302,19 @@ pub fn find_duplicates(
     // to be worth sampling go through it: below SAMPLE_SPAN there is nothing
     // to sample, since a full read there would just be repeated by stage 5.
     // Every bucket holds one size, so a bucket is entirely on one side.
-    let big: Vec<Vec<usize>> = pending
-        .iter()
-        .filter(|bucket| records[bucket[0]].size > SAMPLE_SPAN)
-        .cloned()
-        .collect();
+    // Eight windows spread through a file is eight seeks for every member of
+    // every surviving group, which is the worst thing this program does to a
+    // spinning disk. That profile skips the stage entirely and lets the
+    // comparison do the work in one sweep per file.
+    let big: Vec<Vec<usize>> = if profile == Profile::Spinning {
+        Vec::new()
+    } else {
+        pending
+            .iter()
+            .filter(|bucket| records[bucket[0]].size > SAMPLE_SPAN)
+            .cloned()
+            .collect()
+    };
     if !big.is_empty() {
         pending.retain(|bucket| records[bucket[0]].size <= SAMPLE_SPAN);
         let mut survivors: Vec<usize> = big.into_iter().flatten().collect();
@@ -317,6 +353,7 @@ pub fn find_duplicates(
     let context = Compare {
         root,
         effort,
+        profile,
         solid: device.all_solid_state(),
         learn: cache.is_some(),
     };
@@ -401,12 +438,27 @@ mod tests {
 
     #[test]
     fn the_end_probe_only_pays_for_a_tail_once_the_pages_cannot_meet() {
-        assert_eq!(ends_bytes(100), 100);
-        assert_eq!(ends_bytes(HEAD_BYTES as u64 + 1), HEAD_BYTES);
-        assert_eq!(ends_bytes((DEEP_HEAD + TAIL_BYTES) as u64), HEAD_BYTES);
+        let flash = Profile::Flash;
+        assert_eq!(ends_bytes(flash, 100), 100);
+        assert_eq!(ends_bytes(flash, HEAD_BYTES as u64 + 1), HEAD_BYTES);
         assert_eq!(
-            ends_bytes((DEEP_HEAD + TAIL_BYTES + 1) as u64),
+            ends_bytes(flash, (DEEP_HEAD + TAIL_BYTES) as u64),
+            HEAD_BYTES
+        );
+        assert_eq!(
+            ends_bytes(flash, (DEEP_HEAD + TAIL_BYTES + 1) as u64),
             HEAD_BYTES + TAIL_BYTES
+        );
+    }
+
+    #[test]
+    fn the_spinning_profile_budgets_for_no_tail_at_any_size() {
+        let spin = Profile::Spinning;
+        assert_eq!(ends_bytes(spin, 100), 100);
+        assert_eq!(ends_bytes(spin, HEAD_BYTES as u64 + 1), HEAD_BYTES);
+        assert_eq!(
+            ends_bytes(spin, (DEEP_HEAD + TAIL_BYTES + 1) as u64),
+            HEAD_BYTES
         );
     }
 }

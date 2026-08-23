@@ -21,6 +21,67 @@ pub struct Device {
     requested: Option<usize>,
 }
 
+/// Which access patterns the scan is being asked to optimise for.
+///
+/// Not the same question as `Device::solid`, which is what the disk says about
+/// itself. A user with a USB enclosure that reports nothing knows what is
+/// inside it and we do not, so the two are kept apart: the device answers, the
+/// profile decides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Profile {
+    /// Every stage as it has always been. This is what the conformance gate
+    /// grades and the only thing RBENCH scores.
+    #[default]
+    Flash,
+    /// Fewer, longer, more nearly sequential reads, at the cost of reading
+    /// more bytes. See SPIN.md.
+    Spinning,
+}
+
+/// What `--profile` asked for, before the disk has answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Wanted {
+    #[default]
+    Auto,
+    Flash,
+    Spinning,
+}
+
+/// Said once, on stderr, when `auto` had nothing to go on.
+pub const UNKNOWN_MEDIUM: &str =
+    "dedup-rs: this volume does not say whether it spins, so the scan is reading it as flash. \
+     If it is a USB hard disk, --profile spinning will read it in far fewer seeks.";
+
+impl Wanted {
+    pub fn parse(text: &str) -> Option<Wanted> {
+        match text {
+            "auto" => Some(Wanted::Auto),
+            "flash" => Some(Wanted::Flash),
+            "spinning" => Some(Wanted::Spinning),
+            _ => None,
+        }
+    }
+
+    /// The profile to scan with, and the hint to print if there is one.
+    ///
+    /// `auto` picks `spinning` only for a disk that positively said it spins.
+    /// Solid state and "no idea" both get `flash`, which is what the tool has
+    /// always done and what keeps a default run byte-identical to the oracle.
+    /// Guessing `spinning` at an enclosure that simply does not report would
+    /// cost every ordinary external SSD a slower scan.
+    pub fn resolve(self, device: Device) -> (Profile, Option<&'static str>) {
+        match self {
+            Wanted::Flash => (Profile::Flash, None),
+            Wanted::Spinning => (Profile::Spinning, None),
+            Wanted::Auto => match device.solid {
+                Some(false) => (Profile::Spinning, None),
+                Some(true) => (Profile::Flash, None),
+                None => (Profile::Flash, Some(UNKNOWN_MEDIUM)),
+            },
+        }
+    }
+}
+
 /// A volume probe in flight.
 ///
 /// Asking what kind of disk this is means running `diskutil`, and a subprocess
@@ -79,9 +140,12 @@ impl Device {
 
     /// Readers for the stages that seek: the end probe, the deep head, the
     /// sample windows, and the small-file passes.
-    pub fn random_jobs(&self) -> usize {
+    pub fn random_jobs(&self, profile: Profile) -> usize {
         match self.requested {
             Some(n) => n.max(1),
+            // One set of heads, one queue. Two readers on a spinning disk
+            // spend their time interleaving each other's tracks.
+            None if profile == Profile::Spinning => 1,
             // An unknown device gets the generous pool on purpose: it is
             // usually an enclosure that simply does not report, and treating
             // one of those as a spinning disk costs far more than the reverse.
@@ -91,9 +155,10 @@ impl Device {
     }
 
     /// Readers for the stage that streams whole files in step.
-    pub fn sequential_jobs(&self) -> usize {
+    pub fn sequential_jobs(&self, profile: Profile) -> usize {
         match self.requested {
             Some(n) => n.max(1),
+            None if profile == Profile::Spinning => 1,
             // Serial where the heads would have to seek between files, and
             // where we cannot be sure they would not.
             None if self.solid == Some(true) => cpu_bound(8),
@@ -152,13 +217,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_explicit_j_overrides_both_pools() {
+    fn an_explicit_j_overrides_both_pools_in_either_profile() {
         let device = Device {
             solid: Some(false),
             requested: Some(8),
         };
-        assert_eq!(device.random_jobs(), 8);
-        assert_eq!(device.sequential_jobs(), 8);
+        assert_eq!(device.random_jobs(Profile::Flash), 8);
+        assert_eq!(device.sequential_jobs(Profile::Flash), 8);
+        assert_eq!(device.random_jobs(Profile::Spinning), 8);
+        assert_eq!(device.sequential_jobs(Profile::Spinning), 8);
     }
 
     #[test]
@@ -167,9 +234,62 @@ mod tests {
             solid: None,
             requested: None,
         };
-        assert!(device.random_jobs() > 1);
-        assert_eq!(device.sequential_jobs(), 1);
+        assert!(device.random_jobs(Profile::Flash) > 1);
+        assert_eq!(device.sequential_jobs(Profile::Flash), 1);
         assert!(!device.all_solid_state());
+    }
+
+    #[test]
+    fn the_spinning_profile_reads_with_one_thread_even_on_flash() {
+        // Forced onto a disk that says it is solid state: the profile is what
+        // decides, or forcing it would not be worth having.
+        let device = Device {
+            solid: Some(true),
+            requested: None,
+        };
+        assert_eq!(device.random_jobs(Profile::Spinning), 1);
+        assert_eq!(device.sequential_jobs(Profile::Spinning), 1);
+        assert!(device.random_jobs(Profile::Flash) > 1);
+    }
+
+    #[test]
+    fn auto_only_picks_spinning_for_a_disk_that_said_it_spins() {
+        let of = |solid| Device {
+            solid,
+            requested: None,
+        };
+        assert_eq!(
+            Wanted::Auto.resolve(of(Some(false))),
+            (Profile::Spinning, None)
+        );
+        assert_eq!(Wanted::Auto.resolve(of(Some(true))), (Profile::Flash, None));
+        let (profile, hint) = Wanted::Auto.resolve(of(None));
+        assert_eq!(profile, Profile::Flash);
+        assert_eq!(hint, Some(UNKNOWN_MEDIUM));
+    }
+
+    #[test]
+    fn an_explicit_profile_never_asks_the_disk_and_never_hints() {
+        let of = |solid| Device {
+            solid,
+            requested: None,
+        };
+        for solid in [Some(true), Some(false), None] {
+            assert_eq!(Wanted::Flash.resolve(of(solid)), (Profile::Flash, None));
+            assert_eq!(
+                Wanted::Spinning.resolve(of(solid)),
+                (Profile::Spinning, None)
+            );
+        }
+    }
+
+    #[test]
+    fn the_profile_names_are_the_three_the_flag_documents() {
+        assert_eq!(Wanted::parse("auto"), Some(Wanted::Auto));
+        assert_eq!(Wanted::parse("flash"), Some(Wanted::Flash));
+        assert_eq!(Wanted::parse("spinning"), Some(Wanted::Spinning));
+        assert_eq!(Wanted::parse("Spinning"), None);
+        assert_eq!(Wanted::parse("hdd"), None);
     }
 
     #[test]
