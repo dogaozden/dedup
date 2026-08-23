@@ -325,6 +325,122 @@ new idea you check whether the log already killed it.
 
 ---
 
+## 2026-08-23 — ROUND TWO, OPUS: STOP SUMMARY
+
+**Refereed score 0.6833**, against the `94739ad` pin, on branch `opus-r2` at
+`3019856`. Unmerged, as §10 asks.
+
+```
+run                                        load   score
+self,     r2, seed 1                       5.41  0.6717
+self,     r2, seed 2                       7.96  0.6829
+referee,  r2, seed 1  (clean main)         5.34  0.6833
+self,     scale default, seed 1            4.63  0.6722
+```
+
+Self and referee agree to 1.7%, inside the floor. Noise floor measured twice
+that day on the same machine: **±7.4%** in the afternoon (geomean against
+itself 1.0044) and **±3.7%** in the evening (0.9931). Every gate green in
+every run; `--selftest` 5 of 5 each time.
+
+Referee's per-scenario table, which is the one to read:
+
+```
+scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
+needle       0.7354  0.6030  0.8051   ±3.9%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1713  0.1036  0.6034   ±3.5%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0269  0.0233  0.8685  ±10.4%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1879  0.1523  0.8150  ±11.9%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0234  0.0167  0.7123   ±2.6%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0233  0.0175  0.7439   ±1.1%  138.2 MB  146.2 MB  112.0 MB
+rescan       0.0290  0.0116  0.3817   ±1.5%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0069  0.0068  1.0036   ±3.2%   16.2 MB   16.2 MB   16.0 MB
+```
+
+### Kept, in the order they landed
+
+| # | change | commit | what it bought |
+|---|---|---|---|
+| 1 | `getattrlistbulk(2)` for the walk | `be5be78` | 1.0000 → 0.9587 |
+| 2 | a disk image does not charge for a seek | `6319d35` | 0.9587 → 0.8272 |
+| 3 | stop running SipHash over every small file | `039242d` | 0.8272 → 0.7900 |
+| 4 | a reader per performance core, small-file stage only | `ae7b453` | 0.7900 → 0.7824 |
+| 5 | read sibling directories concurrently | `3019856` | → **0.6833** refereed |
+
+Two of those want the maintainer's eye before anything is taken:
+
+- **#2 is bought where §7 says this bench is blind.** The corpus volume is a
+  RAM disk. The change is confined to media the registry positively identifies
+  as a disk image, so an unreporting USB enclosure keeps the conservative
+  path — but nothing here tests that, and it is the largest single term in the
+  score. It also moves `bigheader`'s bytes, 146.2 MB → 138.2 MB: below the
+  baseline, above the floor, deterministic, legal under §1, and still a
+  behaviour change.
+- **#4 and #5 are the only new constants**, and both are confirmed at
+  `--seed 2` and `--scale default` per §6.5.
+
+### Rejected, with the measurement
+
+- **`openat` on the walk's directory fd** — 1.04x at one thread, 1.00x at
+  four. Path resolution is not what an open costs here.
+- **The seek counter's global mutex** — twice. 0.15 → 0.15 the first time;
+  and again after the compare stage went from one reader to eight, which is
+  the condition that would have made it matter: 136.59 → 137.90 ms.
+- **One reader pool sized from the performance cores** — 0.7936 against
+  0.7900, and a §8 trade: `needle` and `typical` won, `widegroup` and
+  `samesize` lost. Kept only in the narrowed form, #4.
+- **A parallel sort in `candidates()`** — 1.5%, under the floor.
+
+### Where the wall is, and it is not where the honeypot says
+
+`typical` now runs **0.1036 s for 13,372 opens — 7.9 µs each**, which is
+exactly the per-file open cost measured in C over the same tree, at the
+thread count where that cost bottoms out (0.4429 s serial, 0.1526 s at four
+readers, flat to worse out to ten). **`typical` is on the syscall floor.**
+`needle` is at 11 µs, the difference being the 122 MB of file content the
+small-file stage must hold to prove equality byte-for-byte. Startup is
+3.4 ms — 1.4 ms of it bare `fork`/`exec`, 1.7 ms dyld on a 3.1 MB binary —
+and is now 20–50% of five of the seven scenarios.
+
+**The 0.20 target is below what a byte-exact scan can reach on this machine,
+and `floor.py` is why.** Its opens term counts the members of the planted
+duplicate groups: 45 on `needle`. A scan that does not already know the answer
+must open every file sharing a size with another — 50,000 on `needle` — because
+§9 forbids ruling a file out on anything but its bytes. Re-running `floor.py`'s
+own arithmetic with the honest count puts the bulk-walk honeypot at **0.4001**
+with its own serial per-open figure, **0.3416** at the fastest per-open this
+machine was measured to do, and **0.2533** at a hypothetical 4.0 µs nobody has
+observed. Full working in the entry below. The fix is one line: count the files
+in non-singleton size classes, which the generators already know.
+
+### Where I would look next
+
+1. **Fix `floor.py`'s opens term** and re-derive round three's target. Anything
+   else here is downstream of that number being wrong.
+2. **`widegroup` opens each file about three times** — 5,442 opens for 1,827
+   files, one per stage. At 7.9 µs that is 43 ms of its 138 ms. Merging tier A
+   and tier B is not available (it would read past the ceiling on `prefixtrap`),
+   so this needs the staged pipeline to keep a descriptor, which the 256-fd
+   limit forbids at this file count. It is the largest single removable term
+   left and I do not have a safe way to remove it.
+3. **The unique-small-file cache gap is still open and this bench still cannot
+   see it.** `stages.rs:391` guards both `cache.remember` calls with
+   `if group.len() > 1`, so a small file found unique is never remembered and
+   a warm re-scan reads it again. Contrary to the note I was handed, the
+   reshaped `rescan` does **not** exercise it: its `min_size` is 65537, above
+   `DEEP_HEAD`, so `small_file_stage` never runs there — which is exactly what
+   the round-two prep entry says that `min_size` was chosen for. Fixing it is a
+   real win for real trees and worth nothing to this harness, so it wants a
+   scenario before it wants a patch.
+4. **The volume cannot hold the scored set** while round-one `-default-`
+   corpora are resident: 2590 MB wanted of 2739 MB, with 424 MB already spoken
+   for, and `ensure_space` evicts alphabetically so it takes `bigheader` and
+   `needle` — the two costliest to rebuild — and never reaches the stale ones.
+   `needle` was rebuilt before nearly every run of this round, and twice it was
+   evicted out from under a measurement in progress.
+
+---
+
 ## 2026-08-23 — RBENCH built and proved
 
 **Change:** `rbench/run.py`, `baseline.lock` pinning `c238b30`, this file.
@@ -772,6 +888,484 @@ remains on the clock is the walk over 11,200 files.
 
 **Verdict:** KEPT — this is preparation, not an optimization. Nothing in
 `rust/` was touched and no score was chased.
+
+---
+
+## 2026-08-23 — round two, opus: the noise floor of the day
+
+`--calibrate` at `r2`, nine rounds, load average 4.70 3.37 3.23, another
+agent's `--scale default` corpora resident on the volume:
+
+```
+geomean of a baseline against itself: 1.0044
+NOISE FLOOR: +/-7.4%   (worst scenario: widegroup at 1.0745)
+  per-round dispersion, worst scenario: photos at +/-5.8%
+```
+
+Three times looser than the +/-2.4% of record taken at pin time, and the
+machine is the reason: the box was carrying the user's own applications and a
+second optimizer all afternoon. **+/-7.4% per scenario is the floor every
+number below is judged against**, and the geomean's own floor is about
++/-0.4%. Nothing here is claimed on a per-scenario move smaller than 7.4%.
+
+**A note on the volume, which cost me two measurements before I understood
+it.** Five of the eight corpora were rebuilt during that calibration, `needle`
+among them, which RGOAL already warns is the signature of a set that does not
+fit. The cause is not the r2 sizing: 424 MB of round-one `-default-` corpora
+were resident, `ensure_space` evicts alphabetically and so takes `bigheader`
+and `needle` first and never reaches them. They are another contestant's live
+working set — they were created at 15:13 today — so they are not mine to
+delete and I left them alone. The consequence for anyone reading these
+numbers is that `needle` was rebuilt before most runs, and that ad-hoc timings
+taken outside `run.py` are worthless while a second harness is churning the
+volume: I lost one set of `needle` figures to a corpus that was evicted out
+from under the measurement mid-loop.
+
+**Verdict:** of record, for this round only.
+
+---
+
+## 2026-08-23 — the walk reads a directory in one call
+
+**Hypothesis:** the walk pays one `lstat(2)` per file and REWRITE.md §4 wants
+that gone. `getattrlistbulk(2)` returns a whole directory's names *and*
+attributes in one call, and on HFS+ and APFS that is one pass over the catalog
+rather than a lookup per entry. Round one left this unclaimed; ox's attempt
+scored 1.0148 and RGOAL asked that the next person not treat that as a
+ceiling.
+
+**Change:** `sys::BulkDir` — the `getattrlistbulk` FFI, plus a parser that
+carries the kernel buffer, a name arena and the parsed entries across
+directories, so a directory of 50,000 entries costs one allocation and not
+50,000. `walk()` uses it and falls back to `read_dir` per directory for
+anything the platform will not describe completely; `BulkDir::read` answers
+`false` without ever having reported a partial directory, so the fallback
+cannot double count. The relative path is now built by pushing onto the
+parent's prefix rather than by stripping the root off a fresh `PathBuf`,
+which also removes `relative_path`'s `.replace('\\', "/")` — a call that
+allocates a second `String` on every entry whether or not there is a
+backslash in it.
+
+Two things worth writing down for whoever touches this next:
+
+- **The kernel packs the attribute buffer with no padding.** `ATTR_FILE_DATALENGTH`
+  lands on a 4-byte boundary behind `ATTR_FILE_LINKCOUNT`, so almost nothing in
+  an entry is naturally aligned and every field has to be read unaligned. A
+  parser that assumes alignment will read plausible-looking rubbish rather than
+  crash.
+- **`attr_dataoffset` counts from the `attrreference_t` itself**, not from the
+  entry and not from the cursor. I had this wrong first and the bug survived a
+  clean build; what caught it was checking the parse against `lstat` field by
+  field rather than eyeballing the offsets.
+
+**Numbers.** Full scored run, nine rounds, load average 9.93 7.21 5.55 — a
+busy machine, and the spreads say so:
+
+```
+scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
+needle       0.6925  0.6733  0.9826   +/-2.7%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1643  0.1570  0.9478   +/-1.4%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0239  0.0234  0.9886   +/-6.0%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.2178  0.2246  1.0157  +/-14.6%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0309  0.0287  0.9570  +/-12.1%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0321  0.0386  1.0530  +/-26.0%  146.2 MB  146.2 MB  112.0 MB
+rescan       0.0321  0.0245  0.7898   +/-4.8%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0085  0.0080  0.9255  +/-21.1%   16.2 MB   16.2 MB   16.0 MB
+
+SCORE: 0.9587
+```
+
+Noise floor that day +/-7.4%. Only two scenarios moved outside their own
+spread and both are the walk-heavy ones: `rescan` at **0.7898 (+/-4.8%)`,
+whose warm scan reads nothing at all and is therefore almost pure walk, and
+`typical` at **0.9478 (+/-1.4%)**. Everything else is inside the noise of a
+load-9.93 machine. `--selftest` 5 of 5. Output is byte-identical to the
+baseline on every corpus and every reported field, checked before timing.
+
+**This is a smaller win than the honeypot implies, and the reason matters.**
+`floor.py` costs the walk at one `lstat` (1.07 us) against `readdir` (0.25 us)
+and puts the bulk-walk floor at 0.1431. Measured, the whole walk went from
+about 1.56 us to about 1.05 us per file — roughly 1.5x, not 4x. `getattrlistbulk`
+is not free: it does the same catalog work, just once per directory instead of
+once per file, and on a volume whose catalog is entirely in RAM the per-file
+lookup it removes was never the 1.07 us the model charges it.
+
+**Verdict:** KEPT (`be5be78`). Real, gates green, output identical — but the
+walk is only about a fifth of `typical` and a sixteenth of `needle`, so a
+1.5x on it cannot be worth more than it was.
+
+---
+
+## 2026-08-23 — a disk image does not charge for a seek
+
+**Hypothesis:** `sequential_jobs()` returns **1** for any volume whose medium
+the registry will not name, and `all_solid_state()` gives that volume the
+16 MB spinning-disk compare chunk. The bench volume is a RAM disk, and
+`solid_state()` answers `None` for it — the doc comment on that function says
+so in as many words. So the stage that streams whole files in step has been
+running single-threaded on every scored scenario. RGOAL parked this after
+round one as unproven, measured inside a +/-2.9% floor; at `r2` scale
+`widegroup` is 3.6x larger, and §12.1 says rejections expire.
+
+**Change:** `sys::disk_image()` asks the registry a *different* question —
+is this device provided by `IODiskImageBlockStorageDeviceOutKernel` — and
+`device::is_solid_state` falls back to it when `solid_state()` says `None`.
+`solid_state()` itself is untouched, because an existing test asserts it
+agrees with `diskutil`'s `SolidState`, and `diskutil` says "Info not
+available" here; widening it would have broken that agreement.
+
+**This is deliberately not "treat unknown media as flash".** That is the
+version §7 warns about, and it is wrong for the USB enclosure that reports
+nothing and may genuinely spin — eight sequential readers on real heads is a
+seek storm. The registry separates the two cases: a disk image has no heads,
+nothing with heads is provided by that class, and an unreporting enclosure is
+left exactly where it was.
+
+**Numbers.** Full scored run, nine rounds, load average 3.97 6.62 6.08:
+
+```
+scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
+needle       0.8166  0.7875  0.9644  +/-19.4%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1723  0.1641  0.9483  +/-19.0%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0275  0.0236  0.8696   +/-4.5%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1922  0.1439  0.7831   +/-5.5%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0251  0.0179  0.7153   +/-4.7%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0231  0.0174  0.7552   +/-1.7%  138.2 MB  146.2 MB  112.0 MB
+rescan       0.0269  0.0213  0.7879   +/-2.1%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0072  0.0077  1.0232   +/-9.4%   16.2 MB   16.2 MB   16.0 MB
+
+SCORE: 0.8272
+```
+
+Against the walk change alone at 0.9587, on the same harness: `widegroup`
+1.0157 -> **0.7831**, `photos` 0.9570 -> **0.7153**, `bigheader` 1.0530 ->
+**0.7552**, `samesize` 0.9886 -> **0.8696**. All four outside their spreads.
+`rescan` did not move, which is the check that this is the read stages and
+not something else: `rescan`'s scored half reads nothing. `--selftest` 5 of 5.
+
+**Two disclosures, both §8.**
+
+- **It moves bytes.** `bigheader` reads **138.2 MB** where the baseline read
+  146.2 MB — below the ceiling, above the 112.0 MB floor, deterministic across
+  all nine rounds. The compare chunk changed from `SLOW_CHUNK` to `CHUNK`, so
+  a mismatch is found after less of the file. Reading less is legal under §1
+  and it is still a behaviour change.
+- **This bench cannot see the cost of getting it wrong.** §7 names the corpus
+  volume as a RAM disk that reports no medium, which is exactly the case that
+  is free here and is not free on a real external drive. The class check is
+  what confines the change to media that genuinely has no heads, but nothing
+  in this harness tests that claim, and nobody should take the score as
+  evidence for it.
+
+**Verdict:** KEPT on this branch (`6319d35`), and flagged for the maintainer
+rather than claimed. It is the single largest term in this round's score and
+it is bought in the one place §7 says the bench is blind.
+
+---
+
+## 2026-08-23 — two ideas measured and dropped before they cost a scored run
+
+Both were killed with a throwaway build and a C probe rather than a nine-round
+run, which is the only reason there was time for the ones above.
+
+**The seek counter's mutex.** `Effort::read_block` takes a global
+`Mutex<Option<At>>` twice per read — once in `charge_seek`, once to store where
+the read stopped. With eight readers and 50,000 files that looked like the
+obvious serialiser. A build with the mutex removed entirely (seeks left wrong
+on purpose, purely to size the prize) moved `typical` 0.15 -> 0.15 and
+`widegroup` 0.23 -> 0.21, both inside noise. **The lock is not the
+bottleneck.** Not pursued, and `effort.rs` is untouched.
+
+Worth recording beside it: `seeks` is *already* nondeterministic under the
+parallel readers, 2045 or 2046 on the same corpus from run to run, on the
+pinned baseline as much as on this branch. `bytes_read` is exactly
+deterministic on both, which is what gate 7 actually checks.
+
+**`openat` on a held directory fd.** The walk now has a directory descriptor
+in hand, so every later `open(root.join(name))` could have been
+`openat(dirfd, name)` and skipped resolving the parent components. Measured in
+C over `typical`'s 19,200 files: **1.04x at one thread, 1.00x at four, 0.98x
+at ten.** Path resolution is not what an open costs here. Dropped.
+
+What the same probe did establish, and what shaped everything after it:
+**the open path saturates at four threads.** 0.4429 s serial, 0.1526 s at
+four, and flat to worse out to ten — about 7.9 us per file no matter how many
+readers ask. That is the wall `needle` and `typical` are against, and it is
+why neither of them moved much for any of the work above.
+
+**Verdict:** both REJECTED, on measurement, before a scored run was spent.
+
+---
+
+## 2026-08-23 — the small-file stage was hashing every byte it read, with SipHash
+
+**Hypothesis:** `Ordered` indexes its slots by a hash of the key, and in the
+small-file stage the key *is* a whole file's contents. So every byte that
+stage reads is also a byte it hashes, through `DefaultHasher`, which is
+SipHash. That is 122 MB of SipHash on `needle` and 70 MB on `typical`, none
+of which the profile of that stage should be spending on hashing.
+
+**Change:** a multiply-and-rotate mixer in `ordered.rs` in place of
+`DefaultHasher`. This is safe for a reason worth stating plainly rather than
+assuming: **the index is a hint and never an answer.** `push` compares the
+key itself before it believes a match, so a weaker hash costs one extra
+comparison and cannot produce a wrong grouping. It also cannot reorder
+anything — `slots` stays in insertion order, which is what the `RETAIN_BUDGET`
+walk depends on and what `ordered.rs`'s own doc comment says is observable.
+And the digest goes on to be a `HashMap` key, where that map hashes it again
+with its own SipHash, so this mixer does not have to spread its output well.
+It only has to depend on every byte and on the length, which it is tested for
+— including on the `prefixtrap` shape, a long shared prefix and a short
+parting.
+
+**Numbers.** Full scored run, load average 5.61 5.09 5.48:
+
+```
+needle       0.7065  0.6689  0.9393   +/-3.9%
+typical      0.1809  0.1570  0.8665  +/-10.6%
+samesize     0.0300  0.0239  0.9048  +/-12.2%
+widegroup    0.2071  0.1432  0.7476   +/-6.2%
+photos       0.0249  0.0179  0.7171   +/-3.8%
+bigheader    0.0292  0.0174  0.6424   +/-6.4%
+rescan       0.0272  0.0212  0.7571   +/-3.3%
+prefixtrap*  0.0085  0.0084  1.0515   +/-6.1%
+
+SCORE: 0.7900   (from 0.8272)
+```
+
+The gain lands where the hypothesis says it should — `typical` 0.9483 ->
+0.8665 and `needle` 0.9644 -> 0.9393, the two scenarios made of small files.
+`--selftest` 5 of 5, output byte-identical.
+
+**Verdict:** KEPT (`039242d`).
+
+---
+
+## 2026-08-23 — reader counts: one pool sized wrong, then two sized right
+
+**Hypothesis:** `cpu_bound(8)` puts eight readers on a machine with four
+performance cores and six efficiency ones. A C probe over `typical`'s 19,200
+files said the open path saturates at four: 0.4429 s serial, 0.1526 s at
+four, and flat to slightly worse out to ten. So eight readers are queueing,
+not working.
+
+**First change, and it was wrong.** Sizing `random_jobs` from the performance
+cores. Measured with `--jobs` before writing anything, the two stages want
+opposite things:
+
+```
+                      j3      j4      j5      j6      j8      j10
+typical            0.1415  0.1201  0.1408  0.1460  0.1515  0.1547
+widegroup          0.2682  0.2237  0.1565  0.1639  0.1456  0.1448
+```
+
+Scored, that came out **0.7936 against 0.7900** — no gain, and a
+cross-scenario trade underneath it: `needle` 0.9393 -> 0.8170 and `typical`
+0.8665 -> 0.7220, against `widegroup` 0.7476 -> 0.8700 and `samesize`
+0.9048 -> 1.0374. §8 says a trade like that is not mine to keep, and the
+geomean did not move anyway. Reverted.
+
+**Second change, kept.** `random_jobs` drives two different things: the
+small-file stage, which opens a file, reads all of it and moves on, and the
+head/tail probes, which read one page out of a much larger file. Only the
+first is pure latency on a shared catalog. So the small-file stage gets its
+own pool sized from the performance cores, built lazily inside
+`if !small.is_empty()` so a tree with nothing under `DEEP_HEAD` never
+allocates it, and the probes keep `cpu_bound`.
+
+```
+needle       0.7076  0.5797  0.8190   +/-2.5%
+typical      0.1692  0.1169  0.6920   +/-3.0%
+samesize     0.0256  0.0231  0.8658   +/-8.4%
+widegroup    0.2005  0.1498  0.7995   +/-8.4%
+photos       0.0245  0.0196  0.8230   +/-4.7%
+bigheader    0.0231  0.0173  0.7452   +/-3.1%
+rescan       0.0279  0.0213  0.7459   +/-1.9%
+prefixtrap*  0.0070  0.0068  0.9582   +/-3.0%
+
+SCORE: 0.7824   (from 0.7900),  load average 11.40 8.61 7.00
+```
+
+**Read the last three rows as noise and here is the proof.** `widegroup`,
+`photos` and `bigheader` have no file below `DEEP_HEAD` — 247 KB, 3.9 MB and
+56 MB per file — so `small.is_empty()` holds and their code path is
+byte-for-byte what it was in the previous run. `photos` still moved 0.7171 ->
+0.8230 between the two. **That is what a run-to-run per-scenario comparison
+is worth on this machine at load 11.4: about +/-15%, twice the +/-7.4% the
+calibration measured at load 4.7.** Only `needle` and `typical`, which are
+made of small files, moved for a reason.
+
+**Verdict:** first REVERTED (no gain, and a §8 trade); second KEPT
+(`ae7b453`).
+
+---
+
+## 2026-08-23 — the honeypot counts the opens needed to check the answer, not to find it
+
+This is not an optimization. It is a correction to `floor.py`, offered because
+this file's own preamble says that where it and the code disagree the code is
+right and the file is stale. Here I think it is the other way round, in a way
+that set this round's target below what any correct tool can reach.
+
+`floor.py:294` costs the opens term as
+
+```python
+opens = 0 if warm else sum(len(g) for g in ceiling["groups"])
+```
+
+— the members of the planted duplicate groups, and nothing else. That is the
+number of opens needed to **verify a known answer**. A scan does not know the
+answer. Under §9's byte-exactness rule a file can only be ruled *out* of a
+group by reading it, so every file that shares a size with another has to be
+opened, and only files whose size is unique can be skipped. On `needle` the
+floor charges **45 opens**; every correct implementation must do **50,000**,
+which is what both the tool and the frozen oracle actually do.
+
+Re-running `floor.py`'s own arithmetic, with its own constants, changing only
+the open count to the honest one — and costing the walk as a bulk directory
+read throughout, which is the *generous* direction:
+
+```
+  scenario     floor opens  honest opens   published   honest
+  needle            45        50000          6.6%      82.5%
+  typical         1853        13372         23.9%      93.5%
+  samesize          91         1402         17.9%      74.9%
+  widegroup       1820         1827         21.2%      20.7%
+  photos            49          100         32.2%      35.1%
+  bigheader          8            8         23.7%      24.1%
+  rescan             0            0         44.0%      16.3%
+
+  published bulk-walk honeypot : 0.1431      (0.2131 with an lstat walk)
+  same arithmetic, honest opens: 0.4001
+```
+
+`per_open` is measured serially and the tool opens in parallel, so that 0.4001
+is an overestimate. Substituting the fastest per-file open this machine was
+measured to do — 7.9 us, four threads, open plus read plus close — gives
+**0.3416**. Even a hypothetical 4.0 us, faster than anything observed here,
+gives **0.2533**.
+
+**So the round-two target of 0.20 sits below the floor of any byte-exact
+implementation on this machine, and 0.1431 is roughly a factor of two below
+it.** The error is concentrated in `needle`, whose 6.6% is the single term
+that pulled the published geomean down, and which is really about 60–80%.
+
+Nothing here touches the gates, and none of it makes a slow candidate look
+fast — the floor is a target-setting tool, not a scoring one. But RGOAL's own
+account of why the floor exists is that "the predecessor bench set a target
+below what the hardware charges once; a target like that can only be hit by a
+candidate that stopped doing the work." That is exactly the failure mode this
+row reproduces, one level up: the hardware charge is right and the *work* is
+undercounted.
+
+**Suggested fix**, for whoever owns `floor.py`: count the opens as the number
+of files sharing a size with at least one other file, which the generators
+already know and which is what both the oracle and the tool do. Then the
+`needle` row reads about 82% instead of 6.6% and the honeypot lands near 0.34.
+
+**Verdict:** reported, not acted on. `rbench/` is not mine to change (§9),
+and this is a claim about the target rather than about any candidate's score.
+
+---
+
+## 2026-08-23 — the walk goes wide, and rescan halves
+
+**Hypothesis:** once the bulk read landed, the walk *was* `rescan`. Measured
+with `--min-size` set above every file, so the tool walks and reads nothing:
+`rescan` spends **86.8%** of its scan in the walk, and `typical` 24.1%. That
+is the shape of the scored half of `rescan` by construction — it reads no
+bytes, so all it can do is walk and ask the cache. And the walk was one
+thread.
+
+**Change:** one task per directory, on a pool of its own sized like the
+small-file pool and for the same reason — these are directory reads against a
+single catalog. Each task builds its own directory's records into a local
+vector and appends the whole of it under one lock, so the shared state is
+touched once per directory and never per file. The kernel buffer and name
+arena moved to a thread-local, because `BulkDir` carries 128 KiB and a walk
+visits thousands of directories; one per worker rather than one per
+directory.
+
+**Why the order does not matter, checked rather than argued.** `candidates`
+sorts by size and then by `(device, inode)`, and after hardlink folding that
+is a unique key, so the records it hands on are in the same order whatever
+order the tasks finished in. `main` sorts and dedups `unreadable` before
+reporting it. That is the argument; the check is 20 runs per corpus, each
+producing exactly **one** distinct answer over `groups`, `bytes_read`,
+`files_seen`, `opens` and `unreadable` — on every corpus and on a tree of
+symlinks, hardlinks, a fifo, unicode and backslash names.
+
+**Numbers.**
+
+```
+walk only (min-size above every file)   old        new
+  typical                            67.30 ms   23.17 ms
+  rescan                             42.20 ms   17.94 ms
+  widegroup                          10.43 ms   10.01 ms   (too few directories)
+
+scored, rayon's global pool | own pool sized to the performance cores
+  rescan       0.3817 (+/-7.7%)    |  0.4711 (+/-4.6%)
+  typical      0.8312 (+/-1.1%)    |  0.8105 (+/-3.9%)
+  SCORE        0.7542              |  0.7661
+```
+
+**Both scored runs are worth less than they look and the reason is in the
+`base s` column.** They were taken at load average 12.06 and 13.84, with a
+headless Chromium belonging to something else on this machine taking 616% of
+the CPU. `needle`'s own baseline read 1.1293 s and then 1.6144 s against the
+0.6925–0.7076 s it reads on a quiet box — the machine was running at half
+speed and drifting while it did. The two forms of the change cannot be told
+apart at that noise, and `needle` at 1.0394 +/-11.2% says nothing at all. The
+one thing that is far outside it is `rescan`, which halved.
+
+The pooled form is kept over the global-pool form on grounds other than
+score: the global pool would have been a third set of threads alive beside
+the two the read stages already build, on a machine with ten cores.
+
+**Verdict:** KEPT (`3019856`), on `rescan`'s move. The rest of the table from
+these two runs should not be quoted, and is not.
+
+---
+
+## 2026-08-23 — three ideas that did not clear the floor, and the stop
+
+Recorded together because none of them cost a scored run: two were settled
+with a throwaway build and a local A/B on a quiet machine, which is what left
+room for the ones that worked.
+
+**1. One reader pool sized from the performance cores.** Scored at 0.7936
+against 0.7900, and a §8 cross-scenario trade underneath. Reverted; the
+narrower version that only re-sizes the small-file stage was kept instead.
+Written up in full above.
+
+**2. The seek counter's mutex, re-tested.** Rejected once already this round,
+when it moved `typical` 0.15 -> 0.15. Worth re-testing because the condition
+changed underneath it: the disk-image fix took the compare stage from **one**
+reader to eight, so the contention the first test looked for did not exist
+when that test was run. §12.1 says a rejection expires when something lands
+near it. Re-measured with the same throwaway build, on a quiet machine:
+
+```
+                  with the mutex    without it
+  widegroup          136.59 ms       137.90 ms
+  typical             97.90 ms        98.66 ms
+```
+
+Still nothing, in the direction of very slightly worse. Two acquisitions per
+read, on a lock held for the length of a compare and a store, do not show up
+against 7.9 us of open. **Rejected twice, and the second time on purpose.**
+
+**3. A parallel sort in `candidates()`.** It sorts every walked record twice —
+50,000 of them on `needle`, at about 200 bytes each. `par_sort_unstable_by_key`
+is a two-line change and is safe here: the first sort's only ties are hardlinks
+of one inode, whose names `fold_names` sorts afterwards anyway, and the second
+sort's key is unique once folding has happened. Measured on `typical`:
+**96.41 ms against 97.90 ms**, 1.5%. `needle` would gain proportionally more of
+a much larger total. Under the ±3.7% floor either way, and §6.2 says not to
+keep a change on a 2% improvement. Reverted.
+
+**That is three consecutive ideas inside the noise floor, so this is the stop
+under §12.**
 
 ---
 
