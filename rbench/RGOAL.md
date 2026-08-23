@@ -349,14 +349,14 @@ Referee's per-scenario table, which is the one to read:
 
 ```
 scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
-needle       0.6911  0.5174  0.7486   ±3.7%  122.1 MB  122.1 MB  133.3 KB
-typical      0.1710  0.1018  0.5952   ±1.1%   70.6 MB   70.6 MB   33.0 MB
-samesize     0.0262  0.0234  0.9100   ±5.2%   32.8 MB   32.8 MB   22.5 MB
-widegroup    0.1719  0.1252  0.7353   ±6.5%  451.3 MB  451.3 MB  451.3 MB
-photos       0.0227  0.0178  0.7384   ±3.6%  147.9 MB  147.9 MB  147.8 MB
-bigheader    0.0228  0.0163  0.7172   ±2.8%  138.2 MB  146.2 MB  112.0 MB
-rescan       0.0268  0.0100  0.3715   ±0.7%       0 B    5.2 MB    5.2 MB
-prefixtrap*  0.0067  0.0067  1.0083   ±2.8%   16.2 MB   16.2 MB   16.0 MB
+needle       0.6893  0.4865  0.6986   ±2.4%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1745  0.1006  0.5816   ±2.6%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0252  0.0206  0.8148   ±7.8%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1851  0.0971  0.5497   ±5.6%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0237  0.0180  0.7421   ±4.4%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0228  0.0161  0.7055  ±11.5%  138.2 MB  146.2 MB  112.0 MB
+rescan       0.0570  0.0174  0.3307   ±8.4%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0077  0.0073  0.9433   ±9.5%   16.2 MB   16.2 MB   16.0 MB
 ```
 
 ### Kept, in the order they landed
@@ -369,6 +369,7 @@ prefixtrap*  0.0067  0.0067  1.0083   ±2.8%   16.2 MB   16.2 MB   16.0 MB
 | 4 | a reader per performance core, small-file stage only | `ae7b453` | 0.7900 → 0.7824 |
 | 5 | read sibling directories concurrently | `3019856` | → 0.6833 refereed |
 | 6 | compare a group against its pivot in parallel | `db6b8c7` | → **0.6669** refereed |
+| 7 | hardware SHA-256 (`sha2` `asm` feature) | `b3d81fd` | → **0.6102** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -1711,7 +1712,22 @@ this now also refuses to start while any process outside the harness is over
   SCORE        0.6669   0.6295
 ```
 
-5.6% on the geomean, against a ±3.7% floor. The scenarios that move are the
+Confirmed at `--seed 2`: **0.6241**. Refereed from a clean worktree of
+`main`, which is the number that counts: **0.6102**, every gate green.
+
+```
+  referee, b3d81fd     base s  cand s   ratio
+  needle               0.6893  0.4865  0.6986
+  typical              0.1745  0.1006  0.5816
+  samesize             0.0252  0.0206  0.8148
+  widegroup            0.1851  0.0971  0.5497
+  photos               0.0237  0.0180  0.7421
+  bigheader            0.0228  0.0161  0.7055
+  rescan               0.0570  0.0174  0.3307
+  SCORE                                0.6102
+```
+
+8.5% on the geomean against the 0.6669 of record, well past a ±3.7% floor. The scenarios that move are the
 ones that hash the most bytes: `widegroup` 451 MB, `bigheader` 138 MB,
 `photos` 148 MB. `needle` and `typical` barely move, which is the expected
 shape — both are open-bound, not hash-bound, and the journal above has them
