@@ -109,8 +109,7 @@ class Fatal(rbench.Fatal):
     """Something about the machine or the harness is wrong — exit 2."""
 
 
-def human(n) -> str:
-    return rbench.human(n)
+human = rbench.human
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -431,7 +430,7 @@ def write_report(results: dict, tools: list, path: str) -> None:
 # the run
 # ─────────────────────────────────────────────────────────────────────────────
 
-def semantic_deltas(results: dict) -> list:
+def semantic_deltas() -> list:
     """The differences the flag table could not close, as the report states them.
 
     XBENCH.md law 2: where a tool cannot express our semantics, the difference
@@ -643,18 +642,21 @@ def _locked(args, root, note, halve, busy) -> int:
         "shapes": shapes,
         "lanes": lanes,
     }
-    results["deltas"] = semantic_deltas(results)
+    results["deltas"] = semantic_deltas()
 
+    # Fixed startup is compared against the tool's FASTEST scenario, because
+    # that is the one where it is the largest share of the measurement. If it
+    # passes there it passes everywhere.
     for tool in tools:
         share = setup[tool.key]
-        slowest = min((e["tools"][tool.key]["median"]
+        fastest = min((e["tools"][tool.key]["median"]
                        for lane in lanes.values() for e in lane.values()
                        if e["tools"][tool.key].get("median")), default=None)
-        if slowest and share > slowest * SETUP_SHARE:
+        if fastest and share > fastest * SETUP_SHARE:
             print("xbench: NOTE — {}'s fixed startup ({:.3f}s) is more than "
                   "{:.0%} of its fastest scenario ({:.3f}s); this scale is too "
                   "small to publish".format(tool.label, share, SETUP_SHARE,
-                                            slowest))
+                                            fastest))
 
     stamp = datetime.now().strftime("%Y-%m-%d")
     if smoke:

@@ -265,7 +265,7 @@ def compare(want: frozenset, got: frozenset) -> tuple:
     that a table cell reads "exact (10 groups)" rather than saying exact twice.
     """
     if want == got:
-        return True, "({} groups)".format(len(want))
+        return True, "({} group{})".format(len(want), "" if len(want) == 1 else "s")
     missing, extra = want - got, got - want
     bits = []
     if missing:
