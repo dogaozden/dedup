@@ -32,7 +32,26 @@ GENERATOR_VERSION = 2
 # file changes with it.
 RAND_CHUNK = 4 << 20
 
-SCALES = {"default": 1.0, "smoke": 0.1}
+SCALES = {"default": 1.0, "smoke": 0.1, "r2": 1.0}
+
+# A scale may multiply individual scenarios on top of its base factor. What a
+# scenario costs in wall clock and what it costs in RAM disk are not the same
+# ratio for every shape — a small-file tree buys milliseconds by the hundred per
+# megabyte and a few-large-files tree buys them by the twentieth — so one scalar
+# cannot size seven shapes to a common wall clock. See RGOAL.md's round-2 entry
+# for the measurements these came from.
+#
+# `r2` is stamped with the round it was cut for, not named for its purpose,
+# because a scale whose sizes move is a scale whose numbers stop comparing. When
+# the sizes need to move again, add `r3`; do not edit these.
+SCALE_TWEAKS = {
+    "r2": {"typical": 1.6, "widegroup": 3.6},
+}
+
+
+def scale_factor(scenario: str, scale: str) -> float:
+    """The generator factor for one scenario at one scale."""
+    return SCALES[scale] * SCALE_TWEAKS.get(scale, {}).get(scenario, 1.0)
 
 # dedup's stage-4 constants, mirrored so `bigheader` can place a difference in
 # the gap between two sample windows. They are only used to aim a scenario; if
