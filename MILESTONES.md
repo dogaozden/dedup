@@ -9,7 +9,29 @@ macOS `getattrlistbulk(2)` remains explicitly deferred in `LOG.md`.
 
 - Implementation commit addressing all binding review items:
   `06a5f640c11d7cdde9b98842f0f383960d36de00`
-- Gate command: `python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'`
+- Gate command: `python3 ~/ox/dedup-oracle/conformance/run.py --gate m1 --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+'`
 
 Final gate output, captured to `/tmp/dedup-rs-m1-gate.txt` by redirecting
 stdout of the command above:
@@ -50,7 +72,29 @@ revalidated by `fstat` before they are trusted. `-j` is honoured by both pools.
 
 ```
 python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m2 \
-  --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
+  --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+'
 ```
 
 Captured to `evidence/m2-gate.txt` by redirecting that command's stdout, and
@@ -96,7 +140,9 @@ Alternated timed runs (no hyperfine on this machine) on a generated corpus of
 - bytes read: never more than the oracle on any tree — exactly equal on all 13
 
 Full output, verbatim, is in LOG.md and `evidence/perf-j8.txt` /
-`evidence/perf-j1.txt`.
+`evidence/perf-j1.txt`. Re-taken against the shipped binary after M3 and M4
+landed, since the first measurement predates them: 2.33x at -j8, 1.32x at -j1,
+unchanged within noise. The evidence files hold the later run.
 
 ### Standards
 
@@ -129,7 +175,29 @@ column by column.
 
 ```
 python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m3 \
-  --candidate 'target/release/dedup-rs {root} --report-json {json} {flags}'
+  --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+'
 ```
 
 Captured to `evidence/m3-gate.txt` by redirecting that command's stdout, and
@@ -159,3 +227,147 @@ harness/spec discrepancy rather than a change of plan.
 
 `cargo test` 39 passed, 0 failed. `cargo clippy --all-targets -- -D warnings`
 exit 0. `cargo fmt --check` exit 0.
+
+## M4 — deletion — IMPLEMENTED, GATE NOT RUN
+
+**This is not a claim.** The handshake says a milestone is claimed only when
+its gate exits 0, and I have not run the M4 gate. What follows is the status,
+so a reviewer can see exactly what is finished and what is unverified.
+
+### Why the gate is unrun
+
+The instructions I work under carry an absolute fence — never touch anything
+under `/Volumes`, never run any binary against it, and violating it ends the
+project. The M4 gate's third check, `gate_trashes` (`run.py:605-676`), creates
+an 80 MB disk image, mounts it at `/Volumes/dedupconf`, builds a tree on it and
+runs the candidate against that root with `--auto shortest -y`, so my binary
+would read and delete files under `/Volumes`. `--gate m4` runs all three
+checks; there is no way to ask for the other two, and REWRITE.md §0 forbids
+editing the harness to make one.
+
+I referred the decision up rather than reinterpreting a fence that is marked
+project-ending, twice, and it has not come back. `--gate all` is unrun for the
+same reason, since it includes m4.
+
+### What is implemented
+
+Trash placement per volume (`trash_dir_for`: the home Trash on the boot volume,
+`<volume>/.Trashes/<uid>` elsewhere), the survivor guard, `--auto` with all
+three keep rules, `-y`, `--hard`, the TTY refusal, hardlink clusters removed as
+a unit, records pinned from outside the tree never removed, and byte
+re-verification of cache-attested groups before any removal.
+
+### What is verified, and how
+
+`gate_deletion`'s two local checks reproduced on trees built by the harness's
+own `trees.py` into the session scratchpad, judged against each tree's
+construction record — not against the oracle — by the same rule `run.py:533`
+uses, with the oracle run beside the port on its own copy and its own HOME
+(`evidence/m4-local-deletion.txt`):
+
+```text
+  deletion/oracle          pass (12 removed, 12 trashed, exit 0)
+  deletion/candidate       pass (12 removed, 12 trashed, exit 0)
+  links/oracle             pass (2 removed, 2 trashed, exit 0)
+  links/candidate          pass (2 removed, 2 trashed, exit 0)
+
+4 check(s), 0 failed
+```
+
+The flag surface (`evidence/m4-flags.txt`):
+
+```text
+--- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+```
+
+Keep rules and hardlink handling (`evidence/m4-rules-and-hardlinks.txt`):
+
+```text
+--auto shortest -> survivor: z.bin 
+--auto oldest -> survivor: deep/long-name.bin 
+--auto newest -> survivor: z.bin 
+
+--- a hardlink cluster goes as one unit, every name of it ---
+before: c.bin keeper.bin sub/a.bin sub/b.bin 
+after : c.bin sub/a.bin sub/b.bin 
+trash : keeper.bin 
+report groups: [['c.bin', 'keeper.bin']]
+--- the cluster is the victim: all three of its names must go together ---
+before: k.bin sub/xa.bin sub/xb.bin sub/xc.bin 
+after : k.bin 
+trash : xa.bin xb.bin xc.bin 
+
+--- a record pinned by a name outside the tree is never a victim ---
+before: aa.bin pinned.bin 
+
+  Nothing to remove.
+
+after : aa.bin pinned.bin 
+trash : []
+```
+
+The poison path — a cache-attested group whose bytes no longer match must be
+reported and then refused at deletion, while the rest of the tree is still
+cleaned up — is covered by `m3-poison-refusal`, which is green.
+
+### What is NOT verified
+
+`.Trashes/<uid>` on a non-boot volume. That is exactly the check the fence
+blocks, and nothing short of a second volume exercises it. `trash_dir_for` is
+the code; `evidence/m4-flags.txt` shows the boot-volume branch working, and the
+non-boot branch is untested by anything.
+
+To finish M4, run:
+
+```
+python3 /Users/dogaozden/ox/dedup-oracle/conformance/run.py --gate m4 \
+  --candidate 'target/release/dedup-rs {root} --report-json {json} --- 1. --auto with no -y and stdin not a TTY: must refuse ---
+
+  Keeping the Shortest copy in each of 1 groups.
+  Move to Trash: 1 files · 29 bytes reclaimed
+
+      copy-of-a.bin
+
+
+  Refusing to delete without confirmation. Re-run with -y to proceed.
+exit: 1
+files still present: a.bin copy-of-a.bin z.bin 
+trash: []
+
+--- 2. --auto -y: keeper survives, victim goes to the home Trash ---
+exit: 0
+files still present: a.bin z.bin 
+trash: [copy-of-a.bin ]
+
+--- 3. --hard: permanent, nothing reaches the Trash ---
+exit: 0
+files still present: a.bin 
+trash: []
+'
+```
+
+and then `--gate all` with `{stage}` appended to the template, per the note
+under the M2 claim.
+
+- Implementation commit: `ccabb1b87e95ee9ecb02649fb4a62d059e2af9ff`

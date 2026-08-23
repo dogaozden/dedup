@@ -593,3 +593,44 @@ warming the page cache (untimed)
 
 -j 1  median over 6 runs: oracle 7.227s, dedup-rs 5.496s -> 1.32x
 ```
+
+### M4's remaining surface, checked by hand
+
+The keep rules and the hardlink unit rule, which neither `gate_deletion`'s
+local checks nor the M3 gate reach directly
+(`evidence/m4-rules-and-hardlinks.txt`):
+
+```text
+--auto shortest -> survivor: z.bin 
+--auto oldest -> survivor: deep/long-name.bin 
+--auto newest -> survivor: z.bin 
+
+--- a hardlink cluster goes as one unit, every name of it ---
+before: c.bin keeper.bin sub/a.bin sub/b.bin 
+after : c.bin sub/a.bin sub/b.bin 
+trash : keeper.bin 
+report groups: [['c.bin', 'keeper.bin']]
+--- the cluster is the victim: all three of its names must go together ---
+before: k.bin sub/xa.bin sub/xb.bin sub/xc.bin 
+after : k.bin 
+trash : xa.bin xb.bin xc.bin 
+
+--- a record pinned by a name outside the tree is never a victim ---
+before: aa.bin pinned.bin 
+
+  Nothing to remove.
+
+after : aa.bin pinned.bin 
+trash : []
+```
+
+`shortest` keeps `z.bin` over `mid.bin` and `deep/long-name.bin`; `oldest` and
+`newest` follow the mtimes the test stamps. When a hardlink cluster is the
+victim, all three of its names move to the Trash together, because storage is
+only released when the last link goes. When a record is pinned by a name
+outside the tree, nothing is removed at all — `plan_auto` never dooms a record
+whose `deletable` is false, so deleting what we can see cannot free nothing.
+
+Note the second case: `aa.bin` is the shorter path, so `--auto shortest` would
+have kept it and removed `pinned.bin` were the pin not there. The guard is what
+stops it, not the ordering.
