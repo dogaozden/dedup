@@ -419,14 +419,26 @@ is not available. `typical` is on its floor outright. Startup is 3.4 ms
 (1.4 ms `fork`/`exec`, 1.7 ms dyld on a 3.1 MB binary) and is now 20-50% of
 five of the seven scenarios; `strip` does not move it.
 
+**The last premise, verified rather than assumed.** All of this rests on
+`needle`'s 50,000 opens being necessary, which I had asserted three times
+without checking. Counted: **3,073 distinct sizes across 50,000 files, and
+not one file alone at its size.** Every one of them shares a size with
+another, so under §9 every one has to be opened, and the tool opens exactly
+50,000 — no waste to reclaim.
+
 **The 0.20 target is below what a byte-exact scan can do on this machine.**
 `floor.py:294` counts opens as the members of the planted duplicate groups —
 45 on `needle` — where §9 forces every file sharing a size with another to be
 opened, which is 50,000. Its own arithmetic with the honest count gives
 **0.4001** at its own serial per-open figure and **0.3416** at the fastest
 per-open measured here. And independently of that model: `needle`'s 396 ms of
-irreducible syscalls against a 0.691 s baseline is 0.57 on that scenario
-before the tool does anything at all.
+irreducible syscalls against a 0.691 s baseline is **0.573** on that scenario
+before the tool does anything at all. For the geomean to reach 0.20 with
+`needle` at that floor, the other six scenarios would each have to average
+**0.166** — six times faster than the baseline — while four of them are
+already within a few milliseconds of their measured floors and each carries
+3.4 ms of process startup. There is no arrangement of the remaining work that
+gets there.
 
 ### Where I would look next
 
