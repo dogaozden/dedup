@@ -1368,7 +1368,7 @@ includes M5.1's. At the M6 implementation commit alone it read 131.
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 159 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
 
 
 $ cargo clippy --all-targets -- -D warnings
@@ -1606,7 +1606,7 @@ The command exited 0.
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 159 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
 
 
 $ cargo clippy --all-targets -- -D warnings

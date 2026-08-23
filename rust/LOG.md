@@ -1990,3 +1990,33 @@ hot path, so it was measured rather than argued about
   effect anybody can measure here. A real figure wants a quiet machine, and the
   script now prints the load average and the sample spread so a reader can tell
   which kind of run they are looking at.
+
+### The one thing that could not be observed, and what was done instead
+
+`auto` picks `spinning` only for a disk that positively reports rotational
+media, and prints a hint when the disk will not say. Neither case exists on
+this machine — everything here reports solid state — so neither had been seen
+end to end, only asserted about `Wanted::resolve` in isolation. Which is the
+weaker claim: `resolve` returning the right word does not prove the scan that
+word chose is the scan that ran.
+
+`VolumeProbe::answered` (test-only) is a probe that has already answered, and
+four tests in `pipeline` now run a real scan of a real scratch tree against
+each of the three answers. `auto` on a rotational disk is asserted to come back
+with `Profile::Spinning` on the `Scan` itself, and an unknown medium to come
+back on `Flash` carrying `UNKNOWN_MEDIUM` — which is the value `main` prints.
+
+Looking for a real volume that reports unknown was the wrong way to get this,
+and I started down it before stopping: a scan of `/dev` and
+`/System/Volumes/Data` is outside the fence REWRITE.md §0 draws around this
+repo, its scratch corpora and the oracle clone. It was read-only and it was
+killed by its own timeout, and it should not have been started.
+
+### Noticed, not touched
+
+`VolumeProbe`'s doc comment still says asking what kind of disk this is "means
+running `diskutil`, and a subprocess costs more than the whole scan of a small
+tree does". Round one replaced that subprocess with the IOKit calls in
+`sys.rs`, so the reason given for the probe being on a thread is no longer the
+true reason — the thread may well still be worth having, but not for that. It
+is not this branch's code and not this branch's change to make.

@@ -119,6 +119,22 @@ impl VolumeProbe {
     }
 }
 
+#[cfg(test)]
+impl VolumeProbe {
+    /// A probe that has already answered.
+    ///
+    /// The only way to exercise `auto` against media this machine does not
+    /// have: nothing here reports rotational, and the tool's whole point is
+    /// what it does when something does.
+    pub fn answered(solid: Option<bool>, requested: Option<usize>) -> Self {
+        VolumeProbe {
+            asking: None,
+            solid,
+            requested,
+        }
+    }
+}
+
 impl Drop for VolumeProbe {
     /// A scan that never needed the answer still waits for it here rather than
     /// exiting over the top of a live subprocess: an orphan finishing after we

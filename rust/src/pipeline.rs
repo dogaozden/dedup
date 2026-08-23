@@ -435,6 +435,98 @@ pub fn report_names<'a>(records: &'a [FileRec], groups: &[DupGroup]) -> Vec<Vec<
 mod tests {
     use super::*;
     use crate::consts::TAIL_BYTES;
+    use crate::device::UNKNOWN_MEDIUM;
+
+    /// A scratch tree of two identical files, big enough to reach stage 3.
+    struct Tree(std::path::PathBuf);
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Tree {
+        fn new(name: &str) -> Tree {
+            let root = std::env::temp_dir().join(format!(
+                "feat-auto-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("a scratch directory");
+            let content = vec![0x7E_u8; DEEP_HEAD * 4];
+            for name in ["one.bin", "two.bin"] {
+                std::fs::write(root.join(name), &content).expect("a scratch file");
+            }
+            Tree(root)
+        }
+
+        fn scan(&self, solid: Option<bool>, wanted: Wanted) -> Scan {
+            let effort = Effort::default();
+            find_duplicates(
+                &self.0,
+                Filters {
+                    min_size: 1,
+                    include_ext: None,
+                    skip_ext: &[],
+                    excludes: &[],
+                },
+                &mut VolumeProbe::answered(solid, Some(1)),
+                &effort,
+                None,
+                wanted,
+            )
+        }
+    }
+
+    #[test]
+    fn auto_runs_the_spinning_pipeline_on_a_disk_that_says_it_spins() {
+        // Not just that `resolve` returns the right word — that the scan the
+        // word chose is the scan that ran, all the way down.
+        let tree = Tree::new("rotational");
+        let scan = tree.scan(Some(false), Wanted::Auto);
+        assert_eq!(scan.profile, Profile::Spinning);
+        assert_eq!(scan.hint, None);
+        assert_eq!(scan.reported().len(), 1);
+        assert_eq!(scan.reported()[0].members.len(), 2);
+    }
+
+    #[test]
+    fn auto_stays_on_flash_for_a_disk_that_will_not_say_and_says_so_once() {
+        let tree = Tree::new("unknown");
+        let scan = tree.scan(None, Wanted::Auto);
+        assert_eq!(scan.profile, Profile::Flash);
+        assert_eq!(
+            scan.hint,
+            Some(UNKNOWN_MEDIUM),
+            "an unknown medium gets the hint that names the flag"
+        );
+        assert!(scan.hint.expect("a hint").contains("--profile spinning"));
+        assert_eq!(scan.reported().len(), 1);
+    }
+
+    #[test]
+    fn a_disk_that_says_it_is_flash_gets_flash_and_no_advice() {
+        let tree = Tree::new("solid");
+        let scan = tree.scan(Some(true), Wanted::Auto);
+        assert_eq!(scan.profile, Profile::Flash);
+        assert_eq!(scan.hint, None);
+    }
+
+    #[test]
+    fn an_explicit_profile_overrules_the_disk_and_never_advises() {
+        let tree = Tree::new("forced");
+        for solid in [Some(true), Some(false), None] {
+            let scan = tree.scan(solid, Wanted::Spinning);
+            assert_eq!(scan.profile, Profile::Spinning);
+            assert_eq!(scan.hint, None);
+            assert_eq!(scan.reported().len(), 1, "and it still finds the pair");
+            let scan = tree.scan(solid, Wanted::Flash);
+            assert_eq!(scan.profile, Profile::Flash);
+            assert_eq!(scan.hint, None);
+        }
+    }
 
     #[test]
     fn the_end_probe_only_pays_for_a_tail_once_the_pages_cannot_meet() {
