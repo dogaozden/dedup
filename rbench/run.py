@@ -227,28 +227,38 @@ def other_harnesses() -> list:
 
     A second harness on the same volume does not merely slow this one down,
     it evicts corpora underneath it, and the wreckage arrives looking like a
-    gate failure in the candidate. Our own process group is excluded: this
-    file's path contains "rbench" and would otherwise match itself.
+    gate failure in the candidate.
+
+    Our own process group and our own ancestors are excluded. This file's path
+    contains "rbench", so the shell that launched it carries the pattern on its
+    command line and would otherwise be reported as a rival harness.
     """
-    out = run(["ps", "-Ao", "pid=,pgid=,command="])
-    mine = os.getpid()
-    try:
-        my_group = os.getpgid(mine)
-    except OSError:
-        my_group = None
-    found = []
+    out = run(["ps", "-Ao", "pid=,ppid=,pgid=,command="])
+    rows = {}
     for line in out.stdout.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
             continue
         try:
-            pid, pgid = int(parts[0]), int(parts[1])
+            rows[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
         except ValueError:
             continue
-        command = parts[2]
-        if pid == mine or (my_group is not None and pgid == my_group):
-            continue
-        if command.startswith("ps ") or " ps -Ao" in command:
+
+    mine = os.getpid()
+    kin = set()
+    walk = mine
+    while walk in rows and walk not in kin:
+        kin.add(walk)
+        walk = rows[walk][0]
+    kin.add(walk)
+    try:
+        kin |= {pid for pid, row in rows.items() if row[1] == os.getpgid(mine)}
+    except OSError:
+        pass
+
+    found = []
+    for pid, (_ppid, _pgid, command) in sorted(rows.items()):
+        if pid in kin or command.startswith("ps "):
             continue
         if re.search(BUSY_PATTERN, command):
             found.append("{} {}".format(pid, command[:90]))
@@ -564,6 +574,17 @@ def ensure_corpus(volume: str, name: str, scale: str, seed: int, factor: float,
     """
     base = corpus.corpus_dir(volume, name, scale, seed)
     sidecar = os.path.join(base, "rbench.json")
+
+    def build() -> dict:
+        shutil.rmtree(base, ignore_errors=True)
+        ensure_space(volume, int(corpus.estimated_bytes(name, factor) * 1.4), {base})
+        started = time.monotonic()
+        built = corpus.build(volume, name, seed, scale, factor)
+        print("  built {:<10} {:>7} files  {:>9}  in {:.1f}s".format(
+            name, built["file_count"], human(built["total_bytes"]),
+            time.monotonic() - started))
+        return built
+
     manifest = None if rebuild else corpus.load(volume, name, scale, seed)
     ceiling = None
     if manifest is not None and manifest.get("factor") == factor:
@@ -578,29 +599,33 @@ def ensure_corpus(volume: str, name: str, scale: str, seed: int, factor: float,
     else:
         manifest = None
 
-    if manifest is None:
-        shutil.rmtree(base, ignore_errors=True)
-        ensure_space(volume, int(corpus.estimated_bytes(name, factor) * 1.4), {base})
-        started = time.monotonic()
-        manifest = corpus.build(volume, name, seed, scale, factor)
-        print("  built {:<10} {:>7} files  {:>9}  in {:.1f}s".format(
-            name, manifest["file_count"], human(manifest["total_bytes"]),
-            time.monotonic() - started))
+    fresh = manifest is None
+    if fresh:
+        manifest = build()
         ceiling = None
 
-    if ceiling is None:
+    while ceiling is None:
         tree = os.path.join(base, "tree")
         started = time.monotonic()
         oracle = run_oracle(tree, manifest["min_size"], oracle_py)
         truth = truth_groups(manifest)
         # The answer key and the frozen oracle have to agree before anything is
-        # measured against either. If they do not, the disagreement is the
-        # story, and no timing taken today would mean anything.
+        # measured against either. A corpus dir on a shared volume can outlive
+        # the run that made it and be edited by something else in between —
+        # the Python bench's own rescan gate rewrites files in place and
+        # leaves them that way — so the first disagreement buys a rebuild. The
+        # second is a real disagreement between the generator and the oracle,
+        # and no timing taken today would mean anything.
         if group_set(truth) != group_set(oracle["groups"]):
-            raise Fatal(
-                "the oracle disagrees with corpus construction on {}: {}"
-                .format(name, describe_groups(group_set(truth),
-                                              group_set(oracle["groups"]))))
+            complaint = describe_groups(group_set(truth), group_set(oracle["groups"]))
+            if fresh:
+                raise Fatal("the oracle disagrees with corpus construction on "
+                            "a freshly built {}: {}".format(name, complaint))
+            print("  {} does not match its manifest ({}); rebuilding"
+                  .format(name, complaint))
+            manifest = build()
+            fresh = True
+            continue
         ceiling = {
             "oracle_sha": oracle_sha,
             "generator_version": corpus.GENERATOR_VERSION,
@@ -912,9 +937,19 @@ def geomean(values) -> float:
 
 
 def spread(values) -> float:
-    """Half the peak-to-peak of a set of ratios, as a fraction."""
-    values = list(values)
-    return (max(values) - min(values)) / 2.0
+    """Half the interquartile range of a set of ratios.
+
+    Peak-to-peak would be reporting the one round in nine where something else
+    on this machine woke up, which says more about the machine than about the
+    candidate. The score is a median; this is the dispersion a median carries.
+    """
+    values = sorted(values)
+    count = len(values)
+    if count < 4:
+        return (values[-1] - values[0]) / 2.0
+    low = statistics.median(values[:count // 2])
+    high = statistics.median(values[(count + 1) // 2:])
+    return (high - low) / 2.0
 
 
 def render(scenarios: dict) -> str:
@@ -1207,13 +1242,23 @@ def _locked(args, root, note, halve, busy) -> int:
     print("\n({})".format(out_path))
 
     if args.calibrate:
-        deltas = [abs(scenarios[n]["ratio"] - 1.0) for n in scenarios]
-        widest = [spread(scenarios[n]["ratios"]) for n in scenarios]
-        floor = max(max(deltas), max(widest))
-        print("\nNOISE FLOOR: ±{:.1%}  (worst median deviation from 1.00: {:.1%}; "
-              "worst within-scenario spread: {:.1%})".format(
-                  floor, max(deltas), max(widest)))
-        print("A score that moves by less than this has not moved.")
+        # The baseline was timed against itself, so every one of these ratios
+        # is known to be exactly 1.00 and every departure from it is this
+        # machine. The headline is the worst median, because the median is the
+        # statistic the score is built out of; the spreads are printed beside
+        # it so nobody mistakes a quiet scenario for a loud one.
+        deltas = {n: abs(scenarios[n]["ratio"] - 1.0) for n in scenarios}
+        widest = {n: spread(scenarios[n]["ratios"]) for n in scenarios}
+        worst = max(deltas, key=deltas.get)
+        floor = deltas[worst]
+        print("\nNOISE FLOOR: ±{:.1%}   (worst scenario: {} at {:.4f})".format(
+            floor, worst, scenarios[worst]["ratio"]))
+        print("  per-round dispersion, worst scenario: {} at ±{:.1%}".format(
+            max(widest, key=widest.get), max(widest.values())))
+        print("  geomean of a baseline against itself: {:.4f}".format(
+            geomean(scenarios[n]["ratio"] for n in scenarios)))
+        print("\nA score that differs from 1.0000 by less than the noise floor "
+              "has not moved.")
         return 0
 
     if not complete:
