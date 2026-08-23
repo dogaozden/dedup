@@ -1,0 +1,11 @@
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+$ cargo fmt --check
+(no output: clean)

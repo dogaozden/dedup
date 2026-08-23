@@ -52,6 +52,15 @@ impl FileRec {
         (self.dev, self.ino)
     }
 
+    /// Name a read of this file at `offset`, for the seek count.
+    pub fn at(&self, offset: u64) -> crate::effort::At {
+        crate::effort::At {
+            dev: self.dev,
+            ino: self.ino,
+            offset,
+        }
+    }
+
     pub fn head(&self) -> &[u8] {
         self.retained.as_ref().map_or(&[], |kept| &kept.head)
     }

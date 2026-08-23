@@ -32,15 +32,20 @@ pub const HASH_BATCH: usize = 64;
 /// A compare pass that strips off nothing but its own pivot, with this many
 /// blocks still pending, means the pivot loop is going quadratic.
 pub const PARTITION_FANOUT: usize = 256;
+/// How many files the `spinning` profile interleaves in one comparison pass.
+/// A round holds one `SLOW_CHUNK` per member, so eight of them is exactly
+/// `COMPARE_BUDGET` — the widest a group can be read before the round-robin
+/// between its members turns a sequential read into a seek storm.
+pub const SPIN_INTERLEAVE: usize = 8;
 /// Ceiling on head bytes carried from stage 3 to stage 5 so the compare does
 /// not read them a second time.
 pub const RETAIN_BUDGET: usize = 128 * 1024 * 1024;
 /// How many small-file candidates ride between checks of RETAIN_BUDGET.
 pub const RETAIN_CHECK_SPAN: usize = HASH_BATCH * 64;
 
-/// Bump when the stored columns change meaning. 3: every row carries the time
-/// it was written, which is what the racily-clean rule reads.
-pub const CACHE_SCHEMA: i64 = 3;
+/// Bump when the stored columns change meaning. 4: a column for the head-only
+/// digest the `spinning` profile reads, kept apart from the two-ends one.
+pub const CACHE_SCHEMA: i64 = 4;
 /// Entries not seen in this long are dropped.
 pub const CACHE_TTL_DAYS: i64 = 180;
 /// The coarsest granularity any target filesystem records mtime at — HFS+

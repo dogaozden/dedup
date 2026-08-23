@@ -1,0 +1,32 @@
+$ python3 rust/evidence/scripts/spinning_mutants.py
+
+Baseline: the tree as written.
+  compare::tests all pass
+
+mutant cohort-width               reads SPIN_INTERLEAVE + 1 files at once instead of SPIN_INTERLEAVE
+  caught by the_cohorts_never_hold_more_than_the_cap_open_at_once
+
+mutant drop-leftovers             never offers a non-matching member to a later pivot
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, a_pivot_alone_and_unreadable_leaves_nothing_behind, a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in, a_run_holding_the_pivot_brings_whole_clusters_with_it, equal_members_split_across_cohorts_are_still_found, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape
+
+mutant forget-the-partition       carries only each cluster's representative, losing what a pass proved
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, a_run_holding_the_pivot_brings_whole_clusters_with_it, equal_members_split_across_cohorts_are_still_found, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape
+
+mutant settle-on-a-lost-pivot     settles the pivot's class even though a cohort could not read it
+  caught by a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in
+
+mutant strand-a-dead-cluster      drops the other members of a cluster whose representative went away
+  caught by a_cluster_whose_representative_goes_away_keeps_its_other_members
+
+mutant merge-on-the-first-cohort  stops sweeping once the pivot has matched somebody
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_wider_than_the_cap_still_comes_back_whole, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_cohorts_never_hold_more_than_the_cap_open_at_once
+
+Baseline: the same tree, built and run through spinning_meets_the_rest.py.
+  every combination behaves
+
+mutant one-cache-column           files the head-only probe and the two-ends probe in the same column
+  caught: warm flash then spinning reported [('a.bin', 'b.bin')], oracle [('a.bin', 'b.bin', 'e.bin')]
+
+every mutant was caught
+
+exit=0

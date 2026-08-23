@@ -1723,3 +1723,388 @@ by the script above, which is where a real pty belongs.
 
 **Verdict:** KEPT. Touches approved M5 code; the diff is the `poll` call, the
 two endings converging, and the skipped cursor restore.
+
+---
+
+## 2026-08-23 — M6, the spinning profile
+
+Commissioned after a real scan of a USB spinning drive sat in the compare stage
+for tens of hours at 1.5% CPU. The access patterns were tuned on a RAM disk
+where seeks are free. This makes the algorithm device-aware.
+
+### What the profile actually changes
+
+Four things, all behind `--profile spinning`, none of them reachable by default
+unless the disk positively reports rotational media:
+
+| stage | flash | spinning |
+|---|---|---|
+| ends probe | head 4 KiB + tail 4 KiB, one open | head 4 KiB only |
+| deep head | `HEAD_BYTES..DEEP_HEAD` | unchanged |
+| sample | 8 windows × 64 KiB past 8 MiB | skipped |
+| compare run | 4 MiB, shrinking with group width | 16 MiB, fixed |
+| compare width | the whole group at once | 8 at a time, partition carried |
+| readers | 8 random / 8 sequential on flash | 1 and 1 |
+
+The removed stages only ever narrowed, so removing them cannot change an
+answer — it only sends more candidates to the comparison, which reads bytes.
+That is the whole correctness argument for items 1 and 2, and it is why the
+differential found nothing to fix there.
+
+### The capped comparison, and why it is exact
+
+The one real algorithm change. A cluster is a set of records already proved
+byte-equal. Each round takes one cluster's representative as pivot and compares
+it, in cohorts of at most 8, against every other cluster's representative.
+`split_identical` on a cohort is the unchanged lockstep comparison, so its runs
+are exactly the cohort members whose bytes agree to the last one; byte equality
+is transitive, so a representative that matches the pivot brings its cluster,
+and two representatives that match each other fuse theirs. It is the same
+reasoning `partition_blocks` has always rested on, where a run is every block
+equal to the run's first.
+
+For the ordinary case — a wide group of genuine copies — this is one sweep: the
+pivot is re-read once per cohort and everyone else once. At 32 copies of a
+20 MiB file that is 720 MiB read against flash's 656 MiB, for 172 seeks against
+512.
+
+### Numbers
+
+Seeks, `-j 1`, one group of N identical files (`evidence/m6-seeks.txt`):
+
+| files | MiB each | flash | spinning |
+|---|---|---|---|
+| 4 | 20 | 64 | 20 |
+| 8 | 20 | 128 | 40 |
+| 16 | 20 | 256 | 86 |
+| 32 | 20 | 512 | 172 |
+| 6 | 100 | 216 | 60 |
+
+Between 3.0x and 3.6x fewer, and stable to the count across repeated runs at
+one reader. At 32 copies the flash total decomposes as 64 end probes (two
+seeks each), 32 deep heads, 256 sample windows and 192 compare rounds — the
+sample stage alone is half of it, which is why SPIN.md named it.
+
+**HDD wall-clock unvalidated.** No rotational drive is available; the only one
+on this machine is fenced. Nothing here claims a speedup, only a seek count and
+a proof of correctness.
+
+### The bug this milestone could have shipped
+
+The end probe's digest under `spinning` covers the head alone. Under `flash` it
+covers head and tail. Both were going to be written to the cache's `ends`
+column. A scan that found one file's digest remembered and had to read
+another's would then have compared a head against a head-and-tail — and two
+identical files would have landed in different buckets and never been reported.
+
+It is invisible to everything: the gate never passes `--profile`, a warm scan
+under one profile alone is self-consistent, and a cold scan has no cache to be
+wrong about. It needs a warm cache, a mixed state, and a profile switch.
+
+The fix is a column of its own (`Field::Head`, `CACHE_SCHEMA` 3 → 4, so caches
+written by an earlier build are discarded once). The regression check is in
+`evidence/scripts/spinning_meets_the_rest.py`, and `spinning_mutants.py` builds
+the one-column version and shows it losing the duplicate:
+
+```
+mutant one-cache-column           files the head-only probe and the two-ends probe in the same column
+  caught: warm flash then spinning reported [('a.bin', 'b.bin')], oracle [('a.bin', 'b.bin', 'e.bin')]
+```
+
+### Chosen divergences
+
+- **`auto` never guesses `spinning`.** An unknown medium gets `flash` plus one
+  line on stderr suggesting the flag. SPIN.md asks for this, and the reason is
+  that external SSD enclosures are the common case among devices that do not
+  report; treating one as a spinning disk costs far more than the reverse.
+- **The hint prints after the scan, not before it.** The volume probe is
+  collected inside `find_duplicates`, deliberately, so the walk runs while the
+  probe is in flight. Blocking on it in `main` to print advice sooner would
+  undo that. The advice is for next time either way.
+- **`seeks` is in the report JSON.** Not part of the conformance protocol —
+  `conformance/run.py:127` checks only that the six protocol keys are present,
+  and the oracle's own driver already emits three extra keys of its own. A
+  number nobody can read out of a run is a number nobody can check.
+- **Counting seeks costs a mutex per read block.** An atomic pair could tear
+  and report a jump that did not happen. The lock is held for two comparisons
+  against a read syscall that moves up to 16 MiB.
+- **`Device::random_jobs`/`sequential_jobs` take a profile.** The device says
+  what it is; the profile says what to do about it. Forcing `spinning` on a
+  disk that reports solid state has to give one reader, or forcing it would not
+  be worth having.
+
+### One that was worth the detour
+
+The first mutation run had a survivor. The branch that handles a pivot going
+away mid-sweep is only reachable if a file becomes unreadable *between* two
+cohorts of the same round — a race no filesystem test can stage, so the test
+suite could not reach it, and a mutant that deleted it passed everything.
+
+Rather than leave it or fake a test, the sweep's bookkeeping came out into
+`Round`, which moves members between clusters and reads nothing. The race is
+then three arguments, and
+`a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in` drives it
+directly. It also made the answer clearer: settling the pivot's class when half
+the sweep never saw the pivot would strand its members, because a file equal to
+them is still sitting in the pool and they have left it.
+
+All seven mutants are caught now — six against the sweep, one whole-program
+mutant against the cache column (`evidence/m6-mutants.txt`).
+
+### Standards
+
+`cargo test`: 131 passed, 0 failed (111 → 131; 20 new). clippy `-D warnings`
+clean, `fmt --check` clean, `--gate all` 33/33 with no profile flag.
+
+---
+
+## 2026-08-23 — M5.1, the pre-flight menu and --help
+
+Built after M6, so `--profile` is in the flag table, in `--help`, and in the
+menu from the start rather than being added to three places later.
+
+### One table, and what makes it one
+
+`src/cli.rs` carries `FLAGS`. Three readers:
+
+- the parser, which looks a word up in the table and asks it how many more
+  words to take;
+- `help_text()`, which renders it;
+- the menu, which names seven of its entries and takes their labels, prompts,
+  help lines and defaults from them.
+
+The part that does the real work is smaller than the table: `Flag::apply` is
+the only function that turns a word into a setting. The parser calls it. The
+menu calls it on a throwaway `Options` to decide whether a field is valid. So
+"the menu rejects it with the parser's own error message" is not a thing that
+had to be arranged — there is one message because there is one function.
+
+`--help` used to exit 2 with "unknown argument", which is the bug M5_1-MENU.md
+opens with.
+
+### The menu is an argument list
+
+The rule is that the menu "only ever BUILDS the same options struct the CLI
+builds". The strongest way to keep that is not to build an options struct at
+all: `Form::to_arguments` returns a command line, and `main` reads it with
+`parse_arguments_from` — the same call, the same checks, the same errors. A
+capability the flags do not have would have to be a flag the parser accepts.
+
+It also settles what happens to the flags the form does not show. They are kept
+verbatim from the original command line and put back, so `--report-json`,
+`--hard`, `-i` and the rest survive a trip through the form untouched. There is
+a test for exactly that, because dropping one silently is the obvious way this
+design fails.
+
+### Chosen divergences
+
+- **`--stage` is documented.** It is a real flag the parser accepts, and the
+  one-table rule says every accepted flag appears in the help. Hiding it would
+  have meant an exception, and the exception is where the drift starts. Its
+  help line says what it is: groups nothing has read, which `--auto` refuses.
+- **`-q` and `--verify` are documented as ignored.** They are accepted so a
+  command line written for the Python tool still runs. Saying so is better than
+  a help text that implies they do something.
+- **The menu's list fields split on commas.** `--ext` and `--skip-ext` are
+  comma lists to the parser already. `-x` is not: a glob containing a comma
+  cannot be typed into the form. That is the form doing LESS than the flag,
+  which is the safe direction — the rule forbids gaining a capability, not
+  lacking one — and the command line still takes such a glob.
+- **The form is a two-mode screen**, browsing and editing, rather than typing
+  straight into the selected row. `q` has to mean "leave" while browsing and
+  the letter q while typing, and the browser next door is already modal.
+- **Below 54x16 nothing is accepted.** M5_1-MENU.md does not ask for this; it
+  is REVIEW-M5's second finding applied one screen earlier. A scan started on
+  settings nobody could see is the same shape of mistake as a deletion
+  confirmed on a dialog nobody could see, so the model refuses everything but
+  the way out and the paint layer draws a resize line. A test renders both
+  sides of both boundaries and asserts the two agree.
+
+### One that was worth the detour
+
+The pty case for the cache switch first asserted on the screen — that the row
+read `no-cache on` after a space. It failed while the toggle worked perfectly.
+ratatui repaints only the cells that changed, so on a later frame only the word
+`on` crosses the pty, and searching the stream for the phrase proves nothing in
+either direction. REVIEW-M5 caught the same class of thing in its own harness
+before it caught anything in the program.
+
+The case now asserts on the byte count the scan reported: warm cache 12,288
+bytes, the same run with the switch on 4,206,592. That is the toggle arriving
+at the options, not a phrase arriving at a terminal.
+
+### The golden test as a guard
+
+`evidence/scripts/menu_mutants.py` builds six ways of breaking the one-table
+rule — a help renderer that skips a flag, a hand-written help line for a flag
+that does not exist, a default in the table that the code does not have, a menu
+row that prints a default of its own, a form that drops a field on the way out,
+and a form that skips validation — and each is caught. The rule is enforced,
+not merely asserted.
+
+### Standards
+
+`cargo test`: 163 passed, 0 failed (131 → 163; 32 new, 21 of them the menu's
+and the table's). clippy `-D warnings` clean, `fmt --check` clean, `--gate all`
+33/33. M6's differential and combination checks were re-run after the parser
+was rebuilt on the table, and both still pass.
+
+### After both claims were written
+
+Two things the claims prompted, recorded here rather than folded back into
+them:
+
+- **The browse rule was written twice.** `menu_wanted` and `browse` each
+  decided independently whether this run is a browsing run, and two copies of
+  one rule drift. They now share `browsing_flags`, and
+  `the_menu_opens_for_exactly_the_runs_the_browser_opens_for` walks all eight
+  combinations of `--list`, `-i` and `--auto` to hold them together. A run that
+  stopped to be asked about its options and then never browsed is the failure
+  this pins.
+- **`--profile` reaches the browser too**, not only `--auto` — `main::browse`
+  hands the scan's profile to the `Compare` the browser deletes through. The
+  combination checks now drive the real browser through a pty under both
+  profiles and compare what is left on disk. The first version of that case
+  passed while deleting nothing, because the key sequence was missing the
+  apply keystroke; two runs that both delete nothing agree about everything.
+  It now asserts that something was removed before comparing, and both profiles
+  remove `b.bin` and `nested/a-copy.bin` and keep the other three.
+
+Final: `cargo test` 163 passed, clippy and fmt clean, `--gate all` 33/33, and
+every evidence script re-run against the branch tip.
+
+### What the seek counter costs
+
+The counter locks on every read block and `read_block` is the scored profile's
+hot path, so it was measured rather than argued about
+(`evidence/scripts/seek_counter_cost.py`, against a build of `main` at
+`baf9e25` on the same tree):
+
+- `bytes_read`, `opens`, `files_seen`, `bytes_seen` and the groups are
+  **identical** between the two builds at `-j 1` and `-j 8`. That is the part
+  RBENCH's byte-determinism gate and the conformance effort check actually
+  read, and it does not care what else is running on the machine.
+- Wall clock is **not claimed**. This box is shared with other agents and sat
+  at load average 5.1; one run of the script reported 0.18x on one half of the
+  comparison and 1.29x on the other, which is contention and nothing else. Four
+  runs with the load visible put it between 0.92x and 1.03x, which is to say no
+  effect anybody can measure here. A real figure wants a quiet machine, and the
+  script now prints the load average and the sample spread so a reader can tell
+  which kind of run they are looking at.
+
+### The one thing that could not be observed, and what was done instead
+
+`auto` picks `spinning` only for a disk that positively reports rotational
+media, and prints a hint when the disk will not say. Neither case exists on
+this machine — everything here reports solid state — so neither had been seen
+end to end, only asserted about `Wanted::resolve` in isolation. Which is the
+weaker claim: `resolve` returning the right word does not prove the scan that
+word chose is the scan that ran.
+
+`VolumeProbe::answered` (test-only) is a probe that has already answered, and
+four tests in `pipeline` now run a real scan of a real scratch tree against
+each of the three answers. `auto` on a rotational disk is asserted to come back
+with `Profile::Spinning` on the `Scan` itself, and an unknown medium to come
+back on `Flash` carrying `UNKNOWN_MEDIUM` — which is the value `main` prints.
+
+Looking for a real volume that reports unknown was the wrong way to get this,
+and I started down it before stopping: a scan of `/dev` and
+`/System/Volumes/Data` is outside the fence REWRITE.md §0 draws around this
+repo, its scratch corpora and the oracle clone. It was read-only and it was
+killed by its own timeout, and it should not have been started.
+
+### Noticed, not touched
+
+`VolumeProbe`'s doc comment still says asking what kind of disk this is "means
+running `diskutil`, and a subprocess costs more than the whole scan of a small
+tree does". Round one replaced that subprocess with the IOKit calls in
+`sys.rs`, so the reason given for the probe being on a thread is no longer the
+true reason — the thread may well still be worth having, but not for that. It
+is not this branch's code and not this branch's change to make.
+
+---
+
+## 2026-08-23 — REVIEW-M5_1 binding item 1: the menu spun on a dead terminal
+
+The reviewer is right and the diagnosis is exact. `menu.rs` read one of
+`wait_for_terminal_input`'s three answers and fell through to a blocking
+`event::read()` on the other two. `Waited` — nothing typed in 250 ms — is the
+ordinary state of a form somebody is reading, so the process spent almost all
+its time inside that read, where the hangup check cannot be reached. A terminal
+dying there is readable forever and empty forever, and crossterm loops on
+`read` inside `try_read` producing no event and no error. One core, until
+somebody notices.
+
+This is the bug `09599c6` ended for the browser. I put it back one screen in
+front, in a loop I wrote by looking at the browser's and taking the shape but
+not the reason. The browser's `match` has three arms because there are three
+answers; I read the one I was thinking about.
+
+### Two defects, not one
+
+Fixing the poll left the exit code at 101 — the number the review noticed and
+asked to have run down. It is ratatui's `Terminal::drop`, which shows the
+cursor and `eprintln!`s when it cannot, onto the descriptor that just died. The
+browser already carries the answer four lines from the code I copied
+(`std::mem::forget` on the terminal-gone path) and I had not copied that either.
+
+I built the in-between version rather than reasoning about it: three arms and
+no `mem::forget` leaves with 101 on all three runs; with it, 1. That is the
+same ending the browser gives the same event, so `ask` now returns
+`Answer::Scan | Quit | TerminalGone` and `main` turns the last into exit 1.
+
+### The test that stopped testing what it said
+
+`tui-terminal-death.py` passed on the broken build about half the time, and its
+`hangup` case had silently stopped covering the browser altogether — `-i` used
+to reach the browser directly, and once the menu went in front, the same script
+was testing the menu and never said which. The old script asserted nothing
+about the screen it was on, so adding a screen changed what it covered without
+changing a line of it.
+
+Three changes:
+
+- A fixed 1.5 s delay before the terminal is taken away, so the process is
+  provably past the poll and inside the read. Closing the master as soon as the
+  paint pauses lands inside the 250 ms window about half the time.
+- Four scenarios instead of two — `keys` and `hangup`, each for the menu and
+  for the browser — and each one asserts which screen it reached before it
+  tests anything. `reach()` fails the scenario if the screen is not the one it
+  names.
+- A panic exit is a failure. Leaving is not enough; leaving on purpose is the
+  requirement, and 101 is how the second defect showed itself.
+
+Both halves are now mutants in `menu_mutants.py`, built and driven through a
+pty: `one-of-three-answers` fails `hangup/menu` with SPINNING, and
+`drop-the-dead-terminal` fails it with the panic. Both leave `hangup/browser`
+green, which is the per-screen pinning doing its job.
+
+### Numbers
+
+`evidence/m5_1-hangup-before-and-after.txt`, both builds named by sha256
+because a shared `CARGO_TARGET_DIR` will otherwise hand you the wrong binary
+and a clean result you did not earn:
+
+| | b102625 (`a7869954`) | this branch (`d7002edc`) |
+|---|---|---|
+| 3 runs, 1.5 s delay | SPINNING ×3, ~5.0 CPU-s each in a 5 s window | LEFT ×3, exit 1, 0.01 CPU-s |
+
+`cargo test` 163 passed, clippy and fmt clean, `--gate all` 33/33.
+
+### Non-binding notes taken
+
+- The M6 claim now names where the seek win lives — wide groups of large files
+  — and says small-file trees seek slightly more. Its own differential table
+  showed that already, but a reader who saw only the seeks table would have
+  taken 3.0x-3.6x as universal.
+- Three stale prose numbers corrected in the entries above: 158 and 159 tests
+  to 163, and "six mutants" to seven for M6's script. Corrected in place rather
+  than in a new note because they are arithmetic about this branch, not
+  findings; the evidence files were right throughout and only the prose drifted.
+  Recording the correction here so the change is not silent.
+- The one-table section now says plainly that there are two tables, `HELP_FLAGS`
+  beside `FLAGS`, and why that is not a drift hole.
+
+I did not touch the non-binding items the reviewer marked "not this branch's":
+the `-j1` attached-short-option gap, which `main` shares, and `VolumeProbe`'s
+stale doc comment.

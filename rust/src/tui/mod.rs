@@ -6,6 +6,7 @@
 //! `--auto` uses. Splitting it that way is what makes a program that deletes
 //! files testable without a terminal in the test.
 
+pub mod menu;
 pub mod model;
 pub mod view;
 
@@ -119,7 +120,10 @@ enum Ended {
 }
 
 /// Whether the terminal has gone away, asked without waiting for anything.
-fn hung_up() -> bool {
+///
+/// Shared with the pre-flight menu, which asks the same question one screen
+/// earlier and must answer it the same way.
+pub(super) fn hung_up() -> bool {
     sys::wait_for_terminal_input(std::time::Duration::ZERO) == sys::Input::HungUp
 }
 

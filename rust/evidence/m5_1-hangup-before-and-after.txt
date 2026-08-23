@@ -1,0 +1,17 @@
+The bug, before the fix and after it, with the review's own driver.
+
+b102625 (the claimed tip REVIEW-M5_1 read), sha256 a78699545e1f789d:
+$ python3 rust/evidence/scripts/hangup_deterministic.py <b102625 build> 1.5 3
+  run 1: SPINNING(menu, 5.03 CPU-s in 5s)
+  run 2: SPINNING(menu, 5.04 CPU-s in 5s)
+  run 3: SPINNING(menu, 5.06 CPU-s in 5s)
+SPUN 3/3
+exit=1
+
+and the same script against this branch, sha256 d7002edcf24a6b5c:
+$ python3 rust/evidence/scripts/hangup_deterministic.py rust/target/release/dedup-rs 1.5 3
+  run 1: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 2: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 3: LEFT(menu, exit=1, 0.01 CPU-s)
+SPUN 0/3
+exit=0

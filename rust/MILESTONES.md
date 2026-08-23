@@ -1097,3 +1097,715 @@ The `{stage}` token is in this template and only this one, for the reason set
 out under the M2 claim: the M1 gate grades the size-bucket candidate set, which
 a finished pipeline no longer reports by default. Each individual milestone
 claim above uses the prescribed template without it.
+
+---
+
+## M6 — the spinning profile — CLAIMED
+
+`--profile flash|spinning|auto`, default `auto`. `auto` picks `spinning` only
+for a disk that positively reports rotational media; solid state and "no idea"
+both get `flash`, which is today's behaviour byte for byte. `flash` is
+untouched, and the gate below is run with no profile flag at all, which is the
+proof of that.
+
+Under `spinning` the pipeline drops the tail probe (the end stage reads the
+head alone), drops the sample stage entirely, keeps the comparison run at
+`SLOW_CHUNK` however wide the group, reads with one thread, and compares groups
+wider than `SPIN_INTERLEAVE` (8) a cohort at a time, carrying the proved
+partition between passes. Members are read more than once by design.
+
+**HDD wall-clock unvalidated.** No rotational drive is available to an agent —
+the only one on this machine is fenced — so no speed claim is made here. What
+is claimed is correctness, which is proved against the oracle, and the access
+pattern, which is counted. A user-supervised run on a real spinning disk is
+still owed.
+
+### The gate, with no profile flag
+
+Run from the repository root:
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/m6-gate.txt`, quoted from the file:
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0. Nothing in the harness passes `--profile`, so every one
+of those 33 checks ran the flash pipeline exactly as M5 left it.
+
+### Groups are profile-independent
+
+```
+python3 rust/evidence/scripts/spinning_differential.py
+```
+
+Eight scratch trees, each shaped at something the profile removes — the tail
+page it no longer probes, the middle it no longer samples, a divergence in the
+last kilobyte, equal members either side of a cohort boundary, a group three
+times the cohort width, hardlink clusters, unreadable members, and a seeded
+jumble across every size class. On each tree the oracle, `--profile flash`,
+`--profile spinning` and a flagless run are compared. Captured to
+`evidence/m6-differential.txt`:
+
+```text
+tree                  files  groups   flash seeks  spinning seeks   flash bytes  spinning bytes  verdict
+tails                     5       2            18              19        319488          389120  same
+middles                   3       1            40              11      31002624        31457280  same
+last-chunk                3       1            30              14      38805504        56623104  same
+cohort-boundary          16       4            64              72      33554432        49807360  same
+wide                     24       1           336             102     239075328       254607360  same
+links                     6       2            15              16       1048576         1048576  same
+unreadable                5       1            39              12      29884416        28311552  same
+mixed                    46      10           102              83      20717575        45826056  same
+
+8 trees, every profile identical to the oracle
+```
+
+### Seek accounting
+
+```
+python3 rust/evidence/scripts/spinning_seeks.py
+```
+
+`seeks` counts reads that did not continue where the previous read stopped. It
+is incremented at the read, from the offsets the process asked for, and never
+derived from a file's size — the rule `opens` and `bytes_read` are already
+held to. It rides in the `--report-json` object beside them; the conformance
+protocol neither asks for it nor reads it.
+
+Every measured run is at `-j 1`: concurrent readers interleave, and that
+interleaving belongs to the scheduler rather than to the pipeline. Captured to
+`evidence/m6-seeks.txt`:
+
+```text
+One group of N identical files, one reader (-j 1).
+
+files    MiB   flash seeks   spinning seeks   ratio      flash MiB   spinning MiB   groups
+    4     20            64               20     3.2x        82.0           80.0        1
+    8     20           128               40     3.2x       164.0          160.0        1
+   16     20           256               86     3.0x       328.0          359.9        1
+   32     20           512              172     3.0x       656.0          719.8        1
+    6    100           216               60     3.6x       603.0          600.0        1
+
+Same corpora at the default reader count, for scale only (threads interleave, so these move between runs):
+files    MiB   flash seeks   spinning seeks
+    4     20            59               20
+    8     20           123               40
+   16     20           253               86
+   32     20           512              172
+    6    100           192               60
+
+spinning issues fewer seeks on every corpus: between 3.0x and 3.6x fewer
+HDD wall-clock unvalidated: no rotational drive is available here.
+```
+
+The bytes column is the price: at 32 copies, 10% more bytes read for a third of
+the seeks. That is the trade SPIN.md asks for by name.
+
+**Where the win is, and where it is not.** These ratios belong to the corpus
+SPIN.md commissioned the profile for: wide groups of large files, which is what
+a USB disk full of media looks like and what the real scan that prompted this
+was stuck on. On small-file trees `spinning` issues slightly MORE seeks than
+`flash`, because re-reading a pivot costs more than the skipped tail probes
+save — the differential table above shows it (`tails` 18 → 19,
+`cohort-boundary` 64 → 72). Read "3.0x-3.6x fewer" as a statement about large
+wide groups, not about every tree.
+
+### What the counter costs the profile that is scored
+
+The counter takes a lock on every read block, and `read_block` is the default
+profile's hot path. So the default profile was run against a build of `main` at
+`baf9e25` on the same tree:
+
+```
+python3 rust/evidence/scripts/seek_counter_cost.py \
+  <main-build> rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m6-counter-cost.txt`:
+
+```text
+corpus: 156 MiB, 4012 files
+load average: 5.14 5.49 5.26  (this machine is shared; a figure above about 1 makes the timings below indicative only)
+
+-j 1   (7 runs each, page cache warm, medians)
+  main            92.4 ms  (min 90.4, max 113.9)   bytes_read 170599168  opens 4048  groups 10
+  this branch     91.2 ms  (min 90.1, max 92.9)   bytes_read 170599168  opens 4048  groups 10
+  -> this branch / main = 0.987x wall clock (indicative); bytes_read, opens, files_seen, bytes_seen and the groups all identical (exact)
+
+-j 8   (7 runs each, page cache warm, medians)
+  main            61.5 ms  (min 59.0, max 68.3)   bytes_read 170599168  opens 4048  groups 10
+  this branch     58.2 ms  (min 57.6, max 59.8)   bytes_read 170599168  opens 4048  groups 10
+  -> this branch / main = 0.946x wall clock (indicative); bytes_read, opens, files_seen, bytes_seen and the groups all identical (exact)
+
+nothing the harness measures moved
+```
+
+`bytes_read`, `opens`, `files_seen`, `bytes_seen` and the groups are identical
+between the two builds — that is the part of this that is a fact, and it is
+what RBENCH's byte-determinism gate and the conformance effort check read.
+
+The wall clock is not claimed. This machine is shared with other agents and was
+at load average 5.1 throughout; an earlier run of the same script reported
+0.18x and 1.29x on the two halves of one comparison, which is contention and
+nothing else. Four runs at a load this reader can see put it between 0.92x and
+1.03x — i.e. no effect anybody can measure here — and a real figure wants a
+quiet machine.
+
+### Where `--profile` meets the other flags
+
+REVIEW-M4's first finding was a mode that changed what a group meant, in a
+combination no gate ran. `--profile` changes which bytes a digest covers, so
+the combinations were run rather than reasoned about:
+
+```
+python3 rust/evidence/scripts/spinning_meets_the_rest.py
+```
+
+```text
+cache: flash first, then spinning          ok (1 groups, the new copy joined its twins)
+cache: spinning first, then flash          ok (1 groups, the new copy joined its twins)
+cache: spinning twice                      ok (1 groups, the new copy joined its twins)
+--auto under either profile                ok (both kept a.bin, c.bin, d.bin)
+the browser under either profile           ok (both removed b.bin, nested/a-copy.bin and kept a.bin, c.bin, d.bin)
+--stage size --auto --profile spinning     ok (exit 2, nothing removed): dedup-rs: --auto cannot act on a --stage size scan
+--profile with a name it does not know     ok (exit 2): dedup-rs: --profile takes flash, spinning or auto
+
+every combination behaves
+```
+
+The cache case is the one that matters. The `spinning` end probe reads the head
+alone; the `flash` one reads both ends. Those digests cover different bytes, so
+they get different cache columns (`CACHE_SCHEMA` 4 adds `head`). Sharing one
+column would let a scan compare a remembered head-and-tail against a freshly
+read head, and two identical files would land in different buckets — a
+duplicate lost, silently, with the gate still green.
+
+### The tests are guards, not decoration
+
+```
+python3 rust/evidence/scripts/spinning_mutants.py
+```
+
+Six deliberate breaks, each one a plausible implementation of the same feature,
+built and run. Captured to `evidence/m6-mutants.txt`:
+
+```text
+mutant cohort-width               reads SPIN_INTERLEAVE + 1 files at once instead of SPIN_INTERLEAVE
+  caught by the_cohorts_never_hold_more_than_the_cap_open_at_once
+
+mutant drop-leftovers             never offers a non-matching member to a later pivot
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, a_pivot_alone_and_unreadable_leaves_nothing_behind, a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in, a_run_holding_the_pivot_brings_whole_clusters_with_it, equal_members_split_across_cohorts_are_still_found, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape
+
+mutant forget-the-partition       carries only each cluster's representative, losing what a pass proved
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, a_run_holding_the_pivot_brings_whole_clusters_with_it, equal_members_split_across_cohorts_are_still_found, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape
+
+mutant settle-on-a-lost-pivot     settles the pivot's class even though a cohort could not read it
+  caught by a_pivot_that_goes_away_mid_sweep_settles_nothing_and_goes_back_in
+
+mutant strand-a-dead-cluster      drops the other members of a cluster whose representative went away
+  caught by a_cluster_whose_representative_goes_away_keeps_its_other_members
+
+mutant merge-on-the-first-cohort  stops sweeping once the pivot has matched somebody
+  caught by a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_wider_than_the_cap_still_comes_back_whole, a_member_that_cannot_be_read_joins_no_group_and_stops_nobody_else, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_cohorts_never_hold_more_than_the_cap_open_at_once
+
+Baseline: the same tree, built and run through spinning_meets_the_rest.py.
+  every combination behaves
+
+mutant one-cache-column           files the head-only probe and the two-ends probe in the same column
+  caught: warm flash then spinning reported [('a.bin', 'b.bin')], oracle [('a.bin', 'b.bin', 'e.bin')]
+
+every mutant was caught
+```
+
+The last one is the cache column, and its symptom is the exact silent data loss
+described above.
+
+### Standards
+
+Both milestones go to one review, so this is the branch tip and its test count
+includes M5.1's. At the M6 implementation commit alone it read 131.
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+$ cargo fmt --check
+(no output: clean)
+```
+
+---
+
+## M5.1 — the pre-flight menu, and --help — CLAIMED
+
+`--help` and `-h` print real usage and exit 0; they used to exit 2 with
+"unknown argument". An interactive launch gets a form of the tool's real
+options before the scan starts. Both read one table.
+
+### One table
+
+`rust/src/cli.rs` holds `FLAGS`. The parser walks it to decide what each
+argument means, `help_text()` renders it, and the menu asks it for its fields,
+their prompts and their defaults. No flag is spelled twice anywhere, and a word
+becomes a setting in exactly one function — `Flag::apply` — so the menu
+validating a field and the parser reading an argument are the same code.
+
+Strictly there are two tables, not one: `HELP_FLAGS` sits beside `FLAGS` and is
+matched by hand before the `FLAGS` lookup, because `--help` has to win before a
+missing root can be an error. It is not a drift hole — `help_text()` renders it
+from that same constant and the golden test chains it into the set it diffs —
+but "a single source of flag truth" is a sentence about `FLAGS`, and this is
+the exception to it.
+
+```
+$ dedup-rs --help
+```
+
+Captured to `evidence/m5_1-help.txt`, quoted from the file:
+
+```text
+dedup-rs — find byte-exact duplicate files.
+
+usage: dedup-rs <root> [options]
+
+Groups of files whose bytes are identical, largest first. Nothing is
+ever called a duplicate on the strength of a hash: every group is
+read and compared. Without --list or --auto, a terminal gets the
+interactive browser.
+
+options:
+      --min-size BYTES    ignore files smaller than this
+                          (default: 10485760 bytes (10 MiB))
+      --ext LIST          only these extensions, comma-separated; repeatable
+                          (default: every extension)
+      --skip-ext LIST     skip these extensions, comma-separated; repeatable
+                          (default: skip nothing)
+  -x, --exclude GLOB      skip paths matching this glob; repeatable
+                          (default: exclude nothing)
+  -j, --jobs N            readers to use
+                          (default: as many as the disk is worth)
+      --profile NAME      access patterns to use: flash, spinning or auto
+                          (default: auto)
+      --no-cache          read everything, remembering nothing
+                          (default: use the scan cache)
+  -l, --list              print the duplicate groups and stop
+                          (default: browse them, given a terminal)
+  -i, --interactive       browse them, and fail if there is no terminal
+                          (default: browse only when a terminal is there)
+      --auto [RULE]       delete without asking, keeping shortest, oldest or
+                          newest
+                          (default: delete nothing)
+  -y, --yes               do not ask before deleting
+                          (default: ask)
+      --hard              delete permanently instead of moving to the Trash
+                          (default: move to the Trash)
+      --report-json PATH  write the scan report here
+                          (default: a file in the temporary directory)
+      --stage NAME        size, to stop after grouping by length and report
+                          that; nothing there has been read, so --auto refuses
+                          it
+                          (default: full)
+  -q, --quiet             accepted for the Python tool's sake; ignored here
+                          (default: ignored either way)
+      --verify            accepted for the Python tool's sake; ignored here,
+                          which re-proves every group it deletes from anyway
+                          (default: ignored either way)
+  -h, --help              print this and stop
+exit=0
+```
+
+### The rule, enforced
+
+`cli::tests::the_help_text_and_the_parser_know_exactly_the_same_flags` scrapes
+every `-x`-shaped token out of the rendered help and asserts the set equals the
+table's, in both directions;
+`the_defaults_the_help_text_prints_are_the_defaults_the_code_has` compares each
+printed default against what a bare command line actually produces.
+
+A golden test that passes proves nothing on its own, so each way of breaking
+the rule was built and run:
+
+```
+python3 rust/evidence/scripts/menu_mutants.py
+```
+
+Captured to `evidence/m5_1-mutants.txt`, the six that attack the table (the
+same script's two terminal-death mutants are quoted under the re-claim below):
+
+```text
+mutant help-misses-a-flag           renders every flag but the first
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags, the_help_text_says_something_about_every_flag
+
+mutant help-invents-a-flag          hand-writes a line for a flag the parser does not accept
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags
+
+mutant help-default-drifts          says a default the code does not have
+  caught by the_defaults_the_help_text_prints_are_the_defaults_the_code_has, clearing_a_field_puts_the_default_back
+
+mutant menu-writes-its-own-default  shows a default of its own instead of the table's
+  caught by clearing_a_field_puts_the_default_back, the_form_shows_the_root_every_field_and_every_default
+
+mutant menu-drops-a-field           leaves a field out of the argument list it hands back
+  caught by a_switch_toggles_and_reaches_the_options, the_command_line_prefills_the_fields_it_names
+
+mutant menu-skips-validation        accepts whatever is typed and lets the scan find out
+  caught by a_bad_profile_is_refused_the_same_way, a_field_is_refused_in_the_field_with_the_parsers_own_words, a_refusal_is_shown_beside_the_field_it_belongs_to
+```
+
+### The menu
+
+It appears under exactly the browser's own condition — a terminal, no `--auto`,
+and either `-i` or no `--list` — checked by `main::browsing`, which is the same
+question `main::browse` asks after the scan. A piped or flagged run never
+reaches it.
+
+What it hands back is a command line. `main` reads that command line with
+`parse_arguments_from`, the same parser it read the real one with, so the form
+cannot say anything the flags cannot say and cannot quietly drop a flag it does
+not show — anything outside its seven fields rides through untouched. A field
+is checked by `Flag::apply` on a scratch `Options`, so it is refused in the
+field, in the parser's own words.
+
+Twelve model tests and six `TestBackend` snapshots cover it without a terminal.
+End to end, through a real pty against the real binary:
+
+```
+python3 rust/evidence/scripts/m5_1_menu_end_to_end.py \
+  rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m5_1-end-to-end.txt`:
+
+```text
+--help exits 0 and lists the flags       ok (exit 0, 47 lines, -h identical)
+a piped run never sees the menu          ok (2 groups printed, no menu in the output)
+enter-through equals the piped run       ok (2 groups, identical to the piped run)
+enter-through with no flags at all       ok (('huge-a.bin', 'huge-b.bin'), the 10 MiB default honoured on both sides)
+typing a min-size changes the groups     ok (1 group; the 4 KiB pair was filtered out by the typed value)
+space toggles the cache switch           ok (cold 4206592 bytes, warm 12288, switch on 4206592 — the toggle reached the options)
+esc scans nothing                        ok (exit 0, no report, nothing read)
+
+every case behaves
+```
+
+The cache switch is asserted on the bytes the scan read rather than on the
+screen: ratatui repaints only the cells that changed, so a phrase drawn into a
+later frame never reaches the pty whole — the harness mistake REVIEW-M5 caught
+in its own tooling before it caught anything in the program.
+
+### Too small to read is too small to agree to
+
+REVIEW-M5's second finding was a confirmation dialog that was never drawn and
+still acted on. Nothing in the menu deletes — it runs before a scan exists —
+but starting a scan on settings nobody could see is the same mistake, so below
+54x16 the form draws a resize line and `Form::on_key` refuses everything but
+the way out. `the_paint_and_the_model_agree_on_what_is_too_small_to_read`
+renders at both sides of each boundary and asserts the drawing layer and the
+model reach the same verdict, which is what stops the two rules drifting apart.
+
+### The gate
+
+Conformance templates are non-interactive, so the menu never appears in one.
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Captured to `evidence/m5_1-gate.txt`:
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The command exited 0.
+
+### Standards
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+$ cargo fmt --check
+(no output: clean)
+```
+
+---
+
+## M5.1 — RE-CLAIMED after REVIEW-M5_1.md
+
+Binding item 1 is fixed. It was two defects in the same eight lines, and the
+review found the first; running the fix down found the second.
+
+**The spin.** `menu.rs`'s loop read one of `wait_for_terminal_input`'s three
+answers. On `Waited` — nothing typed inside 250 ms, which is the ordinary state
+of a form somebody is reading — it fell through to a blocking `event::read()`,
+and from there the hangup check was unreachable. A terminal that dies while the
+process sits in that read is readable forever and empty forever, and crossterm
+answers by looping on `read` inside `try_read`: no event, no error, one core at
+100%. The browser has consumed all three answers since `09599c6`; the menu,
+added one screen in front of it, did not.
+
+Reproduced before it was touched, with the review's own deterministic driver
+(kept as `evidence/scripts/hangup_deterministic.py`; the delay before the
+terminal dies is a parameter, so the process is provably past the poll). Both
+builds identified by sha256, because a shared `CARGO_TARGET_DIR` will otherwise
+hand you the wrong binary and a clean result you did not earn. Captured to `evidence/m5_1-hangup-before-and-after.txt`:
+
+```text
+b102625 (the claimed tip REVIEW-M5_1 read), sha256 a78699545e1f789d:
+$ python3 rust/evidence/scripts/hangup_deterministic.py <b102625 build> 1.5 3
+  run 1: SPINNING(menu, 5.03 CPU-s in 5s)
+  run 2: SPINNING(menu, 5.04 CPU-s in 5s)
+  run 3: SPINNING(menu, 5.06 CPU-s in 5s)
+SPUN 3/3
+exit=1
+
+and the same script against this branch, sha256 d7002edcf24a6b5c:
+$ python3 rust/evidence/scripts/hangup_deterministic.py rust/target/release/dedup-rs 1.5 3
+  run 1: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 2: LEFT(menu, exit=1, 0.01 CPU-s)
+  run 3: LEFT(menu, exit=1, 0.01 CPU-s)
+SPUN 0/3
+exit=0
+```
+
+The fix is the browser's own `match`, all three arms, so `event::read()` is
+entered only when poll has just said bytes are waiting.
+
+**The panic on the way out.** The review's step 2 asked why its patched build
+left with 101 where the browser leaves with 1. It is ratatui's `Terminal::drop`,
+which shows the cursor and `eprintln!`s when it cannot — onto the descriptor
+that just died. The browser already carries the answer (`std::mem::forget` on
+the terminal-gone path) and the menu did not. Confirmed by building the
+in-between version rather than reasoning about it: three arms and no
+`mem::forget` leaves with 101 on every run; with it, 1.
+
+`ask` now returns `Answer::Scan | Quit | TerminalGone`, and `main` gives
+`TerminalGone` exit 1 — the same ending the browser gives the same event.
+
+### The regression test, and what it was missing
+
+`tui-terminal-death.py` now runs four scenarios instead of two, each of which
+**asserts which screen it reached**:
+
+```text
+  keys/menu        PASS  'q' left the menu in 0.64s, exit 0
+  keys/browser     PASS  'q' left the browser in 0.64s, exit 0
+  hangup/menu      PASS  the menu left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+  hangup/browser   PASS  the browser left 0.05s after the terminal died, exit code 1, 0.00 CPU-seconds
+
+all scenarios passed
+```
+
+Three changes, all of them things the old script's shape allowed to go wrong:
+
+- **A fixed delay past the poll** before the terminal is taken away. Closing
+  the master as soon as the paint pauses lands inside the 250 ms window about
+  half the time, which is why the review warns not to read one green run as a
+  fix.
+- **Each screen is driven and named separately.** This is the coverage that
+  quietly disappeared when M5.1 landed: `-i` used to reach the browser, so the
+  hangup case tested the browser; after the menu went in front, the same script
+  tested the menu instead and never said so. A test that does not assert which
+  screen it is on stops covering the screen it was written for the moment
+  somebody adds another.
+- **A panic exit is a failure**, not a pass. Leaving is not enough; leaving on
+  purpose is the requirement.
+
+The `keys` cases are kept and extended to both screens, because a view that
+ignored input altogether would also not spin and would pass a hangup test on
+its own.
+
+### Both halves of the fix are guarded
+
+`menu_mutants.py` gained the two whole-program mutants, built and driven
+through a pty. Each is caught, each with its own symptom, and each **only on
+the menu** — the browser stays green, which is the per-screen pinning working:
+
+```text
+mutant one-of-three-answers         enters the blocking read when poll said nothing was typed
+  caught: hangup/menu      FAIL  the menu was still running 5s after the terminal died, 5.00 CPU-seconds in that window — SPINNING
+
+mutant drop-the-dead-terminal       lets ratatui print to a descriptor that is gone, panicking on the way out
+  caught: hangup/menu      FAIL  the menu left in 0.05s but by panicking (exit 101)
+
+every mutant was caught
+```
+
+### Standards and the gate
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+$ cargo fmt --check
+(no output: clean)
+```
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+```
+
+The end-to-end pty suite is unchanged and still passes all seven cases
+(`evidence/m5_1-end-to-end.txt`).
+
+### Non-binding notes taken
+
+- The M6 claim now says where the seek win lives — wide groups of large files —
+  and that small-file trees seek slightly more, which its own differential table
+  already showed.
+- `LOG.md`'s three stale prose numbers are corrected: 158 and 159 tests to 163,
+  and "six mutants" to seven for M6's script. The evidence files were right
+  throughout; only the prose had drifted.
+- The one-table section now says plainly that there are strictly two tables,
+  `HELP_FLAGS` beside `FLAGS`, and why that is not a drift hole.

@@ -14,7 +14,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use crate::cache::ScanCache;
 use crate::compare::{compare_stage, Compare};
 use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
-use crate::device::VolumeProbe;
+use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
 use crate::ordered::Ordered;
@@ -32,6 +32,11 @@ pub struct DupGroup {
 
 pub struct Scan {
     pub records: Vec<FileRec>,
+    /// Which profile the scan actually ran with, and the one line to say about
+    /// it if `auto` had nothing to go on. Printing belongs to `main`; deciding
+    /// belongs here, where the volume probe has been collected.
+    pub profile: Profile,
+    pub hint: Option<&'static str>,
     /// Private on purpose. The only ways out are `reported`, for the protocol
     /// report, where a size bucket is an honest answer; and `proven`, for
     /// deletion, where it is not.
@@ -73,8 +78,15 @@ impl Scan {
 }
 
 /// How much the end probe reads — for the retention decision.
-fn ends_bytes(size: u64) -> usize {
-    size.min(HEAD_BYTES as u64) as usize + usize::from(has_tail(size)) * TAIL_BYTES
+///
+/// The `spinning` profile does not go to the far end, so it has no tail to
+/// hold and its budget is the heads alone.
+fn ends_bytes(profile: Profile, size: u64) -> usize {
+    let head = size.min(HEAD_BYTES as u64) as usize;
+    match profile {
+        Profile::Spinning => head,
+        Profile::Flash => head + usize::from(has_tail(size)) * TAIL_BYTES,
+    }
 }
 
 /// Stage 1 and 2 alone: the candidate set, which is all a walk and a size
@@ -113,6 +125,9 @@ pub fn size_stage(root: &Path, filters: Filters) -> Scan {
     sort_groups(&records, &mut groups);
     Scan {
         records,
+        // Nothing here reads, so nothing here has a profile worth the name.
+        profile: Profile::Flash,
+        hint: None,
         groups,
         // Files that merely share a length. Nothing here has read a byte.
         proven: false,
@@ -135,6 +150,7 @@ pub fn find_duplicates(
     probe: &mut VolumeProbe,
     effort: &Effort,
     mut cache: Option<&mut ScanCache>,
+    wanted: Wanted,
 ) -> Scan {
     if let Some(cache) = cache.as_deref_mut() {
         cache.open_path(root);
@@ -153,6 +169,8 @@ pub fn find_duplicates(
     // stage 2 — group by size, collapse hardlinks, discard unique sizes
     let mut records = candidates(root, entries);
     let mut scan = Scan {
+        profile: Profile::Flash,
+        hint: None,
         groups: Vec::new(),
         proven: true,
         files_seen,
@@ -171,8 +189,11 @@ pub fn find_duplicates(
     // The volume probe has been running since the root was known; this is the
     // first thing that needs its answer.
     let device = probe.device();
-    let random_jobs = device.random_jobs();
-    let sequential_jobs = device.sequential_jobs();
+    let (profile, hint) = wanted.resolve(device);
+    scan.profile = profile;
+    scan.hint = hint;
+    let random_jobs = device.random_jobs(profile);
+    let sequential_jobs = device.sequential_jobs(profile);
     let random_pool = pool_of(random_jobs);
     let reader = Reader {
         root,
@@ -217,16 +238,23 @@ pub fn find_duplicates(
     // fits in RETAIN_BUDGET.
     let keep = staged
         .iter()
-        .map(|&index| ends_bytes(records[index].size))
+        .map(|&index| ends_bytes(profile, records[index].size))
         .sum::<usize>()
         <= RETAIN_BUDGET;
 
-    // stage 3 — one page from each end, in one open.
+    // stage 3 — one page from each end, in one open. On a spinning disk the
+    // page at the far end costs a seek per file and saves only the files that
+    // differ there, so the profile reads the head alone and lets the stages
+    // behind it do the separating.
+    let ends = match profile {
+        Profile::Flash => Probe::Ends { keep },
+        Profile::Spinning => Probe::Head { keep },
+    };
     let end_buckets = hash_stage(
         &reader,
         &mut records,
         &staged,
-        Probe::Ends { keep },
+        ends,
         &mut unreadable,
         cache.as_deref_mut(),
     );
@@ -274,11 +302,19 @@ pub fn find_duplicates(
     // to be worth sampling go through it: below SAMPLE_SPAN there is nothing
     // to sample, since a full read there would just be repeated by stage 5.
     // Every bucket holds one size, so a bucket is entirely on one side.
-    let big: Vec<Vec<usize>> = pending
-        .iter()
-        .filter(|bucket| records[bucket[0]].size > SAMPLE_SPAN)
-        .cloned()
-        .collect();
+    // Eight windows spread through a file is eight seeks for every member of
+    // every surviving group, which is the worst thing this program does to a
+    // spinning disk. That profile skips the stage entirely and lets the
+    // comparison do the work in one sweep per file.
+    let big: Vec<Vec<usize>> = if profile == Profile::Spinning {
+        Vec::new()
+    } else {
+        pending
+            .iter()
+            .filter(|bucket| records[bucket[0]].size > SAMPLE_SPAN)
+            .cloned()
+            .collect()
+    };
     if !big.is_empty() {
         pending.retain(|bucket| records[bucket[0]].size <= SAMPLE_SPAN);
         let mut survivors: Vec<usize> = big.into_iter().flatten().collect();
@@ -317,6 +353,7 @@ pub fn find_duplicates(
     let context = Compare {
         root,
         effort,
+        profile,
         solid: device.all_solid_state(),
         learn: cache.is_some(),
     };
@@ -398,15 +435,122 @@ pub fn report_names<'a>(records: &'a [FileRec], groups: &[DupGroup]) -> Vec<Vec<
 mod tests {
     use super::*;
     use crate::consts::TAIL_BYTES;
+    use crate::device::UNKNOWN_MEDIUM;
+
+    /// A scratch tree of two identical files, big enough to reach stage 3.
+    struct Tree(std::path::PathBuf);
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Tree {
+        fn new(name: &str) -> Tree {
+            let root = std::env::temp_dir().join(format!(
+                "feat-auto-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("a scratch directory");
+            let content = vec![0x7E_u8; DEEP_HEAD * 4];
+            for name in ["one.bin", "two.bin"] {
+                std::fs::write(root.join(name), &content).expect("a scratch file");
+            }
+            Tree(root)
+        }
+
+        fn scan(&self, solid: Option<bool>, wanted: Wanted) -> Scan {
+            let effort = Effort::default();
+            find_duplicates(
+                &self.0,
+                Filters {
+                    min_size: 1,
+                    include_ext: None,
+                    skip_ext: &[],
+                    excludes: &[],
+                },
+                &mut VolumeProbe::answered(solid, Some(1)),
+                &effort,
+                None,
+                wanted,
+            )
+        }
+    }
+
+    #[test]
+    fn auto_runs_the_spinning_pipeline_on_a_disk_that_says_it_spins() {
+        // Not just that `resolve` returns the right word — that the scan the
+        // word chose is the scan that ran, all the way down.
+        let tree = Tree::new("rotational");
+        let scan = tree.scan(Some(false), Wanted::Auto);
+        assert_eq!(scan.profile, Profile::Spinning);
+        assert_eq!(scan.hint, None);
+        assert_eq!(scan.reported().len(), 1);
+        assert_eq!(scan.reported()[0].members.len(), 2);
+    }
+
+    #[test]
+    fn auto_stays_on_flash_for_a_disk_that_will_not_say_and_says_so_once() {
+        let tree = Tree::new("unknown");
+        let scan = tree.scan(None, Wanted::Auto);
+        assert_eq!(scan.profile, Profile::Flash);
+        assert_eq!(
+            scan.hint,
+            Some(UNKNOWN_MEDIUM),
+            "an unknown medium gets the hint that names the flag"
+        );
+        assert!(scan.hint.expect("a hint").contains("--profile spinning"));
+        assert_eq!(scan.reported().len(), 1);
+    }
+
+    #[test]
+    fn a_disk_that_says_it_is_flash_gets_flash_and_no_advice() {
+        let tree = Tree::new("solid");
+        let scan = tree.scan(Some(true), Wanted::Auto);
+        assert_eq!(scan.profile, Profile::Flash);
+        assert_eq!(scan.hint, None);
+    }
+
+    #[test]
+    fn an_explicit_profile_overrules_the_disk_and_never_advises() {
+        let tree = Tree::new("forced");
+        for solid in [Some(true), Some(false), None] {
+            let scan = tree.scan(solid, Wanted::Spinning);
+            assert_eq!(scan.profile, Profile::Spinning);
+            assert_eq!(scan.hint, None);
+            assert_eq!(scan.reported().len(), 1, "and it still finds the pair");
+            let scan = tree.scan(solid, Wanted::Flash);
+            assert_eq!(scan.profile, Profile::Flash);
+            assert_eq!(scan.hint, None);
+        }
+    }
 
     #[test]
     fn the_end_probe_only_pays_for_a_tail_once_the_pages_cannot_meet() {
-        assert_eq!(ends_bytes(100), 100);
-        assert_eq!(ends_bytes(HEAD_BYTES as u64 + 1), HEAD_BYTES);
-        assert_eq!(ends_bytes((DEEP_HEAD + TAIL_BYTES) as u64), HEAD_BYTES);
+        let flash = Profile::Flash;
+        assert_eq!(ends_bytes(flash, 100), 100);
+        assert_eq!(ends_bytes(flash, HEAD_BYTES as u64 + 1), HEAD_BYTES);
         assert_eq!(
-            ends_bytes((DEEP_HEAD + TAIL_BYTES + 1) as u64),
+            ends_bytes(flash, (DEEP_HEAD + TAIL_BYTES) as u64),
+            HEAD_BYTES
+        );
+        assert_eq!(
+            ends_bytes(flash, (DEEP_HEAD + TAIL_BYTES + 1) as u64),
             HEAD_BYTES + TAIL_BYTES
+        );
+    }
+
+    #[test]
+    fn the_spinning_profile_budgets_for_no_tail_at_any_size() {
+        let spin = Profile::Spinning;
+        assert_eq!(ends_bytes(spin, 100), 100);
+        assert_eq!(ends_bytes(spin, HEAD_BYTES as u64 + 1), HEAD_BYTES);
+        assert_eq!(
+            ends_bytes(spin, (DEEP_HEAD + TAIL_BYTES + 1) as u64),
+            HEAD_BYTES
         );
     }
 }
