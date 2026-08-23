@@ -500,3 +500,96 @@ decision up rather than deciding it myself, and the m4 gate stays unrun until
 it comes back. Nothing about the cross-volume Trash path is verified by the
 referee at this point; the code for it is `trash_dir_for`, and the only thing
 that exercises it is a second volume.
+
+## 2026-08-22 — differential testing beyond the gate
+
+### Hypothesis
+
+REVIEW-M1 made the point that the gate is a floor, not a ceiling: items 1 and 2
+of that review were things the harness structurally could not catch. So the
+port should be held against the oracle on trees the conformance corpus does not
+contain, comparing the whole protocol report rather than just the groups.
+
+### What happened
+
+Two differential harnesses, both writing only to the session scratchpad and
+both reading the oracle through the harness's own `oracle_driver.py`, so the
+oracle's byte and open counts stay instrumented rather than self-reported.
+
+**Trees** (`evidence/differential-trees.txt`) — five shapes chosen for the
+places a stage changes its mind:
+
+- `boundaries` — a size class at each of 0, 1, 4095, 4096, 4097, 65535, 65536,
+  65537, 69632 and 69633, every one carrying an exact twin, a file differing
+  only in its last byte, and a file differing at the first byte past the head
+  page. That covers the HEAD_BYTES tier split, the DEEP_HEAD small-file cutoff
+  and the `has_tail` boundary at DEEP_HEAD + TAIL_BYTES.
+- `sampling` — 8 MiB exactly, 8 MiB + 1 and 8 MiB + 4096, astride the
+  SAMPLE_SPAN threshold, each with a twin, a file differing one byte in the
+  dead centre, and a file differing in its very last byte.
+- `sameends` — twelve files sharing both end pages, four distinct middles.
+- `nested` — fifty directory levels.
+- `links2` — a three-name hardlink cluster with a separate twin, a two-name
+  cluster matching nothing, and a record pinned by a name outside the tree.
+
+Each scanned under seven flag combinations (`--min-size 0/1/4096`, `-j 1`,
+`-j 4`, `--ext`, `-x`). **35 checks, 0 differing** — identical `groups`,
+`files_seen`, `bytes_seen`, `unreadable`, `bytes_read` and `opens` in every
+one.
+
+**Cache** (`evidence/differential-cache.txt`) — the interesting result. My first
+pass judged a warm scan by the harness's 5% ceiling and called three trees
+failures. They were not: the oracle re-reads them too, and for a reason worth
+writing down. The oracle only remembers a whole-file digest for a file that
+turned out to have a duplicate, and `small_file_stage` only settles a size class
+from memory when *every* member of it carries one. A size class holding a unique
+file therefore never goes warm. The 5% ceiling is a property of the `mixed`
+tree, not of the cache, and the harness only applies it there.
+
+The right criterion is that the port warms exactly as much as the oracle does,
+which is what the table now measures — including both implementations reading
+each other's database:
+
+```text
+tree               cold  warm o->o  warm o->r  warm r->r   verdict
+boundaries      1318917     954367     954367     954367   identical, and interoperable
+sameends         884736          0          0          0   identical, and interoperable
+nested            22096      22096      22096      22096   identical, and interoperable
+links2            84096      84096      84096      84096   identical, and interoperable
+
+4 tree(s), 0 differing
+```
+
+`warm o->r` is the port reading a cache the oracle wrote; `warm r->r` is the
+port reading its own. They agree to the byte, in both directions, so the schema
+means the same thing on both sides — the two are drop-in for each other on the
+same volume.
+
+### Numbers re-taken at the final commit
+
+The M2 timings were measured before the cache and deletion landed, so I re-ran
+them against the shipped binary. Unchanged within noise:
+
+```text
+warming the page cache (untimed)
+  run 1  oracle   2.353s   dedup-rs   1.011s   2.33x
+  run 2  oracle   2.314s   dedup-rs   1.028s   2.25x
+  run 3  oracle   2.396s   dedup-rs   1.009s   2.37x
+  run 4  oracle   2.331s   dedup-rs   1.012s   2.30x
+  run 5  oracle   2.627s   dedup-rs   1.127s   2.33x
+  run 6  oracle   2.459s   dedup-rs   1.040s   2.36x
+
+-j 8  median over 6 runs: oracle 2.374s, dedup-rs 1.020s -> 2.33x
+```
+
+```text
+warming the page cache (untimed)
+  run 1  oracle   7.045s   dedup-rs   5.340s   1.32x
+  run 2  oracle   7.046s   dedup-rs   5.457s   1.29x
+  run 3  oracle   7.219s   dedup-rs   5.682s   1.27x
+  run 4  oracle   7.604s   dedup-rs   5.785s   1.31x
+  run 5  oracle   7.236s   dedup-rs   5.430s   1.33x
+  run 6  oracle   7.561s   dedup-rs   5.535s   1.37x
+
+-j 1  median over 6 runs: oracle 7.227s, dedup-rs 5.496s -> 1.32x
+```
