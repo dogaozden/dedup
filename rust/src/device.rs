@@ -166,7 +166,9 @@ impl Device {
             // usually an enclosure that simply does not report, and treating
             // one of those as a spinning disk costs far more than the reverse.
             None if self.solid == Some(false) => 2,
-            None => cpu_bound(8),
+            // These stages open a file, read a page or two of it and close it
+            // again, which is `fast_bound`'s case and not `cpu_bound`'s.
+            None => fast_bound(8),
         }
     }
 
@@ -212,8 +214,25 @@ fn cpu_bound(ceiling: usize) -> usize {
 /// one structure. Measured on this machine, the small-file stage is fastest
 /// with a reader per performance core and gets steadily slower with more —
 /// an efficiency core waits for the same catalog at a lower clock, and the
-/// extra readers are contention rather than throughput. The stage that
-/// streams whole files wants the opposite and keeps `cpu_bound`.
+/// extra readers are contention rather than throughput.
+///
+/// The head, deep-head and sample probes have the same shape — one open, a
+/// page or two, close — and measure the same way over `widegroup`'s 1,827
+/// files, best of nine:
+///
+/// ```text
+///   readers        ends    deep head     compare (512 KB)
+///        1      17.91 ms    21.56 ms         5.01 ms
+///        2      10.99       12.24            3.82
+///        4       6.38        7.40            3.44
+///        8      10.25       10.54            2.79
+///       12      11.06       11.03            -
+/// ```
+///
+/// Four is 38% better than eight for the probes and 19% worse for the
+/// comparison, which is the whole distinction: the stage that streams whole
+/// files wants the cores and keeps `cpu_bound`; the stages that ask the
+/// catalog want the fast ones and no more.
 ///
 /// Where the cores are all alike this is exactly `cpu_bound`.
 pub fn fast_bound(ceiling: usize) -> usize {
@@ -374,7 +393,7 @@ mod pools {
             requested: None,
         };
         assert_eq!(device.small_file_jobs(Profile::Flash), fast_bound(8));
-        assert_eq!(device.random_jobs(Profile::Flash), cpu_bound(8));
+        assert_eq!(device.random_jobs(Profile::Flash), fast_bound(8));
         assert_eq!(device.sequential_jobs(Profile::Flash), cpu_bound(8));
         assert!(device.small_file_jobs(Profile::Flash) <= device.random_jobs(Profile::Flash));
     }
