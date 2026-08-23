@@ -634,3 +634,81 @@ whose `deletable` is false, so deleting what we can see cannot free nothing.
 Note the second case: `aa.bin` is the shorter path, so `--auto shortest` would
 have kept it and removed `pinned.bin` were the pin not there. The guard is what
 stops it, not the ordering.
+
+## 2026-08-22 — final verification sweep
+
+### What happened
+
+Rebuilt from scratch (`cargo clean` first) and re-ran everything at HEAD, so
+the numbers quoted in the claims describe the binary that is actually
+committed rather than an earlier one.
+
+```text
+$ cargo clean && cargo build --release
+     Removed 4123 files, 464.5MiB total
+   Compiling dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-rs)
+    Finished `release` profile [optimized] target(s) in 25.95s
+=== BUILD EXIT: 0 ===
+
+$ cargo test
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.17s
+clippy exit: 0
+$ cargo fmt --check
+fmt exit: 0
+```
+
+Gates and checks, all from the clean build:
+
+| check | command | exit |
+|---|---|---|
+| M2 gate | `run.py --gate m2` with the prescribed template | 0 |
+| M3 gate | `run.py --gate m3` with the prescribed template | 0 |
+| M1 gate | `run.py --gate m1`, template with `{stage}` appended | 0 |
+| M4 local | `gate_deletion`'s two local checks, reproduced | 0 |
+| differential trees | 35 checks, oracle vs port, whole report | 0 |
+| differential cache | 4 trees, both directions, shared databases | 0 |
+| M4 gate | **not run** — see MILESTONES.md | — |
+
+### One divergence I went looking for and did not find
+
+`relative_path` converts an `OsStr` with `to_string_lossy`, which would replace
+invalid UTF-8 with U+FFFD and hand a later stage a path that does not exist —
+where the oracle's Python strings round-trip arbitrary bytes through
+surrogateescape. That would be a silent mis-handling rather than a loud one,
+so it was worth testing. It cannot arise on the target platform: APFS rejects a
+non-UTF-8 filename at creation with `Errno 92, Illegal byte sequence`, so the
+name never reaches the walk. It could still matter on a mounted exFAT or NTFS
+volume or a network share, and it is written down here rather than fixed,
+because fixing it means carrying the raw `PathBuf` alongside the reported name
+on every record and that costs §6's memory budget.
+
+### Smaller divergences from the oracle, none of them gated
+
+- The oracle takes several roots (`paths` is `nargs="*"`); this takes one, which
+  is all the conformance protocol's `{root}` ever supplies. The name-dedup in
+  `fold_inode` that exists for overlapping roots is therefore unreachable here,
+  and kept because a second root is the obvious next feature.
+- `--min-size` is parsed as `u64`, so a negative value is an error; the
+  oracle's `type=int` accepts one and lets every file through.
+- The curses browser (M5) does not exist and is out of scope.
+- `getattrlistbulk(2)` is still deferred, as recorded at M1. The walk is
+  portable `read_dir`. The protocol excludes directory opens from `opens`, so no
+  gate can see it, and §6's wall-time targets are already met without it. It is
+  the obvious next performance item.
+
+### Fence
+
+Verified rather than asserted. The oracle clone at `/Users/dogaozden/ox/
+dedup-oracle` has an empty `git status` and sits at `b6dd81f`, unchanged.
+`/Users/dogaozden/AI_Projects/dedup-rs` is the only tree I wrote to, apart from
+the session scratchpad. Nothing under `/Volumes` was touched, read or scanned.
+
+One thing to flag rather than act on: `/Users/dogaozden/AI_Projects/dedup`, the
+live checkout I am forbidden to touch, holds an untracked `NOTE-FROM-OPUS.md`
+that I did not create. I looked only at `git status` there, to prove I had not
+written to it, and left the file alone.
