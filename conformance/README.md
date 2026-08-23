@@ -26,7 +26,7 @@ The template is one command line with four substitutions:
 | `{root}`  | the absolute path of the directory to scan                     |
 | `{json}`  | the absolute path where your protocol report must be written   |
 | `{flags}` | the scan flags this case calls for, already split into words   |
-| `{stage}` | nothing, for you. Ignore it; it exists for the oracle (§6)     |
+| `{stage}` | nothing, for you — ignore it, unless your pipeline has grown content stages (§3, M1) |
 
 The template is split with shell word-splitting rules once, then each token is
 substituted, so a path containing a space stays one argument.
@@ -134,10 +134,17 @@ one.
 
 **M1 — walk parity.** `{stage}` puts the oracle in size-grouping mode, so what
 it reports is the candidate set: every size bucket holding two or more records,
-after hardlink collapse and the filters. Your M1 binary has no content stages
-yet, so what it naturally reports *is* that candidate set — no special flag on
-your side. Checked: identical group listing, identical `files_seen` and
-`bytes_seen`. Byte and open counts are not checked here.
+after hardlink collapse and the filters. A binary with no content stages yet
+naturally reports that same candidate set — no special flag needed. Once your
+pipeline has grown content stages, it may implement `--stage size` with exactly
+that behavior — real walk, hardlink collapse, unique-size discard, the same
+sort, the same protocol report — and append `{stage}` to its own template here
+and for `--gate all`. **Warning:** such a scan must be structurally unable to
+reach any deletion path — `--auto` and its kin must refuse it with a non-zero
+exit, the way the oracle's own guard does at `oracle_driver.py:277`. A
+Rust-port candidate that copied the `--stage` switch without that guard
+reproduced permanent data loss. Checked: identical group listing, identical
+`files_seen` and `bytes_seen`. Byte and open counts are not checked here.
 
 **M2 — pipeline parity.** Identical groups on every tree and every flag
 combination; `files_seen`, `bytes_seen` and `unreadable` identical;

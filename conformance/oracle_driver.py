@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import traceback
 
 class _Counted:
@@ -31,15 +32,17 @@ class _Counted:
     closes behave exactly as they did before.
     """
 
-    __slots__ = ("_f", "_tally")
+    __slots__ = ("_f", "_tally", "_lock")
 
-    def __init__(self, fh, tally):
+    def __init__(self, fh, tally, lock):
         self._f = fh
         self._tally = tally
+        self._lock = lock
 
     def read(self, *args):
         block = self._f.read(*args)
-        self._tally[0] += len(block)
+        with self._lock:
+            self._tally[0] += len(block)
         return block
 
     def __enter__(self):
@@ -68,6 +71,7 @@ def instrument(root: str, home: str):
     real_open = builtins.open
     tally = [0]
     opens = [0]
+    lock = threading.Lock()
     tripwire = []
     root_prefix = os.path.join(root, "")
     home_prefix = os.path.join(home, "")
@@ -79,8 +83,9 @@ def instrument(root: str, home: str):
             if not path.startswith(os.sep):
                 path = os.path.abspath(path)
             if path.startswith(root_prefix):
-                opens[0] += 1
-                return _Counted(fh, tally)
+                with lock:
+                    opens[0] += 1
+                return _Counted(fh, tally, lock)
             # Anything else beside the tree is off limits — the manifest sits
             # there, and a tool that reads the answer key is not scanning.
             if path.startswith(home_prefix):
