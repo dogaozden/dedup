@@ -1,0 +1,37 @@
+
+M1 gate
+  mixed                    wrong groups — 1 groups are missing, the first being ['notes/also.txt', 'notes/keep.txt']
+      wrong groups — 1 groups are missing, the first being ['notes/also.txt', 'notes/keep.txt']
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            wrong groups — 1 groups are missing, the first being ['notes/also.txt', 'notes/keep.txt']
+      wrong groups — 1 groups are missing, the first being ['notes/also.txt', 'notes/keep.txt']
+  smallzoo                 wrong groups — group 0 differs — expected ['boundary/65537-a.bin', 'boundary/65537-b.bin', 'boundary/65537-x.bin'] but got ['boundary/65537-a.bin', 'boundary/65537-b.bin']
+      wrong groups — group 0 differs — expected ['boundary/65537-a.bin', 'boundary/65537-b.bin', 'boundary/65537-x.bin'] but got ['boundary/65537-a.bin', 'boundary/65537-b.bin']
+  smallzoo-j1              wrong groups — group 0 differs — expected ['boundary/65537-a.bin', 'boundary/65537-b.bin', 'boundary/65537-x.bin'] but got ['boundary/65537-a.bin', 'boundary/65537-b.bin']
+      wrong groups — group 0 differs — expected ['boundary/65537-a.bin', 'boundary/65537-b.bin', 'boundary/65537-x.bin'] but got ['boundary/65537-a.bin', 'boundary/65537-b.bin']
+  prefix                   wrong groups — group 0 differs — expected ['real/00-a.bin', 'real/00-b.bin', 'real/00-c.bin', 'real/01-a.bin', ... 44 more] but got ['real/00-a.bin', 'real/00-b.bin', 'real/00-c.bin']
+      wrong groups — group 0 differs — expected ['real/00-a.bin', 'real/00-b.bin', 'real/00-c.bin', 'real/01-a.bin', ... 44 more] but got ['real/00-a.bin', 'real/00-b.bin', 'real/00-c.bin']
+  bighead                  wrong groups — group 0 differs — expected ['big/end-a.iso', 'big/end-b.iso', 'big/mid-a.iso', 'big/mid-b.iso', ... 7 more] but got ['big/trio-a.iso', 'big/set/trio-b.iso', 'big/set/deep/trio-c.iso']
+      wrong groups — group 0 differs — expected ['big/end-a.iso', 'big/end-b.iso', 'big/mid-a.iso', 'big/mid-b.iso', ... 7 more] but got ['big/trio-a.iso', 'big/set/trio-b.iso', 'big/set/deep/trio-c.iso']
+  bighead-j8               wrong groups — group 0 differs — expected ['big/end-a.iso', 'big/end-b.iso', 'big/mid-a.iso', 'big/mid-b.iso', ... 7 more] but got ['big/trio-a.iso', 'big/set/trio-b.iso', 'big/set/deep/trio-c.iso']
+      wrong groups — group 0 differs — expected ['big/end-a.iso', 'big/end-b.iso', 'big/mid-a.iso', 'big/mid-b.iso', ... 7 more] but got ['big/trio-a.iso', 'big/set/trio-b.iso', 'big/set/deep/trio-c.iso']
+  links                    wrong groups — 1 groups are missing, the first being ['filler/0.bin', 'filler/1.bin', 'filler/2.bin', 'filler/3.bin', ... 2 more]
+      wrong groups — 1 groups are missing, the first being ['filler/0.bin', 'filler/1.bin', 'filler/2.bin', 'filler/3.bin', ... 2 more]
+  adversarial              wrong groups — group 0 differs — expected ['locked-pair/a.bin', 'locked-pair/b.bin'] but got ['dup/one.bin', 'dup/two.bin']
+      wrong groups — group 0 differs — expected ['locked-pair/a.bin', 'locked-pair/b.bin'] but got ['dup/one.bin', 'dup/two.bin']
+  deletion                 pass
+
+13 check(s), 9 failed
+
+GATE FAILURE
+  mixed: wrong groups — 1 groups are missing, the first being ['notes/also.txt', 'notes/keep.txt']
+  mixed-exclude: wrong groups — 1 groups are missing, the first being ['notes/also.txt', 'notes/keep.txt']
+  smallzoo: wrong groups — group 0 differs — expected ['boundary/65537-a.bin', 'boundary/65537-b.bin', 'boundary/65537-x.bin'] but got ['boundary/65537-a.bin', 'boundary/65537-b.bin']
+  smallzoo-j1: wrong groups — group 0 differs — expected ['boundary/65537-a.bin', 'boundary/65537-b.bin', 'boundary/65537-x.bin'] but got ['boundary/65537-a.bin', 'boundary/65537-b.bin']
+  prefix: wrong groups — group 0 differs — expected ['real/00-a.bin', 'real/00-b.bin', 'real/00-c.bin', 'real/01-a.bin', ... 44 more] but got ['real/00-a.bin', 'real/00-b.bin', 'real/00-c.bin']
+  bighead: wrong groups — group 0 differs — expected ['big/end-a.iso', 'big/end-b.iso', 'big/mid-a.iso', 'big/mid-b.iso', ... 7 more] but got ['big/trio-a.iso', 'big/set/trio-b.iso', 'big/set/deep/trio-c.iso']
+  bighead-j8: wrong groups — group 0 differs — expected ['big/end-a.iso', 'big/end-b.iso', 'big/mid-a.iso', 'big/mid-b.iso', ... 7 more] but got ['big/trio-a.iso', 'big/set/trio-b.iso', 'big/set/deep/trio-c.iso']
+  links: wrong groups — 1 groups are missing, the first being ['filler/0.bin', 'filler/1.bin', 'filler/2.bin', 'filler/3.bin', ... 2 more]
+  adversarial: wrong groups — group 0 differs — expected ['locked-pair/a.bin', 'locked-pair/b.bin'] but got ['dup/one.bin', 'dup/two.bin']
