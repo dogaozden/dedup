@@ -1662,6 +1662,66 @@ harness is the measurement that counts, and it said no.
 
 **Three consecutive ideas inside the floor. This is the stop under §12.**
 
+## 2026-08-23 — the hash was never using the instruction its comment claims
+
+**Change:** `rust/Cargo.toml`, one line. `sha2 = "0.10"` becomes
+`sha2 = { version = "0.10", features = ["asm"] }`. Nothing in `src/` moved.
+
+`digest_of` carries this comment, and has since before round one:
+
+> SHA-256 — every CPU this runs on has an instruction for it, which makes it
+> about twice as fast here as BLAKE2b.
+
+The instruction exists. The build was not reaching it. `sha2` 0.10 selects its
+backend by **crate feature**, and without `asm` it compiles the portable
+software core on every target. Measured single-threaded over 256 MiB, and
+again at the 8 KiB block size `hash_ends` actually uses:
+
+```
+  sha2, as shipped        582.8 MB/s     14.114 us per 8 KiB
+  sha2 + asm             2861.2 MB/s      2.909 us per 8 KiB     4.9x
+  openssl, hardware ref  3107.7 MB/s
+```
+
+`-C target-feature=+sha2` is the obvious thing to reach for and it does
+nothing at all — 576.8 MB/s, inside noise of the default. The crate does not
+consult the target feature. It has to be the feature flag.
+
+The digest is unchanged, so the groups, the byte counts and the cache contents
+are all unchanged; 174 tests pass. What moves is every stage that hashes:
+`hash_ends`, `hash_deep`, `hash_sample`, and the whole-file digest the compare
+learns when a cache is attached.
+
+**Numbers.** Nine rounds, seed 1, on a quiet machine — load 3.34, no rival
+harness. The first attempt at this run was thrown away: a headless Chromium
+came up at 246% mid-run and put `rescan` at 0.5302 with a ±56.8% spread, two
+of its nine rounds at 99 ms against 16 ms for the rest. The gate that catches
+this now also refuses to start while any process outside the harness is over
+20% CPU.
+
+```
+  scenario     before    after    spread
+  needle       0.7486   0.7842    ±5.2%
+  typical      0.5952   0.5928    ±2.2%
+  samesize     0.9100   0.8486    ±3.0%
+  widegroup    0.7353   0.5855    ±4.5%
+  photos       0.7384   0.6887    ±4.7%
+  bigheader    0.7172   0.6411    ±8.2%
+  rescan       0.3715   0.3840    ±1.4%
+  SCORE        0.6669   0.6295
+```
+
+5.6% on the geomean, against a ±3.7% floor. The scenarios that move are the
+ones that hash the most bytes: `widegroup` 451 MB, `bigheader` 138 MB,
+`photos` 148 MB. `needle` and `typical` barely move, which is the expected
+shape — both are open-bound, not hash-bound, and the journal above has them
+against a syscall wall that no hash can shift.
+
+**Why this was missed for a round and a half.** The comment asserted the
+hardware path, and I read the comment instead of measuring the crate. The
+lesson generalises past this one line: a claim in a comment about what the
+machine is doing is a claim to be checked, not a fact to be inherited.
+
 ---
 
 ## 12. The loop, and when to stop
