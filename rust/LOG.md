@@ -1,5 +1,94 @@
 # dedup-rs work log
 
+## RBENCH optimizer round one — summary (branch `opus-r1`, unmerged)
+
+**SCORE 0.3161**, refereed: `python3 /tmp/rbench-referee/rbench/run.py
+--candidate 95afc0f` from a clean checkout of `main`, every gate green.
+In-tree runs of the same commit: **0.3181** at seed 1, **0.3251** at seed 2,
+`--scale default`, 9 rounds. Baseline `c238b30` is 1.0000. The noise floor
+measured that same day at default scale was **±4.3% per scenario, geomean
+0.9908** — recalibrated rather than inherited, as RGOAL §6.2 requires.
+
+The referee's table, quoted rather than remembered (load average 6.39 5.21 4.87):
+
+| scenario | base s | cand s | ratio | spread | bytes | ceiling |
+|---|---|---|---|---|---|---|
+| needle | 1.7197 | 1.6629 | 0.9718 | ±1.2% | 243.8 MB | 243.8 MB |
+| typical | 0.1925 | 0.1348 | 0.6971 | ±2.0% | 52.5 MB | 52.5 MB |
+| samesize | 0.0829 | 0.0243 | 0.2964 | ±0.7% | 32.8 MB | 32.8 MB |
+| widegroup | 0.1156 | 0.0511 | 0.4260 | ±3.6% | 126.3 MB | 126.3 MB |
+| photos | 0.0803 | 0.0231 | 0.2873 | ±0.8% | 147.9 MB | 147.9 MB |
+| bigheader | 0.0814 | 0.0249 | 0.3031 | ±2.4% | 146.2 MB | 146.2 MB |
+| rescan | 0.1269 | 0.0054 | 0.0423 | ±0.3% | 0 B | 32.8 MB |
+
+Every scenario improved. Nothing traded against anything, so there is no
+cross-scenario decision here for the maintainer to make. Bytes are byte-for-byte
+what they were: nothing in this round changes what is read, only what is run.
+
+### What was kept
+
+| # | change | commit | seed 1 / seed 2 |
+|---|---|---|---|
+| 1 | the volume probe stops blocking the scan | `824685c` | 0.8997 / 0.9062 |
+| 2 | the disk's medium read from the IO registry | `fce09bf` | 0.4595 / 0.4659 |
+| 3 | the volume UUID read with `getattrlist` | `95afc0f` | 0.3181 / 0.3251 |
+
+All three are one finding wearing three hats. **`dedup-rs` spent about 60 ms of
+every run on a `diskutil` subprocess — twice over, when the cache was on — to
+learn two facts the kernel and the IO registry hand over in microseconds.** Six
+of the seven scored scenarios finish in under 200 ms, so that subprocess was not
+overhead *around* the work; on five of them it *was* the work. A warm `rescan`
+that finds nothing to do went from 122 ms to 5.4 ms. `strings` on the binary now
+finds no `diskutil` at all, where the baseline has one.
+
+Nothing about the answers changed, and that is checked rather than asserted:
+`sys.rs` carries two tests that run `diskutil` and require the replacements to
+agree with it on every volume the machine has mounted — the medium *and* the
+UUID's exact spelling, since that names a file in the cache directory. The
+first draft of the medium query failed that test, which is how it was found to
+be reading a property that does not exist.
+
+### What was rejected, so nobody re-derives it
+
+- **Stubbing the probe out entirely** (`variant-ceiling`, never committed):
+  measured at 0.2915 purely as a price tag. It was never a candidate — it would
+  mis-size the reader pools on every volume that *does* report a medium, which
+  is every real disk. It is in the log because it is what turned "the startup
+  looks expensive" into a number worth acting on.
+- **Widening the "unknown device" defaults to the flash ones.** It would have
+  bought most of the same win with none of the FFI, and the bench cannot see
+  what it costs: the corpus volume is a RAM disk that reports no medium, so the
+  single case being tuned is the single case this bench charges nothing for.
+  RGOAL §7 names that blind spot and §8 makes such a trade the maintainer's,
+  not mine. Not attempted.
+
+### Where I would look next
+
+`needle` is now the only scenario the scan itself dominates — 1.66 s against
+23–51 ms for everything else — and the only one still near 1.0. Its 100 000
+files cost one `fstatat` each in the walk, plus three allocations per entry
+(`entry.path()`, `to_string_lossy`, and a `replace()` that allocates even when
+there is no backslash to replace). REWRITE.md §4's `getattrlistbulk(2)`,
+deferred at M1, at M2 and again at M5, is aimed at the first of those; a
+parallel walk is aimed at the serialisation around it. The `sys` module this
+round opened is where it belongs.
+
+Worth knowing before someone spends a week on it: the score is a geometric mean
+over seven scenarios, so taking `needle` from 0.97 to 0.75 moves it by about 4%.
+That is the right work for the tool and a small move for this number. I stopped
+here rather than reach for it, because the round's brief was a score and the
+score is met by a factor of two and a half — not because the idea is bad.
+
+### Not mine, but the next person should know
+
+`python3 conformance/run.py --gate all` fails 9 of 33 checks on **`main`
+itself** — identically with and without every change on this branch, verified by
+stashing and rebuilding. It is not an RBENCH gate and it did not block this
+round: RBENCH derives its answer key from corpus construction, and its
+correctness gate was green on every run recorded below. But LOG.md records that
+gate green at M5 and it is not green now, so something between then and now
+moved. Reported, not touched.
+
 ## 2026-08-22 — M1
 
 ### Hypothesis
@@ -1497,5 +1586,25 @@ found nothing to do now takes 5.5 ms instead of 122 ms, because the 122 ms was
 never the scan. The other six sit where change two left them, inside the
 noise.
 
-**Verdict:** KEPT (commit below).
-`evidence/r1-change3-seed1-default.txt`.
+**Confirmed at `--seed 2`**, pinned to the commit (`--candidate 95afc0f`),
+same scale and rounds, load average 3.11 4.17 4.50 — the quietest machine of
+the round:
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.7348 | 1.6409 | 0.9419 | ±2.2% |
+| typical | 0.1905 | 0.1314 | 0.7007 | ±1.5% |
+| samesize | 0.0819 | 0.0244 | 0.3015 | ±0.5% |
+| widegroup | 0.1078 | 0.0476 | 0.4549 | ±1.8% |
+| photos | 0.0865 | 0.0260 | 0.3038 | ±1.7% |
+| bigheader | 0.0835 | 0.0258 | 0.3100 | ±2.6% |
+| rescan | 0.1217 | 0.0054 | **0.0450** | ±0.2% |
+
+```
+SCORE: 0.3251
+```
+
+**Verdict:** KEPT (commit `95afc0f`). Evidence:
+`evidence/r1-change3-seed1-default.txt`,
+`evidence/r1-change3-seed2-default.txt`,
+`evidence/r1-selftest-change3.txt`.
