@@ -35,6 +35,32 @@
     survivors: ['z.bin'] (ok)
     trash: ['a.bin', 'also-a.bin'] (ok)
 
+=== bulk keep-shortest keeps the copy --auto shortest keeps ===
+    expect: b.bin survives both, even run from inside the tree where the drawn paths rank the other way round
+    exit: 0 (ok)
+    browser survivors: ['b.bin'] (ok)
+    --auto survivors: ['b.bin'] (ok)
+    browser and --auto agree: ['b.bin'] (ok)
+
+=== a terminal too small to lay out will not confirm a deletion ===
+    expect: both copies survive; the frame says to resize rather than asking y/n
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin'] (ok)
+    trash: [] (ok)
+    painted the resize message: True
+    never painted a confirmation: True
+
+=== a group the cache vouched for is re-read, disbelieved and refused ===
+    expect: the scan reads nothing and still groups them; the browser reads them, removes nothing, and says why
+    cold scan exit: 0 (ok)
+    exit: 0 (ok)
+    the scan still grouped them: 1 (ok)
+    the scan read 0 bytes to do it
+    grouped without reading them: True
+    survivors: ['a.bin', 'b.bin'] (ok)
+    trash: [] (ok)
+    said it was refusing, and why: True
+
 === -i without a terminal refuses instead of guessing ===
     expect: exit 2, a message naming --list and --auto, and nothing removed
     exit: 2 (ok)

@@ -27,7 +27,7 @@ use crate::pipeline::{DupGroup, ProvenGroups, Scan};
 use crate::trash::{oracle_mtime, report_refusals, run_selected, Removed};
 use crate::walk::FileRec;
 
-use model::{human_count, human_size, Browser, Group, Key, Member, Mode, Outcome, Step};
+use model::{human_count, human_size, Browser, Group, Key, Mark, Member, Mode, Outcome, Step};
 
 /// Whether a browser can run at all. Non-interactive use is `--list`/`--auto`,
 /// and a program that deletes files should not be guessing at a pipe.
@@ -87,8 +87,10 @@ pub fn run(
         previous(info);
     }));
 
+    // No explicit restore here: `draw_and_read` holds a drop guard that covers
+    // every way out of it, and a second mechanism beside it only makes a reader
+    // wonder which one is load-bearing.
     let outcome = draw_and_read(&mut browser, scan, context, cache, &mut refused);
-    put_the_terminal_back();
 
     if let Err(error) = outcome {
         eprintln!("dedup-rs: {error}");
@@ -114,7 +116,12 @@ fn draw_and_read(
     terminal.clear()?;
 
     loop {
-        terminal.draw(|frame| view::draw(frame, browser))?;
+        // The frame that was actually painted decides what the browser will
+        // act on next: below the layout minimum the paint layer draws a resize
+        // message instead of the browser, and the model refuses to act on a
+        // screen that was never drawn.
+        let painted = terminal.draw(|frame| view::draw(frame, browser))?.area;
+        browser.resize(painted.width, painted.height);
         let event = event::read()?;
         let Event::Key(key) = event else { continue };
         // Windows sends a release for every press; acting on both would double
@@ -127,6 +134,7 @@ fn draw_and_read(
             Step::Apply => {
                 terminal.draw(|frame| view::draw(frame, browser))?;
                 let marks = browser.selection();
+                debug_assert!(browser.legible(), "confirmed on a screen nobody could read");
                 let removed = remove(scan, &marks, browser.hard, context, cache.as_deref_mut());
                 match removed {
                     Ok(mut removed) => {
@@ -164,7 +172,7 @@ fn draw_and_read(
 /// being proven, but if one ever did, this refuses instead of assuming.
 fn remove(
     scan: &Scan,
-    marks: &[(usize, usize)],
+    marks: &[Mark],
     hard: bool,
     context: &Compare,
     cache: Option<&mut ScanCache>,
@@ -243,6 +251,7 @@ pub fn build(scan: &Scan, groups: &[DupGroup], root: &Path, hard: bool) -> Brows
                     let record = &scan.records[index];
                     Member {
                         record: index,
+                        name: record.path().to_string(),
                         path: display_path(root, record, cwd.as_deref()),
                         date: date_of(record.mtime_ns, offset),
                         extra_links: record.names.len() - 1,

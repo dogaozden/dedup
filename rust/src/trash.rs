@@ -17,6 +17,7 @@ use crate::cache::ScanCache;
 use crate::compare::{verify_attested, Compare};
 use crate::device::mount_point;
 use crate::pipeline::{DupGroup, ProvenGroups, Scan};
+use crate::tui::model::Mark;
 use crate::walk::{name_order, FileRec};
 
 /// What a non-interactive run was asked to do.
@@ -61,9 +62,10 @@ impl Rule {
     /// oracle keeps the shortest-named one. Reversing the comparator and taking
     /// the minimum gets the first maximum, which is what `dedup.py:2226` does.
     ///
-    /// The browser calls this too, on its own copy of the names and times, so
-    /// "keep the oldest" cannot come to mean one thing under `--auto` and
-    /// another under a menu.
+    /// The browser calls this too. It has to hand over the same strings this
+    /// gets from `keeper`, which are the scan's own names — a name built for
+    /// the screen ranks differently, and sharing the function would then not
+    /// be sharing the rule.
     pub fn keeper_of(self, members: &[(&str, f64)]) -> usize {
         match self {
             Rule::Shortest => members
@@ -370,11 +372,11 @@ fn still_there(root: &Path, record: &FileRec) -> bool {
 /// `ProvenGroups` can only be built by `Scan::proven`, so a browser over a
 /// scan that merely grouped by size cannot reach this function at all.
 ///
-/// A mark is `(group, record)`, where the record is its index in the scan and
-/// not its position on anyone's screen. Positions move — a browser that has
-/// already removed something renumbers what is left — and a stale position
-/// would name a different file rather than an absent one, which for this
-/// program means deleting something nobody chose.
+/// A `Mark` names a group in the scan and a record in the scan, never a
+/// position on anyone's screen. Positions move — a browser that has already
+/// removed something renumbers what is left — and a stale position would name
+/// a different file rather than an absent one, which for this program means
+/// deleting something nobody chose.
 ///
 /// The survivor guard is enforced here rather than trusted from the UI, because
 /// §3.2 says it is the code's job. What it counts is copies that will still be
@@ -386,14 +388,14 @@ fn still_there(root: &Path, record: &FileRec) -> bool {
 pub fn run_selected(
     scan: &Scan,
     proven: ProvenGroups<'_>,
-    marks: &[(usize, usize)],
+    marks: &[Mark],
     hard: bool,
     context: &Compare,
     mut cache: Option<&mut ScanCache>,
 ) -> Result<Removed, String> {
     let groups = proven.groups();
     let mut wanted: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for &(group, record) in marks {
+    for &Mark { group, record } in marks {
         let members = &groups
             .get(group)
             .ok_or_else(|| format!("no such group: {group}"))?
@@ -726,11 +728,11 @@ mod selection {
     }
 
     /// The mark that names a file: its group, and its record in the scan.
-    fn locate(scan: &Scan, name: &str) -> (usize, usize) {
+    fn locate(scan: &Scan, name: &str) -> Mark {
         for (group, members) in scan.reported().iter().enumerate() {
-            for &index in &members.members {
-                if scan.records[index].path() == name {
-                    return (group, index);
+            for &record in &members.members {
+                if scan.records[record].path() == name {
+                    return Mark { group, record };
                 }
             }
         }
@@ -892,7 +894,23 @@ mod selection {
         ]);
         let effort = Effort::default();
         let scan = tree.scan(&effort);
-        for (bad, expected) in [((9, 0), "no such group"), ((0, 9), "is not in group")] {
+        let out_of_range = [
+            (
+                Mark {
+                    group: 9,
+                    record: 0,
+                },
+                "no such group",
+            ),
+            (
+                Mark {
+                    group: 0,
+                    record: 9,
+                },
+                "is not in group",
+            ),
+        ];
+        for (bad, expected) in out_of_range {
             let error = run_selected(
                 &scan,
                 scan.proven().expect("the bytes were compared"),

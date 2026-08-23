@@ -9,6 +9,27 @@ use std::collections::BTreeSet;
 
 use crate::trash::Rule;
 
+/// Below this the columns stop meaning anything and the paint layer draws a
+/// resize message instead of the browser.
+///
+/// It lives here rather than beside the painting because it is not only a
+/// layout number: what is on screen decides what the browser will act on, and
+/// hard rule 3 says nothing is removed without the count, the bytes and the
+/// mode being shown. The two must agree, so they read the same constant.
+pub const MIN_WIDTH: u16 = 54;
+pub const MIN_HEIGHT: u16 = 12;
+
+/// What one mark names: a group in the scan and a record in the scan.
+///
+/// Named fields rather than a bare pair, because the two are both `usize` and
+/// nothing but their order distinguished them. Positions never appear here —
+/// see `Browser::selection`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Mark {
+    pub group: usize,
+    pub record: usize,
+}
+
 /// One member of a group as the browser shows it.
 ///
 /// It carries a copy of what the screen needs rather than borrowing the scan,
@@ -16,6 +37,14 @@ use crate::trash::Rule;
 /// link back: it indexes the scan's records, and it is what deletion acts on.
 pub struct Member {
     pub record: usize,
+    /// The scan's own name for this record, relative to the scanned root.
+    ///
+    /// Two strings name this file and they are not interchangeable. This is the
+    /// one every decision uses, because it is the one `--auto` ranks; `path` is
+    /// built for the screen and its shape depends on where the user happens to
+    /// be standing.
+    pub name: String,
+    /// What to draw. Never compared, never ranked, never a keeper.
     pub path: String,
     pub date: String,
     /// Names beyond the first. A hardlinked inode wears several, and removing
@@ -106,6 +135,13 @@ pub struct Browser {
     /// Whether removal is permanent. Changes the confirmation's verb, and
     /// nothing else in here.
     pub hard: bool,
+    /// Whether the frame is big enough for the browser to have been drawn.
+    ///
+    /// The paint layer gives up below `MIN_WIDTH × MIN_HEIGHT` and draws a
+    /// resize message, and a confirmation that was never drawn cannot have
+    /// been read. Rather than let the model act on a screen that does not
+    /// exist, it stops taking orders until there is one.
+    legible: bool,
     marked: BTreeSet<(usize, usize)>,
     pub applied_files: usize,
     pub applied_bytes: u64,
@@ -123,6 +159,9 @@ impl Browser {
             flash: String::new(),
             root,
             hard,
+            // Assumed until the first frame says otherwise, so a browser built
+            // in a test behaves like one on a terminal anybody could use.
+            legible: true,
             marked: BTreeSet::new(),
             applied_files: 0,
             applied_bytes: 0,
@@ -173,14 +212,12 @@ impl Browser {
     /// Screen positions never leave this module. They move whenever a round of
     /// deletion drops a group or a member, and a stale position handed to the
     /// remover would name a different file rather than a missing one.
-    pub fn selection(&self) -> Vec<(usize, usize)> {
+    pub fn selection(&self) -> Vec<Mark> {
         self.marked
             .iter()
-            .map(|&(group, member)| {
-                (
-                    self.groups[group].index,
-                    self.groups[group].members[member].record,
-                )
+            .map(|&(group, member)| Mark {
+                group: self.groups[group].index,
+                record: self.groups[group].members[member].record,
             })
             .collect()
     }
@@ -229,15 +266,18 @@ impl Browser {
 
     /// Apply a keep rule across every group at once, replacing the marks.
     ///
-    /// The keeper comes from `Rule`, which is the same code `--auto` uses, so
-    /// "keep the oldest" cannot come to mean one thing here and another there.
+    /// The keeper comes from `Rule`, the same code `--auto` uses, fed the same
+    /// strings `--auto` feeds it. Both halves matter: calling the same function
+    /// on the display path ranked a name whose shape depends on the working
+    /// directory, and "keep the shortest path" then kept a different copy here
+    /// than it did there. Sharing the function is not sharing the rule.
     pub fn apply_bulk(&mut self, rule: Rule) -> usize {
         self.marked.clear();
         for (index, group) in self.groups.iter().enumerate() {
             let members: Vec<(&str, f64)> = group
                 .members
                 .iter()
-                .map(|member| (member.path.as_str(), member.mtime))
+                .map(|member| (member.name.as_str(), member.mtime))
                 .collect();
             let keeper = rule.keeper_of(&members);
             for (position, member) in group.members.iter().enumerate() {
@@ -249,9 +289,32 @@ impl Browser {
         self.marked.len()
     }
 
+    /// Tell the model how big the last frame was.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.legible = width >= MIN_WIDTH && height >= MIN_HEIGHT;
+    }
+
+    pub fn legible(&self) -> bool {
+        self.legible
+    }
+
     /// Take one keystroke.
     pub fn on_key(&mut self, key: Key) -> Step {
         self.flash.clear();
+        // A screen nobody can read takes no orders but the one to leave. This
+        // is hard rule 3 in the corner where the paint layer has given up: in
+        // `Mode::Confirm` on a frame too small to lay out, the dialog is not on
+        // screen, so `y` must not be a deletion. Movement and marking are
+        // refused with it — acting on a list that was never drawn is the same
+        // mistake in a cheaper suit — and the resize message the user *can*
+        // see says what to do about it.
+        if !self.legible {
+            return if key == Key::Quit {
+                Step::Quit
+            } else {
+                Step::Stay
+            };
+        }
         match self.mode {
             Mode::Help => self.help_key(key),
             Mode::Bulk => self.bulk_key(key),
@@ -461,13 +524,21 @@ mod tests {
         browser
             .selection()
             .into_iter()
-            .map(|(_, record)| record)
+            .map(|mark| mark.record)
             .collect()
     }
 
-    fn member(record: usize, path: &str, mtime: f64) -> Member {
+    /// A member whose two names agree, which is the ordinary case.
+    fn member(record: usize, name: &str, mtime: f64) -> Member {
+        shown_as(record, name, name, mtime)
+    }
+
+    /// A member whose display string is not its scan name — what happens when
+    /// the user runs the browser from inside the tree being scanned.
+    fn shown_as(record: usize, name: &str, path: &str, mtime: f64) -> Member {
         Member {
             record,
+            name: name.into(),
             path: path.into(),
             date: "2026-08-23".into(),
             extra_links: 0,
@@ -627,6 +698,126 @@ mod tests {
         assert!(!browser.is_marked(0, 0), "a.bin is the newest");
         browser.apply_bulk(Rule::Shortest);
         assert!(!browser.is_marked(0, 0), "a.bin has the shortest name");
+    }
+
+    #[test]
+    fn a_bulk_rule_ranks_the_scans_name_not_the_one_on_screen() {
+        // Standing in `tree/photos`, the browser draws `b.bin` as its absolute
+        // path — it is not under the working directory — while `photos/aaaa.bin`
+        // draws as the bare `aaaa.bin`. So the two orders disagree: by the
+        // scan's names `b.bin` is shortest, by what is on screen `aaaa.bin` is.
+        // `--auto shortest` keeps `b.bin`, and so must this.
+        let mut browser = Browser::new(
+            vec![Group {
+                index: 0,
+                size: 100,
+                members: vec![
+                    shown_as(0, "b.bin", "/scratch/tree/b.bin", 1.0),
+                    shown_as(1, "photos/aaaa.bin", "aaaa.bin", 2.0),
+                ],
+            }],
+            "/scratch/tree".into(),
+            false,
+        );
+        assert_eq!(browser.apply_bulk(Rule::Shortest), 1);
+        assert!(
+            !browser.is_marked(0, 0),
+            "the shortest name in the scan was marked for deletion"
+        );
+        assert_eq!(plan(&browser), vec![1]);
+
+        // The same group with the display strings swapped keeps the same copy,
+        // which is the whole point: what is drawn cannot change what dies.
+        let mut swapped = Browser::new(
+            vec![Group {
+                index: 0,
+                size: 100,
+                members: vec![
+                    shown_as(0, "b.bin", "b.bin", 1.0),
+                    shown_as(1, "photos/aaaa.bin", "photos/aaaa.bin", 2.0),
+                ],
+            }],
+            "/scratch/tree".into(),
+            false,
+        );
+        swapped.apply_bulk(Rule::Shortest);
+        assert_eq!(plan(&swapped), plan(&browser));
+    }
+
+    #[test]
+    fn keep_this_one_and_the_survivor_guard_do_not_read_the_display_string() {
+        // The other two ways a copy gets marked, on the same disagreeing group.
+        let mut browser = Browser::new(
+            vec![Group {
+                index: 0,
+                size: 100,
+                members: vec![
+                    shown_as(0, "b.bin", "/scratch/tree/b.bin", 1.0),
+                    shown_as(1, "photos/aaaa.bin", "aaaa.bin", 2.0),
+                ],
+            }],
+            "/scratch/tree".into(),
+            false,
+        );
+        browser.keep_only_current();
+        assert_eq!(
+            plan(&browser),
+            vec![1],
+            "keep-this looked at the wrong name"
+        );
+
+        browser.member = 1;
+        browser.toggle(); // unmark record 1
+        browser.toggle(); // and back on
+        assert_eq!(plan(&browser), vec![1]);
+        browser.member = 0;
+        browser.toggle();
+        assert_eq!(plan(&browser), vec![1], "both copies were marked");
+        assert_eq!(browser.flash, "at least one copy has to stay");
+    }
+
+    #[test]
+    fn a_screen_too_small_to_read_takes_no_orders_but_quit() {
+        let mut browser = browser();
+        browser.member = 0;
+        browser.keep_only_current();
+        browser.on_key(Key::Apply);
+        assert_eq!(browser.mode, Mode::Confirm);
+
+        // The frame shrinks under the confirmation. The paint layer has stopped
+        // drawing it, so `y` must stop being a deletion.
+        browser.resize(20, 8);
+        assert!(!browser.legible());
+        assert_eq!(browser.on_key(Key::Yes), Step::Stay, "y deleted unseen");
+        assert_eq!(browser.mode, Mode::Confirm, "the dialog was dismissed");
+
+        // Nothing else moves either, and the marks are still there to act on.
+        for key in [Key::Down, Key::Toggle, Key::Bulk, Key::Apply, Key::Help] {
+            assert_eq!(browser.on_key(key), Step::Stay, "{key:?} was acted on");
+        }
+        assert_eq!(browser.member, 0);
+        assert_eq!(browser.marked_count(), 2);
+        assert_eq!(browser.mode, Mode::Confirm);
+
+        // Quitting always works — it is the one thing the resize message asks
+        // the user to be able to do without seeing anything.
+        assert_eq!(browser.on_key(Key::Quit), Step::Quit);
+
+        // Back at a legible size, the confirmation is live again.
+        browser.resize(MIN_WIDTH, MIN_HEIGHT);
+        assert!(browser.legible());
+        assert_eq!(browser.on_key(Key::Yes), Step::Apply);
+    }
+
+    #[test]
+    fn the_legibility_floor_is_the_one_the_paint_layer_uses() {
+        let mut browser = browser();
+        browser.resize(MIN_WIDTH, MIN_HEIGHT);
+        assert!(browser.legible(), "the minimum itself must be legible");
+        browser.resize(MIN_WIDTH - 1, MIN_HEIGHT);
+        assert!(!browser.legible());
+        browser.resize(MIN_WIDTH, MIN_HEIGHT - 1);
+        assert!(!browser.legible());
     }
 
     #[test]
@@ -798,7 +989,10 @@ mod tests {
         browser.keep_only_current();
         assert_eq!(
             browser.selection(),
-            vec![(1, 4)],
+            vec![Mark {
+                group: 1,
+                record: 4
+            }],
             "the mark did not name the scan's own group and record"
         );
     }

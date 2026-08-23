@@ -12,12 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::model::{elide_left, human_count, human_size, Browser, Mode};
-
-/// Below this the columns stop meaning anything, so say so rather than paint
-/// a scrambled screen.
-pub const MIN_WIDTH: u16 = 54;
-pub const MIN_HEIGHT: u16 = 12;
+use super::model::{elide_left, human_count, human_size, Browser, Mode, MIN_HEIGHT, MIN_WIDTH};
 
 const ACCENT: Color = Color::Cyan;
 const MARK: Color = Color::Red;
@@ -411,6 +406,7 @@ mod tests {
     fn member(record: usize, path: &str, deletable: bool, links: usize) -> Member {
         Member {
             record,
+            name: path.into(),
             path: path.into(),
             date: "2026-08-23".into(),
             extra_links: links,
