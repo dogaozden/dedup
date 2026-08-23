@@ -1,0 +1,32 @@
+rbench: building candidate ... 27.5s
+rbench: volume /Volumes/dedupbench (reused), scale default, seed 1, rounds 9
+rbench: baseline c238b30d9e55   candidate worktree 824685c9ec98+dirty
+rbench: load average 4.33 4.81 4.69
+  built needle      100000 files   243.8 MB  in 6.0s
+  ceiling needle    oracle read  243.8 MB in 100000 opens  (3.2s)
+rbench: needle ... 0.9570  (±1.6%)
+rbench: typical ... 0.6939  (±1.5%)
+rbench: samesize ... 0.2952  (±2.5%)
+rbench: widegroup ... 0.4513  (±3.2%)
+  built photos         100 files   393.6 MB  in 0.6s
+  ceiling photos    oracle read  147.9 MB in 125 opens  (0.2s)
+rbench: photos ... 0.3047  (±2.2%)
+  built bigheader        8 files   450.0 MB  in 0.6s
+  ceiling bigheader oracle read  146.2 MB in  20 opens  (0.2s)
+rbench: bigheader ... 0.3044  (±2.3%)
+rbench: rescan ... 0.5271  (±1.0%)
+
+scenario   base s  cand s   ratio  spread     bytes   ceiling     floor
+───────────────────────────────────────────────────────────────────────
+needle     1.7000  1.6229  0.9570   ±1.6%  243.8 MB  243.8 MB  260.9 KB
+typical    0.1915  0.1317  0.6939   ±1.5%   52.5 MB   52.5 MB   23.0 MB
+samesize   0.0836  0.0241  0.2952   ±2.5%   32.8 MB   32.8 MB   22.5 MB
+widegroup  0.1126  0.0502  0.4513   ±3.2%  126.3 MB  126.3 MB  126.3 MB
+photos     0.0800  0.0244  0.3047   ±2.2%  147.9 MB  147.9 MB  147.8 MB
+bigheader  0.0847  0.0252  0.3044   ±2.3%  146.2 MB  146.2 MB  112.0 MB
+rescan     0.1200  0.0634  0.5271   ±1.0%       0 B   32.8 MB   32.8 MB
+
+(/Users/dogaozden/AI_Projects/dedup-opus-r1/rbench/state/results.json)
+
+SCORE: 0.4595
+EXIT=0

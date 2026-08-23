@@ -14,6 +14,7 @@ mod filters;
 mod ordered;
 mod pipeline;
 mod stages;
+mod sys;
 mod trash;
 mod tui;
 mod walk;

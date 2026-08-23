@@ -127,11 +127,7 @@ fn is_solid_state(path: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    match ask_diskutil(&mount_point(path), "SolidState")?.as_str() {
-        value if value.starts_with("<true") => Some(true),
-        value if value.starts_with("<false") => Some(false),
-        _ => None,
-    }
+    crate::sys::solid_state(path)
 }
 
 /// A stable filename for the cache belonging to the volume `path` is on.

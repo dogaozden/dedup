@@ -1299,4 +1299,132 @@ So the probe is still on the critical path for four scenarios; it has only
 stopped being in front of the walk. The next question is what it would be
 worth to stop paying for it at all, which is a measurement and not a guess.
 
-**Verdict:** KEPT (commit below). `evidence/r1-change1-seed1-default.txt`.
+**Confirmed at `--seed 2`** (RGOAL §12.5), same scale and rounds, load average
+3.91 4.90 4.56:
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.6944 | 1.6478 | 0.9654 | ±1.8% |
+| typical | 0.1905 | 0.1564 | **0.8246** | ±1.2% |
+| samesize | 0.0848 | 0.0818 | 0.9637 | ±3.8% |
+| widegroup | 0.1124 | 0.1164 | 1.0249 | ±6.5% |
+| photos | 0.0848 | 0.0832 | 0.9831 | ±6.5% |
+| bigheader | 0.0820 | 0.0899 | 1.0241 | ±11.0% |
+| rescan | 0.1224 | 0.0784 | **0.6337** | ±1.5% |
+
+```
+SCORE: 0.9062
+```
+
+`widegroup` and `bigheader` sit just over 1.0 on both seeds, by less than the
+±4.3% floor and with spreads of ±6.5% and ±11.0% — that is the bench standing
+still, not a regression, and it is the same pair the calibration named as its
+noisiest.
+
+**Verdict:** KEPT (commit `824685c`). Evidence:
+`evidence/r1-change1-seed1-default.txt`,
+`evidence/r1-change1-seed2-default.txt`, `evidence/r1-selftest.txt`.
+
+## 2026-08-23 — what the subprocess costs (a price tag, not a change)
+
+**Hypothesis:** change one moved the `diskutil` call off the front of the walk
+but not out of the run, and four scenarios did not move at all. Before
+spending any effort on replacing it, find out what replacing it is worth.
+
+**Change:** none to keep. A throwaway build — `variant-ceiling`, never
+committed — with `is_solid_state` and `volume_uuid` returning immediately
+without running anything, measured through the harness as
+`--candidate variant-ceiling` so it is priced the same way a real candidate
+would be. It is not a candidate: it would mis-size the pools on any volume
+that does report, which is every real disk.
+
+**Numbers:** seed 1, `--scale default`, 9 rounds, load average 5.23 5.15 4.69:
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.7166 | 1.6841 | 0.9696 | ±3.6% |
+| typical | 0.1925 | 0.1308 | 0.6845 | ±2.2% |
+| samesize | 0.0823 | 0.0227 | 0.2841 | ±2.4% |
+| widegroup | 0.1102 | 0.0512 | 0.4471 | ±3.2% |
+| photos | 0.0856 | 0.0219 | 0.2544 | ±3.2% |
+| bigheader | 0.0913 | 0.0238 | 0.2511 | ±2.7% |
+| rescan | 0.1229 | 0.0042 | 0.0332 | ±0.1% |
+
+```
+SCORE: 0.2915
+```
+
+**Verdict:** REVERTED, as intended — it was never a candidate. What it bought
+is the number: **asking a subprocess what kind of disk this is costs about
+60 ms, and that is most of five of the seven scored scenarios.** A warm
+`rescan` finishes in 4.2 ms without it and 123 ms with it. Everything else in
+this round is smaller than this one thing, so this one thing goes first.
+
+`evidence/r1-diagnostic-no-diskutil.txt`.
+
+## 2026-08-23 — the disk question, asked without a subprocess
+
+**Hypothesis:** the price tag above. `diskutil info -plist` costs about 60 ms
+and the tool runs it to learn one fact: whether the volume is flash. That fact
+lives in the IO registry, which `diskutil` is itself only a client of. Read it
+directly and the subprocess disappears — not moved off the critical path, gone.
+
+**Change:** a new `sys` module, the port's one place for platform FFI.
+`statfs` names the device backing a path; `IOBSDNameMatching` plus
+`IOServiceGetMatchingService` find it in the registry; and
+`IORegistryEntrySearchCFProperty` reads `Device Characteristics` from it,
+climbing towards the root of the IOService plane because what `statfs` names
+is a partition — or, on APFS, a volume inside a container inside one — while
+the medium is a property of the physical disk. `Medium Type` is
+`"Solid State"`, `"Rotational"`, or absent, which maps exactly onto the
+`Some(true) / Some(false) / None` the old code got from the plist.
+`volume_uuid` still runs `diskutil`; that is the next entry.
+
+**REWRITE.md §7**, which allows `unsafe` in "the `getattrlistbulk` FFI module"
+and asks for anything else to be justified here first. The justification: the
+rule's shape is *one* module that owns the platform's unsafe surface, and this
+is that module, opened before the bulk walk lands in it rather than after.
+`libc` is on §7's own crate allowlist and is used for `statfs` so the struct
+layout is not hand-rolled. Every block carries its invariant. Nothing here is
+load-bearing for correctness: every path returns `None` when the platform will
+not answer, which is the case every caller already treats as "don't know".
+
+**The check that made this honest.** A faster route to a *different* answer
+would be a different tool, not a faster one, so `sys.rs` carries a test that
+runs `diskutil` and asserts the registry agrees with it on every volume this
+machine has mounted. It failed the first time — the first draft looked for a
+top-level `Solid State` boolean, which does not exist; the boot volume came
+back `None` where `diskutil` said `true`. That is what sent me to look at the
+registry properly and find `Device Characteristics`. It now reports:
+
+```
+/: registry=Some(true) diskutil=Some(true)
+/Volumes/dedupbench: registry=None diskutil=None
+```
+
+so the pools and the comparison chunk are sized exactly as before, on the
+bench volume and on the boot volume both.
+
+**Numbers:** seed 1, `--scale default`, 9 rounds, load average 4.33 4.81 4.69.
+Noise floor ±4.3%. `--selftest` passed first — 4 of 4 sabotages caught.
+
+| scenario | base s | cand s | ratio | spread |
+|---|---|---|---|---|
+| needle | 1.7000 | 1.6229 | 0.9570 | ±1.6% |
+| typical | 0.1915 | 0.1317 | **0.6939** | ±1.5% |
+| samesize | 0.0836 | 0.0241 | **0.2952** | ±2.5% |
+| widegroup | 0.1126 | 0.0502 | **0.4513** | ±3.2% |
+| photos | 0.0800 | 0.0244 | **0.3047** | ±2.2% |
+| bigheader | 0.0847 | 0.0252 | **0.3044** | ±2.3% |
+| rescan | 0.1200 | 0.0634 | **0.5271** | ±1.0% |
+
+```
+SCORE: 0.4595
+```
+
+Every scenario improved; nothing traded against anything. Bytes are unchanged
+and still exactly at the ceiling on every scenario, because this reads nothing
+— it only stops running a program to ask a question.
+
+**Verdict:** KEPT (commit below).
+`evidence/r1-change2-seed1-default.txt`.
