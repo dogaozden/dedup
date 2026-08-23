@@ -316,11 +316,29 @@ was working at load average ~3.4:
 | `--calibrate --rounds 15` | geomean **1.0062**, noise floor **±3.4%** (worst scenario `samesize` at 1.0341) |
 | `--candidate c238b30 --rounds 9` | **SCORE 0.9890**, every gate green |
 | default candidate, separately built, `--rounds 9` | **SCORE 1.0085**, every gate green |
+| same again after the last refactor | **SCORE 1.0061**, every gate green |
 | `--selftest` | 4 of 4 sabotages caught, honest control clean |
 
 The four sabotaged candidates and the gate that caught each: `drop-group` →
 correctness; `inflate-bytes` → bytes ceiling; `underreport-bytes` → byte
 floor; `touch-corpus` → manifest tripwire.
+
+Two things the build turned up that are worth remembering:
+
+- **A stale corpus outlives the run that made it.** The Python bench's
+  `rescan` gate rewrites corpus files in place and leaves them rewritten, so
+  `rescan-smoke-seed1` on the shared RAM disk no longer matched its own
+  manifest. The generation-time cross-check between construction and the
+  oracle caught it. `ensure_corpus` now spends one rebuild on a disagreement
+  before treating it as real. Do not remove that check to make a run go
+  through; it is the reason a poisoned corpus cannot quietly become the
+  answer key.
+- **A liveness check that is too broad is a check that is off.** The first
+  "is another harness running" test excluded this process's whole process
+  group, which also hid any rival launched from the same shell — the exact
+  case it exists to catch. It only surfaced because the check was tested in
+  both directions, with a fake harness deliberately started. Test a tripwire
+  by making it fire.
 
 **These are smoke-level proof that the harness functions. They are not
 records.** They were taken at a tenth scale, on a busy shared machine, against

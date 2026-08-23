@@ -111,7 +111,17 @@ LOCK_POLL = 2.0
 LOCK_GRACE = 5.0
 
 # Other harnesses that must not be scanning while this one times anything.
-BUSY_PATTERN = r"bench/run\.py|_measure\.py|rbench|dedup-rs|oracle_driver"
+# Matched against a process's own command line, which is why these are spelled
+# as paths and executables rather than as the bare word "rbench": a shell that
+# once launched this harness carries that word forever and is not a harness.
+BUSY_PATTERN = re.compile(
+    r"(^|/)dedup-rs(\s|$)|(^|/)(r?bench)/run\.py|(^|/)_measure\.py"
+    r"|(^|/)oracle_driver\.py|conformance/run\.py")
+
+# Launchers, not harnesses. A shell whose command line mentions the harness is
+# the shell that started one, and it is either our own ancestor or its corpse.
+LAUNCHERS = {"sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish",
+             "login", "claude", "node", "timeout", "env", "sudo", "ps"}
 
 
 class Fatal(Exception):
@@ -233,17 +243,20 @@ def other_harnesses() -> list:
     contains "rbench", so the shell that launched it carries the pattern on its
     command line and would otherwise be reported as a rival harness.
     """
-    out = run(["ps", "-Ao", "pid=,ppid=,pgid=,command="])
+    out = run(["ps", "-Ao", "pid=,ppid=,command="])
     rows = {}
     for line in out.stdout.splitlines():
-        parts = line.strip().split(None, 3)
-        if len(parts) < 4:
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
             continue
         try:
-            rows[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+            rows[int(parts[0])] = (int(parts[1]), parts[2])
         except ValueError:
             continue
 
+    # Our own ancestors only. Excluding our whole process group would also
+    # hide a rival harness that happened to be launched from the same shell,
+    # which is exactly the case this check exists to catch.
     mine = os.getpid()
     kin = set()
     walk = mine
@@ -251,17 +264,20 @@ def other_harnesses() -> list:
         kin.add(walk)
         walk = rows[walk][0]
     kin.add(walk)
-    try:
-        kin |= {pid for pid, row in rows.items() if row[1] == os.getpgid(mine)}
-    except OSError:
-        pass
 
     found = []
-    for pid, (_ppid, _pgid, command) in sorted(rows.items()):
-        if pid in kin or command.startswith("ps "):
+    for pid, (_ppid, command) in sorted(rows.items()):
+        if pid in kin:
             continue
-        if re.search(BUSY_PATTERN, command):
-            found.append("{} {}".format(pid, command[:90]))
+        head = command.split(None, 1)[0] if command.split() else ""
+        if os.path.basename(head).lstrip("-") in LAUNCHERS:
+            continue
+        if BUSY_PATTERN.search(command):
+            # The interesting part of a long command line is its tail — the
+            # script being run, not the interpreter that is running it.
+            shown = command if len(command) <= 120 else \
+                command[:36] + " … " + command[-80:]
+            found.append("{} {}".format(pid, shown))
     return found
 
 
