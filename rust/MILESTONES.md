@@ -1197,8 +1197,8 @@ jumble across every size class. On each tree the oracle, `--profile flash`,
 ```text
 tree                  files  groups   flash seeks  spinning seeks   flash bytes  spinning bytes  verdict
 tails                     5       2            18              19        319488          389120  same
-middles                   3       1            39              11      31002624        31457280  same
-last-chunk                3       1            29              14      38805504        56623104  same
+middles                   3       1            40              11      31002624        31457280  same
+last-chunk                3       1            30              14      38805504        56623104  same
 cohort-boundary          16       4            64              72      33554432        49807360  same
 wide                     24       1           336             102     239075328       254607360  same
 links                     6       2            15              16       1048576         1048576  same
@@ -1237,8 +1237,8 @@ files    MiB   flash seeks   spinning seeks   ratio      flash MiB   spinning Mi
 Same corpora at the default reader count, for scale only (threads interleave, so these move between runs):
 files    MiB   flash seeks   spinning seeks
     4     20            59               20
-    8     20           124               40
-   16     20           255               86
+    8     20           123               40
+   16     20           253               86
    32     20           512              172
     6    100           192               60
 
@@ -1264,6 +1264,7 @@ cache: flash first, then spinning          ok (1 groups, the new copy joined its
 cache: spinning first, then flash          ok (1 groups, the new copy joined its twins)
 cache: spinning twice                      ok (1 groups, the new copy joined its twins)
 --auto under either profile                ok (both kept a.bin, c.bin, d.bin)
+the browser under either profile           ok (both removed b.bin, nested/a-copy.bin and kept a.bin, c.bin, d.bin)
 --stage size --auto --profile spinning     ok (exit 2, nothing removed): dedup-rs: --auto cannot act on a --stage size scan
 --profile with a name it does not know     ok (exit 2): dedup-rs: --profile takes flash, spinning or auto
 
@@ -1319,15 +1320,18 @@ described above.
 
 ### Standards
 
+Both milestones go to one review, so this is the branch tip and its test count
+includes M5.1's. At the M6 implementation commit alone it read 131.
+
 ```text
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 131 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+test result: ok. 159 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
 
 
 $ cargo clippy --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
 $ cargo fmt --check
 (no output: clean)
@@ -1561,11 +1565,11 @@ The command exited 0.
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 158 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+test result: ok. 159 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
 
 
 $ cargo clippy --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
 $ cargo fmt --check
 (no output: clean)

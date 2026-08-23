@@ -22,12 +22,16 @@ Run from the repository root:
     python3 rust/evidence/scripts/spinning_meets_the_rest.py
 """
 
+import fcntl
 import json
 import os
+import pty
 import random
 import shutil
+import struct
 import subprocess
 import sys
+import termios
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -87,6 +91,55 @@ def oracle(root: str, report: str):
                     "--min-size", "1", "--no-cache", "-q"],
                    check=True, capture_output=True)
     return groups(report)
+
+
+def pty_drive(root: str, home: str, keys, extra):
+    """Run the browser under a real terminal and send it `keys`.
+
+    The same shape as `m5_end_to_end.py`'s driver, which is where the details
+    (the window size a pty starts without, and answering the cursor-position
+    query nothing else on this pty will answer) were worked out.
+    """
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+    environment = dict(os.environ, HOME=home, TERM="xterm-256color")
+    environment["DEDUP_CACHE_DIR"] = os.path.join(home, "cache")
+    process = subprocess.Popen([CANDIDATE, root] + extra, stdin=slave,
+                               stdout=slave, stderr=slave, env=environment,
+                               start_new_session=True)
+    os.close(slave)
+    os.set_blocking(master, False)
+
+    def drain():
+        try:
+            chunk = os.read(master, 262144)
+        except (BlockingIOError, OSError):
+            return
+        if b"\x1b[6n" in chunk:
+            os.write(master, b"\x1b[1;1R")
+
+    # The menu comes first now: one Enter accepts it, then the scan runs.
+    for _ in range(8):
+        time.sleep(0.1)
+        drain()
+    for key in [b"\r"] + list(keys):
+        if process.poll() is not None:
+            break
+        try:
+            os.write(master, key)
+        except OSError:
+            break
+        for _ in range(5):
+            time.sleep(0.1)
+            drain()
+    try:
+        code = process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        code = process.wait()
+    drain()
+    os.close(master)
+    return code, ""
 
 
 def build(root: str) -> None:
@@ -150,6 +203,47 @@ def case_deletion_parity() -> str:
     return "ok (both kept {})".format(", ".join(outcomes["flash"]))
 
 
+def case_browser_deletion_parity(binary_pty) -> str:
+    """The browser deletes the same files under either profile.
+
+    `--profile` reaches the browser too — `main::browse` hands the scan's
+    profile to the `Compare` the browser deletes through, and a wide attested
+    group re-proved at deletion time takes the capped comparison. So the same
+    marks under the two profiles have to remove the same files.
+    """
+    outcomes = {}
+    for profile in ("flash", "spinning"):
+        root = os.path.join(BASE, "browse-" + profile)
+        home = os.path.join(BASE, "browse-home-" + profile)
+        os.makedirs(root)
+        os.makedirs(home)
+        build(root)
+        put(root, "nested/a-copy.bin", 1, 0xAA)
+        before = survivors(root)
+        # `a` marks every copy but the highlighted one in this group, ENTER
+        # asks for the confirmation, `y` accepts it, `q` leaves.
+        code, _ = binary_pty(root, home,
+                             [b"a", b"\r", b"y", b"q"],
+                             ["-i", "--min-size", "1", "--no-cache",
+                              "--profile", profile,
+                              "--report-json", os.path.join(home, "report.json")])
+        if code != 0:
+            return "FAIL: the browser under {} exited {}".format(profile, code)
+        after = survivors(root)
+        # Two runs that both deleted nothing agree about everything, which is
+        # not the thing being tested.
+        if after == before:
+            return ("FAIL: the browser under {} removed nothing, so this "
+                    "proves nothing".format(profile))
+        outcomes[profile] = (before, after)
+    if outcomes["flash"] != outcomes["spinning"]:
+        return "FAIL: flash kept {}, spinning kept {}".format(
+            outcomes["flash"][1], outcomes["spinning"][1])
+    gone = sorted(set(outcomes["flash"][0]) - set(outcomes["flash"][1]))
+    return "ok (both removed {} and kept {})".format(
+        ", ".join(gone), ", ".join(outcomes["flash"][1]))
+
+
 def case_stage_size_guard() -> str:
     """A size bucket is not a group, whatever the profile says."""
     root = os.path.join(BASE, "stage-size")
@@ -188,6 +282,8 @@ def main() -> int:
         ("cache: spinning first, then flash", lambda: case_cache_crossover("spinning", "flash")),
         ("cache: spinning twice", lambda: case_cache_crossover("spinning", "spinning")),
         ("--auto under either profile", case_deletion_parity),
+        ("the browser under either profile",
+         lambda: case_browser_deletion_parity(pty_drive)),
         ("--stage size --auto --profile spinning", case_stage_size_guard),
         ("--profile with a name it does not know", case_bad_value),
     ]

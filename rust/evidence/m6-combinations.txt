@@ -4,6 +4,7 @@ cache: flash first, then spinning          ok (1 groups, the new copy joined its
 cache: spinning first, then flash          ok (1 groups, the new copy joined its twins)
 cache: spinning twice                      ok (1 groups, the new copy joined its twins)
 --auto under either profile                ok (both kept a.bin, c.bin, d.bin)
+the browser under either profile           ok (both removed b.bin, nested/a-copy.bin and kept a.bin, c.bin, d.bin)
 --stage size --auto --profile spinning     ok (exit 2, nothing removed): dedup-rs: --auto cannot act on a --stage size scan
 --profile with a name it does not know     ok (exit 2): dedup-rs: --profile takes flash, spinning or auto
 

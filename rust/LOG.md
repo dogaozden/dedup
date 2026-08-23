@@ -1947,3 +1947,27 @@ not merely asserted.
 and the table's). clippy `-D warnings` clean, `fmt --check` clean, `--gate all`
 33/33. M6's differential and combination checks were re-run after the parser
 was rebuilt on the table, and both still pass.
+
+### After both claims were written
+
+Two things the claims prompted, recorded here rather than folded back into
+them:
+
+- **The browse rule was written twice.** `menu_wanted` and `browse` each
+  decided independently whether this run is a browsing run, and two copies of
+  one rule drift. They now share `browsing_flags`, and
+  `the_menu_opens_for_exactly_the_runs_the_browser_opens_for` walks all eight
+  combinations of `--list`, `-i` and `--auto` to hold them together. A run that
+  stopped to be asked about its options and then never browsed is the failure
+  this pins.
+- **`--profile` reaches the browser too**, not only `--auto` — `main::browse`
+  hands the scan's profile to the `Compare` the browser deletes through. The
+  combination checks now drive the real browser through a pty under both
+  profiles and compare what is left on disk. The first version of that case
+  passed while deleting nothing, because the key sequence was missing the
+  apply keystroke; two runs that both delete nothing agree about everything.
+  It now asserts that something was removed before comparing, and both profiles
+  remove `b.bin` and `nested/a-copy.bin` and keep the other three.
+
+Final: `cargo test` 159 passed, clippy and fmt clean, `--gate all` 33/33, and
+every evidence script re-run against the branch tip.

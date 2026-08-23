@@ -53,14 +53,21 @@ struct Report<'a> {
     seeks: u64,
 }
 
-/// Whether this run is one the browser will open for.
+/// Whether the flags on this run ask for the browser, leaving aside whether
+/// there is a terminal to browse in.
 ///
-/// The menu appears under exactly this condition and no other, because the
-/// menu is the browser's front door: a run that will not browse must not stop
-/// to be asked about, and a piped or flagged run must be byte-for-byte what it
-/// has always been.
-fn browsing(options: &Options) -> bool {
-    tui::has_terminal() && options.auto.is_none() && (options.interactive || !options.list)
+/// One rule, read in two places: the menu opens on it before the scan and the
+/// browser opens on it after. Written twice they could drift, and a run that
+/// stopped to be asked about its options and then never browsed would be the
+/// result.
+fn browsing_flags(options: &Options) -> bool {
+    options.auto.is_none() && (options.interactive || !options.list)
+}
+
+/// Whether the pre-flight menu appears. A piped or flagged run never sees it
+/// and is byte-for-byte what it has always been.
+fn menu_wanted(options: &Options) -> bool {
+    tui::has_terminal() && browsing_flags(options)
 }
 
 fn print_report(groups: &[Vec<&str>]) {
@@ -95,7 +102,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // is a command line, and it goes through the same parser and the same
     // checks the real one did — the form has no way to say anything the flags
     // cannot say.
-    if browsing(&options) {
+    if menu_wanted(&options) {
         match tui::menu::ask(&arguments)? {
             None => return Ok(0),
             Some(chosen) => match parse_arguments_from(chosen.into_iter())? {
@@ -236,8 +243,10 @@ fn browse(
         }
         return 0;
     }
-    if !options.interactive && options.list {
-        return 0; // --list already printed everything the run was asked for
+    if !browsing_flags(options) {
+        // --list already printed everything the run was asked for. (`--auto`
+        // never reaches here: the caller took the other branch.)
+        return 0;
     }
     if scan.reported().is_empty() {
         if !options.list {
@@ -288,5 +297,37 @@ mod tests {
     fn the_default_report_path_is_a_file_not_a_directory() {
         assert!(default_report_path().file_name().is_some());
         assert!(default_report_path().starts_with(Path::new(&std::env::temp_dir())));
+    }
+
+    #[test]
+    fn the_menu_opens_for_exactly_the_runs_the_browser_opens_for() {
+        // Every combination of the three flags that decide it. The menu is the
+        // browser's front door, so a run that is asked about its options and
+        // then does not browse — or browses without being asked — is the bug
+        // this pins.
+        for list in [false, true] {
+            for interactive in [false, true] {
+                for auto in [None, Some("shortest".to_string())] {
+                    let options = Options {
+                        list,
+                        interactive,
+                        auto: auto.clone(),
+                        ..Options::new()
+                    };
+                    let by_flags = browsing_flags(&options);
+                    let wanted = auto.is_none() && (interactive || !list);
+                    assert_eq!(
+                        by_flags, wanted,
+                        "list={list} interactive={interactive} auto={auto:?}"
+                    );
+                    // ...and the menu adds the terminal and nothing else.
+                    assert_eq!(
+                        menu_wanted(&options),
+                        tui::has_terminal() && by_flags,
+                        "list={list} interactive={interactive} auto={auto:?}"
+                    );
+                }
+            }
+        }
     }
 }
