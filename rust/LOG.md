@@ -1971,3 +1971,22 @@ them:
 
 Final: `cargo test` 159 passed, clippy and fmt clean, `--gate all` 33/33, and
 every evidence script re-run against the branch tip.
+
+### What the seek counter costs
+
+The counter locks on every read block and `read_block` is the scored profile's
+hot path, so it was measured rather than argued about
+(`evidence/scripts/seek_counter_cost.py`, against a build of `main` at
+`baf9e25` on the same tree):
+
+- `bytes_read`, `opens`, `files_seen`, `bytes_seen` and the groups are
+  **identical** between the two builds at `-j 1` and `-j 8`. That is the part
+  RBENCH's byte-determinism gate and the conformance effort check actually
+  read, and it does not care what else is running on the machine.
+- Wall clock is **not claimed**. This box is shared with other agents and sat
+  at load average 5.1; one run of the script reported 0.18x on one half of the
+  comparison and 1.29x on the other, which is contention and nothing else. Four
+  runs with the load visible put it between 0.92x and 1.03x, which is to say no
+  effect anybody can measure here. A real figure wants a quiet machine, and the
+  script now prints the load average and the sample spread so a reader can tell
+  which kind of run they are looking at.

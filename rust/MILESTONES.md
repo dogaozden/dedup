@@ -1249,6 +1249,47 @@ HDD wall-clock unvalidated: no rotational drive is available here.
 The bytes column is the price: at 32 copies, 10% more bytes read for a third of
 the seeks. That is the trade SPIN.md asks for by name.
 
+### What the counter costs the profile that is scored
+
+The counter takes a lock on every read block, and `read_block` is the default
+profile's hot path. So the default profile was run against a build of `main` at
+`baf9e25` on the same tree:
+
+```
+python3 rust/evidence/scripts/seek_counter_cost.py \
+  <main-build> rust/target/release/dedup-rs <scratch-dir>
+```
+
+Captured to `evidence/m6-counter-cost.txt`:
+
+```text
+corpus: 156 MiB, 4012 files
+load average: 5.14 5.49 5.26  (this machine is shared; a figure above about 1 makes the timings below indicative only)
+
+-j 1   (7 runs each, page cache warm, medians)
+  main            92.4 ms  (min 90.4, max 113.9)   bytes_read 170599168  opens 4048  groups 10
+  this branch     91.2 ms  (min 90.1, max 92.9)   bytes_read 170599168  opens 4048  groups 10
+  -> this branch / main = 0.987x wall clock (indicative); bytes_read, opens, files_seen, bytes_seen and the groups all identical (exact)
+
+-j 8   (7 runs each, page cache warm, medians)
+  main            61.5 ms  (min 59.0, max 68.3)   bytes_read 170599168  opens 4048  groups 10
+  this branch     58.2 ms  (min 57.6, max 59.8)   bytes_read 170599168  opens 4048  groups 10
+  -> this branch / main = 0.946x wall clock (indicative); bytes_read, opens, files_seen, bytes_seen and the groups all identical (exact)
+
+nothing the harness measures moved
+```
+
+`bytes_read`, `opens`, `files_seen`, `bytes_seen` and the groups are identical
+between the two builds — that is the part of this that is a fact, and it is
+what RBENCH's byte-determinism gate and the conformance effort check read.
+
+The wall clock is not claimed. This machine is shared with other agents and was
+at load average 5.1 throughout; an earlier run of the same script reported
+0.18x and 1.29x on the two halves of one comparison, which is contention and
+nothing else. Four runs at a load this reader can see put it between 0.92x and
+1.03x — i.e. no effect anybody can measure here — and a real figure wants a
+quiet machine.
+
 ### Where `--profile` meets the other flags
 
 REVIEW-M4's first finding was a mode that changed what a group meant, in a
