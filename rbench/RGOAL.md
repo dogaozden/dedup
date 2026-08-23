@@ -490,8 +490,9 @@ The scenarios therefore fall into three classes:
   milliseconds and stays there. Giving all three another 240 MB of RAM disk
   was measured to buy 13 ms between them, and would have cost the volume the
   headroom it needs to not evict a corpus every run. Not spent.
-- **responds to nothing** — `rescan`. Its warm scan reads nothing by design and
-  walks thirteen files, so it is startup and a rounding error. See below.
+- **responded to nothing** — `rescan`, as it was. Its warm scan reads nothing by
+  design and walked thirteen files, so it was startup and a rounding error. It
+  has since been reshaped rather than rescaled; see below.
 
 ### The `r2` scale
 
@@ -501,52 +502,104 @@ common wall clock. `smoke` is untouched and is still what development runs on.
 `default` is kept so round-one corpora still build and is not comparable with
 anything here.
 
-| scenario | factor | files | corpus | baseline s | startup share |
+| scenario | factor | files | on disk | baseline s | startup share |
 |---|---|---|---|---|---|
-| needle | 1.0 | 100,000 | 243.8 MB | 1.6177 | 0.2% |
-| typical | **1.6** | 25,600 | 440.1 MB | 0.2549 | 1.4% |
-| widegroup | **3.6** | 1,820 | 451.4 MB | 0.2096 | 1.7% |
-| samesize | 1.0 | 1,402 | 414.0 MB | 0.0240 | 15.0% |
-| photos | 1.0 | 100 | 393.6 MB | 0.0231 | 15.6% |
-| bigheader | 1.0 | 8 | 450.0 MB | 0.0223 | 16.1% |
-| rescan | 1.0 (smoke) | 13 | 48.8 MB | 0.0058 | 62% |
-| `prefixtrap` (gate) | 1.0 (smoke) | 32 | 64.0 MB | 0.0075 | 48% |
+| needle | **0.5** | 50,000 | 196 MB | 0.6934 | 0.5% |
+| typical | **1.2** | 19,200 | 386 MB | 0.1664 | 2.2% |
+| widegroup | **3.6** | 1,820 | 452 MB | 0.1710 | 2.1% |
+| samesize | 1.0 | 1,402 | 415 MB | 0.0246 | 14.6% |
+| photos | 1.0 | 100 | 394 MB | 0.0227 | 15.9% |
+| bigheader | 1.0 | 8 | 451 MB | 0.0232 | 15.5% |
+| rescan | **0.7** | 11,200 | 231 MB | 0.0277 | 13.0% |
+| `prefixtrap` (gate) | 0.1 (smoke) | 32 | 65 MB | 0.0072 | 50% |
+
+`baseline s` for `rescan` is its **warm** scan, which is the half that is scored;
+its cold half is the harness's untimed priming run and has no figure of its own.
 
 Startup share is against `main`'s own measured startup of 3.6 ms, of which
 2.2 ms is work it chooses to do and 1.3 ms is bare process creation.
 
 `baseline s` is `main` at `baf9e25`, which is what the pin is about to become,
-**not** the currently pinned `c238b30`. Every corpus fits the 500 MB envelope;
-the whole set occupies 2508 MB of the 2816 MB volume, which leaves it able to
-hold all eight at once and stop rebuilding. Generation is 0.1–6.3 s per corpus
-and the oracle pass 0.1–3.4 s, both far inside the two-minute budget.
+**not** the currently pinned `c238b30`. Generation is 0.1–4.2 s per corpus and
+the oracle pass 0.1–2.4 s, both far inside the two-minute budget.
 
-Two of the three that respond were pushed to the envelope and both beat the
-linear projection — `typical` was predicted at 0.215 s and measured 0.2626,
-`widegroup` predicted 0.256 and measured 0.2379. `needle` was left alone: it
-was already 1.6 s, it is the cheapest wall clock per megabyte by a factor of
-ten, and doubling it would have doubled the harness's own fingerprint pass for
-nothing.
+### Size these against disk, not against bytes
 
-### `rescan` is still 63% startup, and scale cannot fix it
+The first cut of `r2` was sized from the manifests' `total_bytes` and overflowed
+the volume without saying so. The volume is HFS+ with a **4 KiB allocation
+block**, and a tree of small files costs appreciably more than it contains:
+`needle`'s files average 2.6 KB and each occupies a whole block, which is 136 MB
+of difference on that corpus alone. The set that was supposed to occupy 2508 MB
+of 2816 actually wanted about 2860, and the symptom was quiet — `needle` and
+`bigheader` were evicted and rebuilt on **every single run**, which the logs
+show plainly once you look for `built` lines and which no gate has any reason to
+mention.
 
-This is the one thing round two should know and the one thing this branch did
-not fix. `rescan`'s warm scan reads nothing — that is the point of it — over a
-corpus of thirteen large files, so the work it does is a walk of thirteen
-entries. At `default` scale it would be a hundred files and no better. There is
-no factor that makes a warm re-scan of a few-large-files tree cost anything.
+Two lessons, both cheap to act on and both easy to miss:
 
-It matters because `rescan` scored **0.0448** in the run below, the largest
-single term in the geomean, and essentially all of it is the startup cost round
-one removed. A cache measurement that cannot see the cache is not measuring the
-cache.
+- **`du`, never `total_bytes`.** `ensure_space` compares against real free
+  space, so a plan made in data bytes is a plan made in the wrong unit.
+- **Check the `built` lines after a run.** A corpus that is rebuilt every time
+  is a corpus that did not fit, and the run still passes every gate while it
+  happens.
 
-The fix is a shape change, not a scale change: `rescan` borrows `_photos`
-because it wanted a corpus, not because few-large-files is the right shape for
-a cache test. A file-count-heavy corpus would put the warm scan's time into the
-walk-and-look-up path the cache actually lives in. **That is a maintainer's
-call** — it changes what a scored scenario measures, and §3 freezes the scored
-list — so it is recorded here and not done.
+`ensure_space` evicts in alphabetical order and reserves 1.4× its estimate, so
+under pressure it will drop `bigheader` and `needle` — the two most expensive
+things to rebuild — before anything else, and the two of them then take turns
+being missing. That is existing behaviour and not worth changing for this; the
+fix is to leave enough room that it never runs.
+
+Sizes are therefore set from measured disk usage, with `needle` and `typical`
+held well below what would fit because they have the slack to spare: both still
+run far above any startup effect, and their megabytes buy much more on `rescan`,
+which had none. The eight corpora a scored run touches occupy **2599 MB** of the
+2739 MB the volume has for corpora, leaving about 140 MB — enough that a run
+which rebuilds nothing evicts nothing.
+
+### `rescan` reshaped: off `photos`, onto `typical`
+
+`rescan`'s warm scan reads nothing — that is the point of it — so the only work
+it can possibly do is walk the tree, stat every file and ask the cache about
+each one. All of that is per-file, and over `photos`' thirteen large files it
+came to about a millisecond. The scenario scored **0.0448**, the largest single
+term in the geomean, and essentially all of it was the startup cost round one
+had just removed. A cache test that cannot see the cache measures nothing.
+
+It now borrows `typical`'s shape instead. It keeps its own directory for the
+reason it always had one. `WARM_CEILING`, the warm correctness gate and the cold
+half's gates are all untouched, and the cold half runs like any other cold scan.
+
+**Its `min_size` is one byte above `DEEP_HEAD`, and that is the whole trick.**
+The first attempt used `min_size` 1 and failed `WARM_CEILING` outright, reading
+**69%** of its cold bytes back on every warm scan. The cause is in the tool, and
+it is worth writing down because no scored scenario prices it:
+
+> `small_file_stage` settles everything at or below `DEEP_HEAD` in one pass, and
+> it calls `cache.remember(…, Field::Full, …)` **only for groups it proved to be
+> duplicates**. A small file found unique is never remembered. A size class is
+> then settled from the cache only when *every* member of it carries a digest,
+> so a single unique file sends its whole class back to disk. `typical` is ~96%
+> unique small files, so nearly every class was re-read.
+
+Above `DEEP_HEAD` the staged pipeline caches a digest for every file it opens,
+unique ones included, and the warm scan reads exactly **0 B**. The whole tree is
+still walked and stat'd — `min_size` decides what is *considered*, not what is
+*visited* — so the file count, which is the measurement, is undiminished.
+
+**That finding is the more valuable half of this change.** A real warm re-scan
+of an ordinary tree re-reads every unique small file it has ever seen, every
+time. Caching the unique verdict for small files looks like a genuine win, and
+none of the scored seven can see it.
+
+**A sharp edge, recorded deliberately.** Few files are considered and their
+sizes are drawn from a continuous distribution, so no two of them share a size
+and the oracle reads nothing but the duplicate groups. `rescan`'s cold legal
+band is therefore **zero bytes wide** — floor equal to ceiling. That is the
+ordinary ceiling and floor gates on a corpus where the optimal read *is* the
+floor, not a weakened or special-cased gate, and §5.2 says reading more than the
+oracle is a regression. But it does mean any candidate reading one extra byte on
+`rescan`'s cold pass voids, and an eager or batched head read would do it. Met
+by surprise it looks like a broken harness, so it is written down here.
 
 ### The trap gate
 
@@ -583,30 +636,35 @@ of arithmetic. The predecessor bench set a target below what the hardware
 charges once; a target like that can only be hit by a candidate that stopped
 doing the work.
 
-Measured against `main` at `r2`, load average 5.1:
+Measured against `main` at `r2`, on a quiet machine:
 
 ```
-process creation 0.0013 s   ·   main's own startup 0.0036 s (2.2 ms removable)
-read 32.07 GB/s   ·   lstat 1.18 µs   ·   open+close 12.31 µs
-readdir 0.25 µs/entry
+process creation 0.0013 s   ·   open + close 11.68 µs   ·   readdir 0.26 µs
 
-scenario      files   spawn    walk   opens    read   floor  base s  floor/base
-needle      100,000  0.0013  0.1176  0.0012  0.0000  0.1202  1.6177        7.4%
-typical      25,600  0.0013  0.0301  0.0304  0.0014  0.0633  0.2549       24.8%
-samesize      1,402  0.0013  0.0016  0.0011  0.0007  0.0048  0.0240       20.1%
-widegroup     1,820  0.0013  0.0021  0.0224  0.0148  0.0406  0.2096       19.4%
-photos          100  0.0013  0.0001  0.0005  0.0048  0.0068  0.0231       29.4%
-bigheader         8  0.0013  0.0000  0.0000  0.0037  0.0050  0.0223       22.7%
-rescan           13  0.0013  0.0000  0.0000  0.0000  0.0014  0.0058       23.7%
-prefixtrap       32  0.0013  0.0000  0.0001  0.0005  0.0020  0.0075       26.8%
+scenario     files   spawn    walk   opens    read   floor  base s  floor/base
+needle      50,000  0.0013  0.0503  0.0006  0.0000  0.0522  0.7487        7.0%
+typical     19,200  0.0013  0.0193  0.0216  0.0011  0.0434  0.1759       24.6%
+samesize     1,402  0.0013  0.0014  0.0011  0.0008  0.0045  0.0243       18.6%
+widegroup    1,820  0.0013  0.0018  0.0213  0.0153  0.0397  0.1715       23.1%
+photos         100  0.0013  0.0001  0.0005  0.0050  0.0069  0.0231       29.7%
+bigheader        8  0.0013  0.0000  0.0000  0.0038  0.0051  0.0255       20.1%
+rescan      11,200  0.0013  0.0113  0.0000  0.0000  0.0126  0.0284       44.2%
+prefixtrap      32  0.0013  0.0000  0.0001  0.0005  0.0020  0.0074       26.7%
 
-HONEYPOT: targets below ≈0.1966 are not reachable honestly.
-          ≈0.1411 if the walk became a bulk directory read.
+HONEYPOT: targets below ≈0.2126 are not reachable honestly.
+          ≈0.1373 if the walk became a bulk directory read.
 ```
 
-Read that against round one's 0.3173: the room left below the new pin is
-roughly a factor of five, not another factor of three, and `needle`'s walk is
-where most of it sits.
+Read that against round one's 0.3173: the room left below the new pin is roughly
+a factor of five, not another factor of three, and the walk is where most of it
+sits.
+
+`rescan`'s row is worth a second look. Its floor is **44.2%** of its baseline
+and almost all of that is the walk — which is the whole object of the reshape.
+Where the old `rescan` was a startup measurement with a rounding error attached,
+it is now a walk-and-cache-lookup measurement with a known irreducible half. It
+is also the second scenario, after `needle`, whose number a bulk directory read
+would move.
 
 **These are placeholders.** Re-run `floor.py` at pin time, on a quiet machine,
 after the pin moves; the numbers above were taken with another builder working.
@@ -655,39 +713,56 @@ contain, and the run below reports a score against the *old* pin because that
 is what the harness was still holding.
 
 **Numbers.** Full scored run, `--scale r2 --candidate baf9e25`, nine rounds,
-baseline the stale pin `c238b30`, load average 3.75, another builder working:
+baseline the stale pin `c238b30`, load average 4.73, another builder working.
+**This run rebuilt nothing** — every corpus was already resident, which is the
+check that the set fits:
 
 ```
 scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
-needle       1.7118  1.6177  0.9582   ±1.6%  243.8 MB  243.8 MB  260.9 KB
-typical      0.3153  0.2549  0.8006   ±1.3%  101.8 MB  101.8 MB   44.1 MB
-samesize     0.0811  0.0240  0.3005   ±1.0%   32.8 MB   32.8 MB   22.5 MB
-widegroup    0.2503  0.2096  0.7761   ±6.1%  451.3 MB  451.3 MB  451.3 MB
-photos       0.0802  0.0231  0.2914   ±0.7%  147.9 MB  147.9 MB  147.8 MB
-bigheader    0.0786  0.0223  0.2806   ±2.2%  146.2 MB  146.2 MB  112.0 MB
-rescan       0.1190  0.0058  0.0483   ±0.3%       0 B   32.8 MB   32.8 MB
-prefixtrap*  0.0630  0.0075  0.1213   ±0.3%   16.2 MB   16.2 MB   16.0 MB
+needle       0.7556  0.6934  0.9177   ±4.0%  122.1 MB  122.1 MB  133.3 KB
+typical      0.2262  0.1664  0.7400   ±0.8%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0814  0.0246  0.3013   ±1.0%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.2573  0.1710  0.7145   ±3.6%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0791  0.0227  0.2874   ±0.3%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0810  0.0232  0.2918   ±1.3%  146.2 MB  146.2 MB  112.0 MB
+rescan       0.1422  0.0277  0.1961   ±0.2%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0636  0.0072  0.1140   ±0.3%   16.2 MB   16.2 MB   16.0 MB
 
-SCORE: 0.3547
+SCORE: 0.4225
 ```
 
-That 0.3547 is not a result — it is the round-one win being re-measured at a
-new scale against a pin that has not moved yet. It is here as proof that all
-seven scored scenarios and the new gate run to completion with every gate green
-at `r2`. An earlier run of the same pair, before the last of these edits,
-scored 0.3538; 0.25% apart, comfortably inside the floor below.
+That 0.4225 is not a result — it is the round-one win being re-measured at a new
+scale against a pin that has not moved yet. It is here as proof that all seven
+scored scenarios and the new gate run to completion with every gate green at
+`r2`. The immediately preceding run of the same pair scored 0.4219, 0.14% away.
+
+`rescan`'s row is the reshape working: **0 B** read on the warm side, against a
+cold scan of 5.2 MB, over 11,200 files instead of thirteen.
 
 `--calibrate --rounds 9` at `r2`, the same afternoon and the same shared
-machine: geomean **1.0026**, **noise floor ±2.0%** (worst scenario `typical` at
-0.9797), worst per-round dispersion `widegroup` at ±6.5%. Round one's
-equivalent at smoke scale was ±3.4%, so the larger corpora bought a tighter
-floor on a busier machine, which is what they were for. **This is not the
-noise floor of record** — recalibrate at pin time, on a quiet machine, against
-the new pin.
+machine: geomean **1.0002**, **noise floor ±2.1%** (worst scenario `samesize` at
+1.0214), worst per-round dispersion `widegroup` at ±7.4%. Round one's equivalent
+at smoke scale was ±3.4%, so the larger corpora bought a tighter floor on a
+busier machine, which is what they were for — and the floor did not loosen when
+`needle` and `typical` were cut back to fit the volume, which is the evidence
+that those cuts were slack rather than signal. **This is not the noise floor of
+record** — recalibrate at pin time, on a quiet machine, against the new pin.
 
 `--selftest`: 5 of 5 sabotages caught (`drop-group`, `inflate-bytes`,
 `underreport-bytes`, `touch-corpus`, `shrunk-head`), both honest controls
 clean.
+
+`rescan`'s two halves, timed directly rather than by the harness, which never
+times the priming scan — fastest of five, `main` at `baf9e25`:
+
+| half | seconds | bytes | opens |
+|---|---|---|---|
+| cold | 0.0398 | 5,443,825 | 63 |
+| warm | 0.0259 | **0** | **0** |
+
+Zero opens on the warm side is the reshape's whole claim in one number: every
+considered file was answered from the cache without being touched, and what
+remains on the clock is the walk over 11,200 files.
 
 **Verdict:** KEPT — this is preparation, not an optimization. Nothing in
 `rust/` was touched and no score was chased.

@@ -98,16 +98,17 @@ ORDER = list(SCORE_SCENARIOS) + list(GATE_SCENARIOS)
 # corpus the harness is about to ask about nine more times.
 CACHE_ON = ("rescan",)
 
-# `rescan` always builds at smoke scale whatever --scale asked for. It is a
-# warm-cache measurement — everything it reports is a ratio — and its 430 MB
-# at default scale is what tips the corpora past what the RAM disk holds.
+# `prefixtrap` is pinned to smoke whatever --scale asked for: it is a gate, not
+# a term, so nothing about it is a timing, and the trap survives the small
+# scale intact — every band still exists and still diverges on the byte after
+# its shared prefix. Paying for a full-scale corpus would buy the gate nothing
+# and cost the scored scenarios the room.
 #
-# `prefixtrap` is pinned to smoke for a different reason: it is a gate, not a
-# term, so nothing about it is a timing, and the trap survives the small scale
-# intact — every band still exists and still diverges on the byte after its
-# shared prefix. Paying for a full-scale corpus would buy the gate nothing and
-# cost the scored scenarios the room.
-GATE_SCALE = {"rescan": "smoke", "prefixtrap": "smoke"}
+# `rescan` used to be pinned here too, because its `photos` corpus cost 430 MB
+# at full scale and bought a warm scan that read nothing over a hundred files.
+# Round two moved it onto `typical`'s shape, where the file count is the whole
+# measurement, so it takes a scale factor like everything else.
+GATE_SCALE = {"prefixtrap": "smoke"}
 
 # A warm scan of a corpus nobody has touched should read essentially nothing.
 # Five percent is a ceiling with room in it; the real figure is zero.

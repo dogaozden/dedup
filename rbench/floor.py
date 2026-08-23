@@ -85,17 +85,21 @@ import corpus                                           # noqa: E402
 # tool reads in and the fastest this volume goes. One big serial read measures
 # a memcpy and would understate what the hardware allows.
 #
-# Small on purpose. This runs on a volume whose whole point is being full of
-# corpora, and a probe that needed room would either fail or evict one — and
-# evicting a corpus to measure the machine would cost more to rebuild than the
-# measurement is worth. 64 MB at RAM-disk speed is still tens of milliseconds,
-# which is four orders of magnitude above the clock's resolution.
+# Small on purpose, and smaller than feels comfortable. A full volume is this
+# script's normal working condition, not an edge case: the corpora are sized to
+# leave about 140 MB, so a probe that wanted more than that would refuse to run
+# exactly when someone needed it. Evicting a corpus instead is not an option —
+# it costs more to rebuild than these numbers are worth, and the next scored run
+# would silently pay for it. 48 MB at RAM-disk speed is still milliseconds,
+# three orders of magnitude above the clock's resolution, and every figure is
+# the fastest of REPEATS passes.
 PROBE_FILES = 8
-PROBE_BYTES = 8 << 20
+PROBE_BYTES = 6 << 20
 PROBE_BUFFER = 1 << 20
 
-# What the probes need, with room to land. Checked before anything is written.
-PROBE_SPACE = 160 << 20
+# What the probes actually occupy (48 MB of read probe, 16 MB of small files)
+# with room to land. Checked before anything is written.
+PROBE_SPACE = 80 << 20
 
 # The syscall probe. Enough files that the per-call figure is not a timer
 # artefact, few enough that laying them down is instant.
