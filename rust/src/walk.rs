@@ -5,12 +5,15 @@
 //! counted after the name filters and before the size filter, which is the
 //! order `dedup.py`'s walkers use and the order the protocol asks for.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::filters::{excluded, extension_allowed, Filters};
+use crate::sys::{BulkDir, VDIR, VLNK, VREG};
 
 /// One file. A hardlinked inode is one record wearing several names, because
 /// deleting fewer than all of them frees nothing.
@@ -127,76 +130,186 @@ pub fn walk(
     unreadable: &mut Vec<String>,
 ) -> Vec<FileRec> {
     let mut survivors = Vec::new();
-    let mut directories = vec![root.to_path_buf()];
+    // Each directory carries the relative path it was reached by, so a child's
+    // relative name is one push onto its parent's rather than a fresh strip of
+    // the whole path.
+    let mut directories = vec![(root.to_path_buf(), String::new())];
+    let mut bulk = BulkDir::default();
 
-    while let Some(directory) = directories.pop() {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
+    while let Some((directory, prefix)) = directories.pop() {
+        // One call for the whole directory, names and attributes together.
+        // Anything the kernel will not describe completely comes back `false`
+        // with nothing reported, and that directory alone takes the portable
+        // path below.
+        if bulk.read(&directory) {
+            gather_bulk(
+                &bulk,
+                &directory,
+                &prefix,
+                filters,
+                files_seen,
+                bytes_seen,
+                &mut survivors,
+                &mut directories,
+            );
+            continue;
+        }
+        gather_portable(
+            root,
+            &directory,
+            filters,
+            files_seen,
+            bytes_seen,
+            unreadable,
+            &mut survivors,
+            &mut directories,
+        );
+    }
+
+    survivors
+}
+
+/// A directory the kernel described in bulk.
+#[allow(clippy::too_many_arguments)]
+fn gather_bulk(
+    bulk: &BulkDir,
+    directory: &Path,
+    prefix: &str,
+    filters: Filters,
+    files_seen: &mut u64,
+    bytes_seen: &mut u64,
+    survivors: &mut Vec<FileRec>,
+    directories: &mut Vec<(PathBuf, String)>,
+) {
+    for (name, entry) in bulk.entries() {
+        let relative = child_relative(prefix, name);
+        // Tested before the entry is looked at any further, so an excluded
+        // directory is never entered and nothing inside it can be tripped
+        // over on the way in.
+        if excluded(&relative, &filters) {
+            continue;
+        }
+        if entry.objtype == VLNK {
+            continue;
+        }
+        if entry.objtype == VDIR {
+            // Joined from the raw name rather than the relative one: only the
+            // relative spelling folds a backslash onto a slash, and the path
+            // we open has to stay the name the kernel gave us.
+            directories.push((directory.join(OsStr::from_bytes(name)), relative));
+            continue;
+        }
+        if entry.objtype != VREG || !extension_allowed(&relative, &filters) {
+            continue;
+        }
+
+        *files_seen += 1;
+        *bytes_seen += entry.size;
+        if entry.size < filters.min_size {
+            continue;
+        }
+        survivors.push(FileRec {
+            names: vec![relative],
+            size: entry.size,
+            dev: entry.dev,
+            ino: entry.ino,
+            nlink: entry.nlink,
+            mtime_ns: entry.mtime_ns,
+            retained: None,
+        });
+    }
+}
+
+/// `prefix/name`, spelled the way `relative_path` spells it.
+fn child_relative(prefix: &str, name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
+    let mut relative = String::with_capacity(prefix.len() + 1 + name.len());
+    if !prefix.is_empty() {
+        relative.push_str(prefix);
+        relative.push('/');
+    }
+    for character in name.chars() {
+        relative.push(if character == '\\' { '/' } else { character });
+    }
+    relative
+}
+
+/// The portable walk, for a directory `getattrlistbulk` would not describe.
+#[allow(clippy::too_many_arguments)]
+fn gather_portable(
+    root: &Path,
+    directory: &Path,
+    filters: Filters,
+    files_seen: &mut u64,
+    bytes_seen: &mut u64,
+    unreadable: &mut Vec<String>,
+    survivors: &mut Vec<FileRec>,
+    directories: &mut Vec<(PathBuf, String)>,
+) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            unreadable.push(relative_path(root, directory));
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(_) => {
-                unreadable.push(relative_path(root, &directory));
+                unreadable.push(relative_path(root, directory));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let relative = relative_path(root, &path);
+        // Tested before the entry is looked at any further, so an excluded
+        // directory is never entered and nothing inside it can be tripped
+        // over on the way in.
+        if excluded(&relative, &filters) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                unreadable.push(relative);
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            directories.push((path, relative));
+            continue;
+        }
+        if !file_type.is_file() || !extension_allowed(&relative, &filters) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                unreadable.push(relative);
                 continue;
             }
         };
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    unreadable.push(relative_path(root, &directory));
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let relative = relative_path(root, &path);
-            // Tested before the entry is looked at any further, so an excluded
-            // directory is never entered and nothing inside it can be tripped
-            // over on the way in.
-            if excluded(&relative, &filters) {
-                continue;
-            }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => {
-                    unreadable.push(relative);
-                    continue;
-                }
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                directories.push(path);
-                continue;
-            }
-            if !file_type.is_file() || !extension_allowed(&relative, &filters) {
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    unreadable.push(relative);
-                    continue;
-                }
-            };
-
-            *files_seen += 1;
-            *bytes_seen += metadata.len();
-            if metadata.len() < filters.min_size {
-                continue;
-            }
-            survivors.push(FileRec {
-                names: vec![relative],
-                size: metadata.len(),
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-                nlink: metadata.nlink(),
-                mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-                retained: None,
-            });
+        *files_seen += 1;
+        *bytes_seen += metadata.len();
+        if metadata.len() < filters.min_size {
+            continue;
         }
+        survivors.push(FileRec {
+            names: vec![relative],
+            size: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            nlink: metadata.nlink(),
+            mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+            retained: None,
+        });
     }
-
-    survivors
 }
 
 /// Fold the names of one inode, whose records sit at `[..]`, onto the first.

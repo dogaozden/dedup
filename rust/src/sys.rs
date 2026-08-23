@@ -515,3 +515,281 @@ mod terminal {
         close(main);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bulk directory reads
+//
+// REWRITE.md §4 wants the walk to stop paying for one `lstat` per file. The
+// kernel will hand over a whole directory's names *and* their attributes in
+// one call, which is what `getattrlistbulk(2)` is for, and on HFS+ and APFS
+// that is one pass over the catalog instead of a lookup per entry.
+//
+// Unlike the rest of this module this path *is* load-bearing: it produces the
+// file list. It keeps the module's contract anyway — `BulkDir::read` answers
+// `false` for anything the platform will not describe completely, and the
+// walk falls back to `read_dir` for that directory. It never answers `true`
+// having seen only part of a directory, so a caller can fall back without
+// risking a double count.
+// ---------------------------------------------------------------------------
+
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+const ATTR_CMN_NAME: u32 = 0x0000_0001;
+const ATTR_CMN_DEVID: u32 = 0x0000_0002;
+const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+const ATTR_CMN_FILEID: u32 = 0x0200_0000;
+const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
+const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+
+/// `enum vtype` — the three this walk distinguishes. Everything else is
+/// neither a file nor a directory and is skipped exactly as `read_dir`'s
+/// `is_file`/`is_dir` pair skips it.
+pub const VREG: u32 = 1;
+pub const VDIR: u32 = 2;
+pub const VLNK: u32 = 5;
+
+/// What every entry must carry before the walk will trust the batch.
+const WANT_COMMON: u32 = ATTR_CMN_RETURNED_ATTRS
+    | ATTR_CMN_NAME
+    | ATTR_CMN_DEVID
+    | ATTR_CMN_OBJTYPE
+    | ATTR_CMN_MODTIME
+    | ATTR_CMN_FILEID;
+const WANT_FILE: u32 = ATTR_FILE_LINKCOUNT | ATTR_FILE_DATALENGTH;
+
+/// One directory's worth of buffer, sized so an ordinary directory comes back
+/// in a single call and a large one in a handful.
+const BULK_BUFFER: usize = 128 * 1024;
+
+#[repr(C)]
+struct AttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+extern "C" {
+    fn getattrlistbulk(
+        dirfd: c_int,
+        attrlist: *mut c_void,
+        buffer: *mut c_void,
+        buffersize: usize,
+        options: u64,
+    ) -> c_int;
+}
+
+/// One directory entry, as the kernel described it. `name` is an offset into
+/// the arena rather than a `String` so that a directory of 50,000 entries
+/// costs one allocation rather than 50,000.
+pub struct BulkEntry {
+    name_at: u32,
+    name_len: u32,
+    pub objtype: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+/// Scratch reused across every directory of a walk: the kernel's buffer, the
+/// name arena, and the parsed entries.
+#[derive(Default)]
+pub struct BulkDir {
+    buffer: Vec<u8>,
+    names: Vec<u8>,
+    entries: Vec<BulkEntry>,
+}
+
+/// Read `offset` bytes into `buffer` as a `T`. The kernel packs these fields
+/// end to end with no padding, so almost none of them are aligned and every
+/// read has to say so.
+///
+/// SAFETY: the caller has checked that `offset + size_of::<T>()` is within
+/// `buffer`, and every `T` used here is a plain integer with no invalid bit
+/// patterns.
+unsafe fn unpack<T: Copy>(buffer: &[u8], offset: usize) -> T {
+    std::ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<T>())
+}
+
+impl BulkDir {
+    /// Fill this scratch with `directory`'s entries.
+    ///
+    /// `false` means the platform did not describe the directory completely
+    /// and the caller must fall back; nothing read here is then usable, and
+    /// no caller has been told about any of it yet.
+    pub fn read(&mut self, directory: &Path) -> bool {
+        self.names.clear();
+        self.entries.clear();
+        if self.buffer.len() != BULK_BUFFER {
+            self.buffer.resize(BULK_BUFFER, 0);
+        }
+
+        let Ok(c_path) = CString::new(directory.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is NUL-terminated and outlives the call.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return false;
+        }
+
+        let mut request = AttrList {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: WANT_COMMON,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: WANT_FILE,
+            forkattr: 0,
+        };
+
+        let complete = loop {
+            // SAFETY: `request` is a well-formed attrlist that outlives the
+            // call, and the kernel writes at most `BULK_BUFFER` bytes into a
+            // buffer of exactly that size.
+            let count = unsafe {
+                getattrlistbulk(
+                    fd,
+                    std::ptr::addr_of_mut!(request).cast::<c_void>(),
+                    self.buffer.as_mut_ptr().cast::<c_void>(),
+                    BULK_BUFFER,
+                    0,
+                )
+            };
+            if count < 0 {
+                break false;
+            }
+            if count == 0 {
+                break true;
+            }
+            if !self.parse(count as usize) {
+                break false;
+            }
+        };
+
+        // SAFETY: `fd` came from a successful `open` and is closed once.
+        unsafe { libc::close(fd) };
+        complete
+    }
+
+    /// Split one batch of `count` entries out of the buffer.
+    fn parse(&mut self, count: usize) -> bool {
+        let mut base = 0_usize;
+        for _ in 0..count {
+            if base + 4 > self.buffer.len() {
+                return false;
+            }
+            // SAFETY: bounds checked immediately above and below; every read
+            // below stays inside `base .. base + length`.
+            let length = unsafe { unpack::<u32>(&self.buffer, base) } as usize;
+            if length < 24 || base + length > self.buffer.len() {
+                return false;
+            }
+            if !self.parse_entry(base, length) {
+                return false;
+            }
+            base += length;
+        }
+        true
+    }
+
+    fn parse_entry(&mut self, base: usize, length: usize) -> bool {
+        let end = base + length;
+        let mut at = base + 4;
+
+        // SAFETY: `at + 20 <= end <= buffer.len()`, checked by the caller's
+        // `length < 24` guard.
+        let returned_common = unsafe { unpack::<u32>(&self.buffer, at) };
+        let returned_file = unsafe { unpack::<u32>(&self.buffer, at + 12) };
+        at += 20;
+
+        // Anything the kernel declined to describe sends the whole directory
+        // down the portable path rather than being guessed at.
+        if returned_common & WANT_COMMON != WANT_COMMON {
+            return false;
+        }
+
+        macro_rules! take {
+            ($ty:ty) => {{
+                let size = std::mem::size_of::<$ty>();
+                if at + size > end {
+                    return false;
+                }
+                // SAFETY: bounds checked on the line above.
+                let value = unsafe { unpack::<$ty>(&self.buffer, at) };
+                at += size;
+                value
+            }};
+        }
+
+        // The order is the order of the bits in `struct attrlist`: common
+        // attributes low bit first, then the file group.
+        //
+        // `attr_dataoffset` counts from the reference itself, so where that
+        // reference sits has to be remembered before the cursor moves on.
+        let name_reference = at;
+        let name_offset = take!(i32);
+        let name_length = take!(u32) as usize;
+        let dev = take!(i32) as u64;
+        let objtype = take!(u32);
+        let mtime_sec = take!(i64);
+        let mtime_nsec = take!(i64);
+        let ino = take!(u64);
+
+        let name_start = name_reference as i64 + name_offset as i64;
+        if name_start < base as i64 || name_length == 0 {
+            return false;
+        }
+        let name_start = name_start as usize;
+        // The length the kernel reports includes the trailing NUL.
+        let name_end = name_start + name_length - 1;
+        if name_end > end {
+            return false;
+        }
+
+        let (nlink, size) = if objtype == VREG {
+            if returned_file & WANT_FILE != WANT_FILE {
+                return false;
+            }
+            let nlink = take!(u32) as u64;
+            let size = take!(i64) as u64;
+            (nlink, size)
+        } else {
+            (0, 0)
+        };
+
+        // Every field the kernel said it returned has now been accounted for,
+        // and none of them ran past the entry it belongs to.
+        debug_assert!(at <= end);
+
+        let name_at = self.names.len() as u32;
+        self.names
+            .extend_from_slice(&self.buffer[name_start..name_end]);
+        self.entries.push(BulkEntry {
+            name_at,
+            name_len: (name_end - name_start) as u32,
+            objtype,
+            dev,
+            ino,
+            nlink,
+            size,
+            mtime_ns: mtime_sec * 1_000_000_000 + mtime_nsec,
+        });
+        true
+    }
+
+    /// The entries of the directory last read, each with its raw name.
+    pub fn entries(&self) -> impl Iterator<Item = (&[u8], &BulkEntry)> {
+        self.entries.iter().map(|entry| {
+            let at = entry.name_at as usize;
+            (&self.names[at..at + entry.name_len as usize], entry)
+        })
+    }
+}
+
