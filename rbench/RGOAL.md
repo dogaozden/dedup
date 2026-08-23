@@ -327,8 +327,8 @@ new idea you check whether the log already killed it.
 
 ## 2026-08-23 — ROUND TWO, OPUS: STOP SUMMARY
 
-**Refereed score 0.6833**, against the `94739ad` pin, on branch `opus-r2` at
-`3019856`. Unmerged, as §10 asks.
+**Refereed score 0.6669**, against the `94739ad` pin, on branch `opus-r2` at
+`db6b8c7`. Unmerged, as §10 asks.
 
 ```
 run                                        load   score
@@ -365,7 +365,8 @@ prefixtrap*  0.0069  0.0068  1.0036   ±3.2%   16.2 MB   16.2 MB   16.0 MB
 | 2 | a disk image does not charge for a seek | `6319d35` | 0.9587 → 0.8272 |
 | 3 | stop running SipHash over every small file | `039242d` | 0.8272 → 0.7900 |
 | 4 | a reader per performance core, small-file stage only | `ae7b453` | 0.7900 → 0.7824 |
-| 5 | read sibling directories concurrently | `3019856` | → **0.6833** refereed |
+| 5 | read sibling directories concurrently | `3019856` | → 0.6833 refereed |
+| 6 | compare a group against its pivot in parallel | `db6b8c7` | → **0.6669** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -1396,6 +1397,113 @@ Differences of 1-3% in both directions. macOS does not page a symbol table in
 at load, so the bytes removed were never on the critical path.
 
 **Three consecutive ideas inside the floor. This is the stop under §12.**
+
+## 2026-08-23 — the pivot comparison was serial, and three more that were not worth keeping
+
+**Where this came from.** I had already written a stop summary saying the tool
+was at its floor. It was not, and the thing that showed it was arithmetic
+rather than a hunch: `widegroup` was spending 153 ms against about 83 ms of
+work I could account for. Reading its 452 MB takes **33.5 ms** — measured, in
+C, at the thread count where it bottoms out, and **14.2 GB/s** rather than the
+27 GB/s `floor.py` measures with 48 MB probe files, because widegroup's files
+are 247 KB. Seventy milliseconds were unexplained on a scenario worth a
+seventh of the score, and a scenario I had just called finished.
+
+**Change:** `partition_blocks` picks the first block as a pivot and `memcmp`s
+every other block against it — one at a time. Those comparisons are
+independent, and on a wide group of large blocks they are the whole stage:
+`widegroup` puts 227 blocks of a quarter megabyte through a pass, per group,
+eight groups of them. The verdicts now go into a `Vec<bool>` in parallel and
+the split happens afterwards, so a run holds its members in exactly the order
+it always did and no block moves — only the `memcmp` is spread.
+
+**Numbers**, referee, clean checkout of `main`, load average 4.49:
+
+```
+scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
+needle       0.6911  0.5174  0.7486   ±3.7%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1710  0.1018  0.5952   ±1.1%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0262  0.0234  0.9100   ±5.2%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1719  0.1252  0.7353   ±6.5%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0227  0.0178  0.7384   ±3.6%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0228  0.0163  0.7172   ±2.8%  138.2 MB  146.2 MB  112.0 MB
+rescan       0.0268  0.0100  0.3715   ±0.7%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0067  0.0067  1.0083   ±2.8%   16.2 MB   16.2 MB   16.0 MB
+
+SCORE: 0.6669   (referee, from 0.6833)
+```
+
+Confirmed at `--seed 2` and `--scale default`, gates green in all of them.
+Re-profiled after: `split_identical` fell from 10.6% of `widegroup` to 6.1%
+and `memcmp` is 1.5%, which is the change doing what it claims.
+
+**§8 disclosure: this trades `samesize` away.** Across every run before and
+after, on both scorers and both scales:
+
+```
+  before: 0.8433  0.8684  0.8685  0.9186        (mean 0.875)
+  after : 0.9100  0.9437  0.9551  0.9575  0.9614  0.9655   (mean 0.949)
+```
+
+About eight percent, consistently, against wins on `widegroup`, `needle`,
+`typical` and `rescan` that net a refereed 0.6833 → 0.6669. `samesize`'s
+absolute times are 0.0234 s against 0.0262 s, so a single millisecond is four
+percent of that ratio and the scenario is the noisiest of the seven — but the
+sign is the same in nine runs out of nine and I do not think it is noise.
+**This is a cross-scenario trade and it is the maintainer's to judge, not
+mine to keep.** It stays on this unmerged branch with the table above.
+
+I tried twice to keep the win without the trade and failed both times; both
+attempts are strikes below.
+
+---
+
+## 2026-08-23 — three more inside the floor, and the stop
+
+**1. Sizing the parallel comparison by bytes per task** (`with_min_len`).
+The theory was that `samesize` regressed because it dispatches many tiny
+comparisons. It does not: its compare blocks are whole ~296 KB files, not the
+4 KB head pages I had assumed. **0.6772 against 0.6537** — worse. Reverted.
+
+**2. Raising `PARTITION_SPREAD` to 8 MB**, to leave `samesize` serial while
+`widegroup` still spreads. Two scored runs, both contaminated beyond use — a
+headless Chromium belonging to something else on this machine at 277% with
+two more instances behind it, plus a VPN client at 83%. `needle`'s own
+baseline read 0.98 s and then 1.38 s against 0.687 s, and `rescan` moved
+0.3752 → 0.4611 on a code path the change cannot reach: its warm half never
+enters the compare stage at all. **No demonstrated benefit, so not kept.**
+Recorded as a failure rather than as an unknown, which is what an
+unmeasurable change is worth.
+
+**3. One allocation instead of three in `read_batched`.** It built a vector
+per chunk, collected those into a vector of vectors, then flattened into a
+third — on `needle`, eight hundred allocations and a full extra pass over
+fifty thousand results, to arrive at the order it already had.
+`with_min_len` batches identically and collects straight into one vector.
+Measured on comparable baselines (`needle` 0.6903 against 0.6865):
+**0.6746 against 0.6537**, and every scenario moved the same direction,
+including `needle` whose spread was ±0.5%. Neutral at best. Reverted.
+
+**Three consecutive ideas inside the floor. This is the stop under §12** —
+this time with the count kept properly: a win resets it, and the last win was
+the pivot comparison above.
+
+### What is left, for round three
+
+- **`widegroup` still has about 60 ms over a hand-rolled floor** (33.5 ms to
+  read its 452 MB, ~22 ms for the two extra opens per file, ~7 ms of `memcmp`,
+  3.4 ms of startup). Half its profile sits in rayon's `bridge_producer_consumer`
+  and `join_context` frames, and with LTO inlining the closures into them I
+  could not attribute it further with `sample`. That is where I would point a
+  real profiler first.
+- **The three opens per file** are worth 10.8 ms at four threads and 21.7 ms
+  at eight, measured. Removing them needs the staged pipeline to hold a
+  descriptor across stages, which the 256-descriptor limit forbids at this
+  file count without raising it.
+- **`samesize` is the worst scored scenario at 0.91** and the one this round
+  made worse.
+
+---
 
 ## 12. The loop, and when to stop
 
