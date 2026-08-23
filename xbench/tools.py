@@ -241,8 +241,15 @@ def groups_as_inodes(tree: str, groups: list) -> frozenset:
                 # that does not exist. Keep it, distinguishably, so the group
                 # cannot accidentally match a real one.
                 inodes.add("missing:" + os.path.relpath(path, tree))
-        if len(inodes) > 1:
-            out.add(frozenset(inodes))
+        # A group whose paths all resolve to ONE inode is kept, not dropped.
+        # It is a tool claiming that a hardlink is a duplicate of itself —
+        # deleting either name frees nothing — and it is wrong. Dropping it
+        # here would let that claim through unscored, which is exactly the
+        # mistake `fclones -H` or `jdupes -H` would make if either flag ever
+        # became a default. A one-inode set can never equal a planted group,
+        # since every planted group has at least two distinct inodes, so
+        # keeping it can only ever surface as spurious.
+        out.add(frozenset(inodes))
     return frozenset(out)
 
 

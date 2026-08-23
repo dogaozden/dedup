@@ -12,7 +12,7 @@ Run it after touching tools.py, and after any competitor upgrade:
 
     python3 xbench/verify_parsers.py
 
-Two things are asserted, not one:
+Three things are asserted, not one:
 
   * every tool's answer, reduced to inodes, equals the planted answer. This
     is the check the correctness column depends on.
@@ -21,6 +21,12 @@ Two things are asserted, not one:
     recorded in tools.py as a semantic delta, and if a future fclones stops
     doing it, this check fails and the note gets corrected instead of quietly
     becoming false.
+  * the checker FAILS when it should. A correctness column that has only ever
+    printed "exact" has not been shown to work — it has been shown to agree,
+    which is a different thing and is what a checker that returned True
+    unconditionally would also do. So a correct answer is deliberately
+    corrupted six ways and every corruption must be caught. This is RBENCH's
+    selftest idea applied to the one gate XBENCH actually has.
 """
 from __future__ import annotations
 
@@ -95,6 +101,72 @@ def plant(tree: str) -> corpus.Corpus:
     return c
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# the checker, sabotaged on purpose
+# ─────────────────────────────────────────────────────────────────────────────
+
+def mutations(groups: list) -> list:
+    """(name, corrupted answer, what a working checker must say) for each way
+    a duplicate finder can be wrong.
+
+    The corruptions are applied to a KNOWN-GOOD parsed answer, so anything
+    that still compares equal is a hole in the checker rather than a quirk of
+    a tool. Every one of these is a mistake a real duplicate finder can make.
+    """
+    ordered = sorted(groups, key=len, reverse=True)
+    wide = ordered[0]                     # the 5-member group
+    pair = ordered[-1]                    # a 2-member group
+    out = [
+        # Missed a duplicate entirely: the classic false negative.
+        ("drop-group", [g for g in groups if g is not pair], "missed"),
+        # Claimed two unrelated files are copies: the classic false positive,
+        # and the one that costs a user data if they act on it.
+        ("spurious-group", groups + [["u-not-a-dupe-1", "u-not-a-dupe-2"]],
+         "spurious"),
+        # Ran two real groups together — right that they are duplicates, wrong
+        # about which of what.
+        ("merge-groups", [wide + pair] + [g for g in groups
+                                          if g is not wide and g is not pair],
+         "spurious"),
+        # Found part of a group. A subset is a different answer, not a
+        # partially correct one.
+        ("split-group", [wide[:2]] + [g for g in groups if g is not wide],
+         "spurious"),
+        # Reported a hardlink cluster as a duplicate of itself. Two names, one
+        # inode, deleting either frees nothing. This is what `-H` would do to
+        # any of these tools, and until the fix in groups_as_inodes it was
+        # passing through the checker unnoticed.
+        ("hardlink-as-duplicate", groups + [["hl/a.bin", "hl/b.bin"]],
+         "spurious"),
+        # Named a file that is not there. lstat cannot resolve it, and the
+        # group must not be allowed to match a real one by accident.
+        ("phantom-member", [["a.bin", "sub/does-not-exist.bin"]]
+         + [g for g in groups if g is not pair], "spurious"),
+    ]
+    return out
+
+
+def check_mutations(tree: str, truth, groups: list) -> bool:
+    """Every corruption of a correct answer must be caught. No exceptions."""
+    print("\nchecker sabotage — a correct answer, corrupted six ways:\n")
+    ok = True
+    for name, corrupted, expect in mutations(groups):
+        exact, detail = toolkit.compare(
+            truth, toolkit.groups_as_inodes(tree, corrupted))
+        caught = (not exact) and expect in detail
+        print("  {:<22} {:<7} {}".format(
+            name, "caught" if caught else "MISSED", detail))
+        if not caught:
+            ok = False
+
+    # ...and the control: the uncorrupted answer must still pass, or the
+    # checker is simply rejecting everything and the six above prove nothing.
+    exact, detail = toolkit.compare(truth, toolkit.groups_as_inodes(tree, groups))
+    print("  {:<22} {:<7} {}".format(
+        "control, no sabotage", "clean" if exact else "UNEXPECTED", detail))
+    return ok and exact
+
+
 def main() -> int:
     binary = os.path.join(REPO, "rust", "target", "release", "dedup-rs")
     if not os.path.isfile(binary):
@@ -126,6 +198,7 @@ def main() -> int:
 
         ok = True
         raw_paths = {}
+        known_good = None
         for tool in found:
             tool.reset_cache(work)
             out = os.path.join(work, "{}.json".format(tool.key))
@@ -145,6 +218,8 @@ def main() -> int:
 
             groups = tool.parse(tree, out)
             raw_paths[tool.key] = sum(len(g) for g in groups)
+            if tool.key == "ours":
+                known_good = groups
             exact, detail = toolkit.compare(
                 truth, toolkit.groups_as_inodes(tree, groups))
             print("{:<9} {:<8} {}   ({} paths in {} groups)".format(
@@ -166,6 +241,12 @@ def main() -> int:
         else:
             print("DELTA CHANGED: paths per tool {} — tools.py's hardlink note "
                   "is now wrong and must be rewritten".format(raw_paths))
+            ok = False
+
+        if known_good is None:
+            print("our tool produced no answer to sabotage", file=sys.stderr)
+            ok = False
+        elif not check_mutations(tree, truth, known_good):
             ok = False
 
         print("\nparser verification {}".format("PASSED" if ok else "FAILED"))
