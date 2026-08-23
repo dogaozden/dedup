@@ -18,7 +18,8 @@ pub struct Entry {
     pub size: u64,
     pub dev: u64,
     pub ino: u64,
-    pub mtime_ns: i128,
+    pub nlink: u64,
+    pub mtime_ns: i64,
 }
 
 /// One file. A hardlinked inode is one record wearing several names, because
@@ -31,7 +32,10 @@ pub struct FileRec {
     pub size: u64,
     pub dev: u64,
     pub ino: u64,
-    pub mtime_ns: i128,
+    /// How many names the inode has on disk, which is not always how many the
+    /// scan can see.
+    pub nlink: u64,
+    pub mtime_ns: i64,
     /// Bytes stage 3 read from offset 0, kept so stage 5 can compare them
     /// instead of reading them a second time.
     pub head: Vec<u8>,
@@ -46,6 +50,15 @@ impl FileRec {
 
     pub fn layout(&self) -> (u64, u64) {
         (self.dev, self.ino)
+    }
+
+    /// True when removing our copies actually frees the bytes.
+    ///
+    /// A hardlinked inode only releases its storage once every name is gone.
+    /// If the scan cannot see all of them, some name outside the tree is still
+    /// holding the data down and deleting what we can see frees nothing.
+    pub fn deletable(&self) -> bool {
+        self.names.len() as u64 >= self.nlink
     }
 }
 
@@ -134,8 +147,8 @@ pub fn walk(
                 size: metadata.len(),
                 dev: metadata.dev(),
                 ino: metadata.ino(),
-                mtime_ns: i128::from(metadata.mtime()) * 1_000_000_000
-                    + i128::from(metadata.mtime_nsec()),
+                nlink: metadata.nlink(),
+                mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
             });
         }
     }
@@ -157,6 +170,7 @@ fn fold_inode(root: &Path, entries: &mut [Entry]) -> FileRec {
         size: first.size,
         dev: first.dev,
         ino: first.ino,
+        nlink: first.nlink,
         mtime_ns: first.mtime_ns,
         head: Vec::new(),
         tail: Vec::new(),
@@ -235,9 +249,7 @@ pub fn unchanged(root: &Path, members: &[&FileRec]) -> bool {
     members.iter().all(|record| {
         matches!(fs::metadata(root.join(record.path())), Ok(metadata)
             if metadata.len() == record.size
-                && i128::from(metadata.mtime()) * 1_000_000_000
-                    + i128::from(metadata.mtime_nsec())
-                    == record.mtime_ns)
+                && metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec() == record.mtime_ns)
     })
 }
 
@@ -245,8 +257,7 @@ pub fn unchanged(root: &Path, members: &[&FileRec]) -> bool {
 pub fn still_the_same(file: &fs::File, record: &FileRec) -> io::Result<bool> {
     let metadata = file.metadata()?;
     Ok(metadata.len() == record.size
-        && i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec())
-            == record.mtime_ns)
+        && metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec() == record.mtime_ns)
 }
 
 pub fn basename(path: &str) -> &str {
@@ -263,6 +274,7 @@ mod tests {
             size,
             dev: 1,
             ino,
+            nlink: 1,
             mtime_ns: 0,
         }
     }
@@ -317,6 +329,7 @@ mod tests {
             size: 1,
             dev: 1,
             ino: 1,
+            nlink: 1,
             mtime_ns: 0,
             head: Vec::new(),
             tail: Vec::new(),

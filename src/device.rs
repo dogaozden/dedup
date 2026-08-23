@@ -85,20 +85,47 @@ fn is_solid_state(path: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return None;
     }
+    match ask_diskutil(&mount_point(path), "SolidState")?.as_str() {
+        value if value.starts_with("<true") => Some(true),
+        value if value.starts_with("<false") => Some(false),
+        _ => None,
+    }
+}
+
+/// A stable filename for the cache belonging to the volume `path` is on.
+///
+/// The UUID survives a remount under a different name, which a mount point
+/// does not. Where there is no UUID to be had, the mount point is all there is,
+/// and guessing wrong only ever costs one cold scan.
+pub fn volume_uuid(path: &Path) -> String {
     let root = mount_point(path);
+    if let Some(uuid) = ask_diskutil(&root, "VolumeUUID")
+        .as_deref()
+        .and_then(|value| value.strip_prefix("<string>"))
+        .and_then(|value| value.split('<').next())
+        .filter(|value| !value.is_empty())
+    {
+        return uuid.to_string();
+    }
+    let digest = crate::stages::sha256(root.as_os_str().as_encoded_bytes());
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..32]
+        .to_string()
+}
+
+fn ask_diskutil(root: &Path, key: &str) -> Option<String> {
     let output = Command::new("diskutil")
         .args(["info", "-plist"])
-        .arg(&root)
+        .arg(root)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    match plist_value(&String::from_utf8_lossy(&output.stdout), "SolidState")? {
-        value if value.starts_with("<true") => Some(true),
-        value if value.starts_with("<false") => Some(false),
-        _ => None,
-    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    plist_value(&text, key).map(ToString::to_string)
 }
 
 /// Whatever element follows `<key>name</key>`. Enough of a plist reader for

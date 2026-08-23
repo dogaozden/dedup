@@ -15,10 +15,13 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 use rayon::ThreadPool;
+use sha2::{Digest as _, Sha256};
 
+use crate::cache::ScanCache;
 use crate::consts::{CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, SLOW_CHUNK};
 use crate::effort::Effort;
 use crate::ordered::Ordered;
+use crate::pipeline::DupGroup;
 use crate::stages::{sha256, Digest};
 use crate::walk::{still_the_same, unchanged, FileRec};
 
@@ -26,6 +29,28 @@ pub struct Compare<'a> {
     pub root: &'a Path,
     pub effort: &'a Effort,
     pub solid: bool,
+    /// Whether whole-file digests are worth building as the bytes go past. The
+    /// bytes are being read anyway and SHA-256 runs at a few GB/s where a disk
+    /// does not, so a group read here is also a group learned — but only with
+    /// a cache to put it in.
+    pub learn: bool,
+}
+
+/// What one comparison settled: the runs that agree to the last byte, and the
+/// whole-file digests learned on the way. The digests are handed back rather
+/// than written straight to the cache, so nothing has to lock it from inside
+/// the pool.
+#[derive(Default)]
+pub struct Settled {
+    pub matched: Vec<Vec<usize>>,
+    pub learned: Vec<(usize, Digest)>,
+}
+
+impl Settled {
+    fn absorb(&mut self, other: Settled) {
+        self.matched.extend(other.matched);
+        self.learned.extend(other.learned);
+    }
 }
 
 /// How much to read from each file per round.
@@ -87,8 +112,7 @@ fn tags(run: Vec<(usize, Vec<u8>)>) -> Vec<usize> {
 }
 
 /// Compare one group of same-size candidates and return the runs that agree to
-/// the last byte. Members are positions in `members`, mapped back to record
-/// indices on the way out.
+/// the last byte.
 pub fn split_identical(
     context: &Compare,
     records: &[FileRec],
@@ -96,7 +120,9 @@ pub fn split_identical(
     chunk: usize,
     unreadable: &mut Vec<String>,
     pool: Option<&ThreadPool>,
-) -> Vec<Vec<usize>> {
+) -> Settled {
+    let mut settled = Settled::default();
+
     // A short file that stage 3 read to its end is already here in full.
     // Opening it again to read nothing costs an open against the stat that
     // says the file is still the one we read.
@@ -114,11 +140,21 @@ pub fn split_identical(
                 (index, record.head[..record.size as usize].to_vec())
             })
             .collect();
-        return partition_blocks(blocks)
-            .into_iter()
-            .map(tags)
-            .filter(|run| run.len() > 1)
-            .collect();
+        for run in partition_blocks(blocks) {
+            if run.len() < 2 {
+                continue;
+            }
+            if context.learn {
+                // The whole file is in hand and it matched, so this is the
+                // same proof the reading path produces, learned for free.
+                let digest = sha256(&run[0].1);
+                settled
+                    .learned
+                    .extend(run.iter().map(|&(index, _)| (index, digest)));
+            }
+            settled.matched.push(tags(run));
+        }
+        return settled;
     }
 
     let mut opened: Vec<usize> = Vec::new();
@@ -186,7 +222,27 @@ pub fn split_identical(
             .unwrap_or(0)
     });
 
-    let mut matched: Vec<Vec<usize>> = Vec::new();
+    // The digest being learned has to cover the file, not just the part of it
+    // this call happens to read. Kept bytes are part of the file too, so they
+    // go into the hasher in their place: head first, then everything read,
+    // then the tail as each run finishes. A digest built any other way would be
+    // remembered as a whole-file digest without being one, and the next scan
+    // would match two files on their middles alone.
+    let mut hashers: Vec<Sha256> = if context.learn {
+        opened
+            .iter()
+            .map(|&index| {
+                let mut hasher = Sha256::new();
+                if prefix > 0 {
+                    hasher.update(&records[index].head[..prefix]);
+                }
+                hasher
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut live: Vec<Vec<usize>> = if opened.len() < 2 {
         Vec::new()
     } else if prefix > 0 {
@@ -205,6 +261,7 @@ pub fn split_identical(
         vec![(0..opened.len()).collect()]
     };
 
+    let mut matched: Vec<Vec<usize>> = Vec::new();
     let mut position = prefix;
     loop {
         if live.is_empty() {
@@ -235,12 +292,29 @@ pub fn split_identical(
                     None => unreadable.push(records[opened[slot]].path().to_string()),
                 }
             }
+            if context.learn {
+                for (slot, block) in &good {
+                    hashers[*slot].update(block);
+                }
+            }
+
             for run in partition_blocks(good) {
                 let at_end = run[0].1.is_empty();
                 let members = tags(run);
                 if members.len() < 2 {
                     continue; // settled, stop reading
                 } else if at_end {
+                    // Reaching EOF here means the read covered everything after
+                    // the kept head. With a kept tail in hand the run stops
+                    // short of EOF instead and is learned below, once that tail
+                    // has gone into the digest.
+                    if context.learn && tail == 0 {
+                        for &slot in &members {
+                            settled
+                                .learned
+                                .push((opened[slot], hashers[slot].clone().finalize().into()));
+                        }
+                    }
                     matched.push(members); // same bytes to EOF
                 } else {
                     following.push(members); // still together
@@ -256,22 +330,32 @@ pub fn split_identical(
         let blocks = group
             .into_iter()
             .map(|slot| {
-                let held = &records[opened[slot]].tail;
-                (slot, held[held.len() - tail..].to_vec())
+                let kept = &records[opened[slot]].tail;
+                (slot, kept[kept.len() - tail..].to_vec())
             })
             .collect();
         for run in partition_blocks(blocks) {
-            let members = tags(run);
-            if members.len() > 1 {
-                matched.push(members);
+            if run.len() < 2 {
+                continue;
             }
+            if context.learn {
+                for (slot, block) in &run {
+                    hashers[*slot].update(block);
+                    settled
+                        .learned
+                        .push((opened[*slot], hashers[*slot].clone().finalize().into()));
+                }
+            }
+            matched.push(tags(run));
         }
     }
 
-    matched
-        .into_iter()
-        .map(|run| run.into_iter().map(|slot| opened[slot]).collect())
-        .collect()
+    settled.matched.extend(
+        matched
+            .into_iter()
+            .map(|run| run.into_iter().map(|slot| opened[slot]).collect()),
+    );
+    settled
 }
 
 /// Run `split_identical` over every candidate group.
@@ -291,19 +375,19 @@ pub fn compare_stage(
     jobs: usize,
     pool: &ThreadPool,
     unreadable: &mut Vec<String>,
-) -> Vec<Vec<usize>> {
+) -> Settled {
     // 4x the reader count so there is enough work to keep every reader busy
     // even once a group or two settles early, floored at 16 so a low -j does
     // not turn nearly everything into a wave of two.
     let wave_members = (4 * jobs).max(16);
-    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut out = Settled::default();
     let spread = (jobs > 1).then_some(pool);
 
     let mut index = 0;
     while index < buckets.len() {
         if buckets[index].len() >= wave_members {
             let chunk = compare_chunk(buckets[index].len(), context.solid);
-            out.extend(split_identical(
+            out.absorb(split_identical(
                 context,
                 records,
                 &buckets[index],
@@ -328,31 +412,79 @@ pub fn compare_stage(
             // Nothing left to pack it with, and it never reached the threshold
             // alone either.
             let chunk = compare_chunk(wave[0].len(), context.solid);
-            out.extend(split_identical(
+            out.absorb(split_identical(
                 context, records, &wave[0], chunk, unreadable, spread,
             ));
             continue;
         }
 
         let wave_chunk = compare_chunk(total, context.solid);
-        let settled: Vec<(Vec<Vec<usize>>, Vec<String>)> = pool.install(|| {
+        let results: Vec<(Settled, Vec<String>)> = pool.install(|| {
             wave.par_iter()
                 .map(|group| {
                     let mut local = Vec::new();
                     // pool = None: nothing here submits pool work from inside
                     // pool work, so each task reads its own members serially.
-                    let runs =
+                    let settled =
                         split_identical(context, records, group, wave_chunk, &mut local, None);
-                    (runs, local)
+                    (settled, local)
                 })
                 .collect()
         });
-        for (runs, local) in settled {
-            out.extend(runs);
+        for (settled, local) in results {
+            out.absorb(settled);
             unreadable.extend(local);
         }
     }
     out
+}
+
+/// Byte-compare every group matched from memory rather than read.
+///
+/// Returns (safe to act on, refused). Nothing from a refused group may be
+/// deleted: its members disagree, so whatever was remembered of them was
+/// wrong, and the tool has no idea which copy is which. A group compared
+/// during this scan is already proved and is not read again.
+pub fn verify_attested(
+    context: &Compare,
+    records: &[FileRec],
+    groups: Vec<DupGroup>,
+    cache: Option<&mut ScanCache>,
+) -> (Vec<DupGroup>, Vec<DupGroup>) {
+    let mut safe = Vec::new();
+    let mut refused = Vec::new();
+    let mut forget: Vec<usize> = Vec::new();
+    for mut group in groups {
+        if !group.attested {
+            safe.push(group);
+            continue;
+        }
+        let mut unreadable = Vec::new();
+        let chunk = compare_chunk(group.members.len(), context.solid);
+        let settled = split_identical(
+            context,
+            records,
+            &group.members,
+            chunk,
+            &mut unreadable,
+            None,
+        );
+        if settled.matched.len() == 1
+            && settled.matched[0].len() == group.members.len()
+            && unreadable.is_empty()
+        {
+            group.attested = false; // proved, here, now
+            safe.push(group);
+        } else {
+            forget.extend(group.members.iter().copied());
+            refused.push(group);
+        }
+    }
+    if let Some(cache) = cache {
+        let doubted: Vec<&FileRec> = forget.iter().map(|&index| &records[index]).collect();
+        cache.forget(&doubted);
+    }
+    (safe, refused)
 }
 
 #[cfg(test)]

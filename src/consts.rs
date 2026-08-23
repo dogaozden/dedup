@@ -38,4 +38,14 @@ pub const RETAIN_BUDGET: usize = 128 * 1024 * 1024;
 /// How many small-file candidates ride between checks of RETAIN_BUDGET.
 pub const RETAIN_CHECK_SPAN: usize = HASH_BATCH * 64;
 
+/// Bump when the stored columns change meaning. 3: every row carries the time
+/// it was written, which is what the racily-clean rule reads.
+pub const CACHE_SCHEMA: i64 = 3;
+/// Entries not seen in this long are dropped.
+pub const CACHE_TTL_DAYS: i64 = 180;
+/// The coarsest granularity any target filesystem records mtime at — HFS+
+/// stores whole seconds — so racily-clean is judged at whole seconds on every
+/// volume, rather than asking each one how fine its clock is.
+pub const CACHE_TICK_NS: i64 = 1_000_000_000;
+
 pub const DEFAULT_MIN_SIZE: u64 = 10 * 1024 * 1024;

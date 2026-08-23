@@ -11,6 +11,7 @@ use std::path::Path;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
+use crate::cache::ScanCache;
 use crate::compare::{compare_stage, Compare};
 use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
 use crate::device::Device;
@@ -22,6 +23,10 @@ use crate::walk::{basename, candidates, name_order, walk, FileRec};
 
 pub struct DupGroup {
     pub members: Vec<usize>,
+    /// True when the members were matched from remembered digests instead of
+    /// being read this scan. Such a group is a candidate, not a conclusion:
+    /// nothing may be deleted from it until the bytes have been read again.
+    pub attested: bool,
 }
 
 pub struct Scan {
@@ -65,7 +70,10 @@ pub fn size_stage(root: &Path, filters: Filters) -> Scan {
         .into_values()
         .into_iter()
         .filter(|bucket| bucket.len() > 1)
-        .map(|members| DupGroup { members })
+        .map(|members| DupGroup {
+            members,
+            attested: false,
+        })
         .collect();
     sort_groups(&records, &mut groups);
     Scan {
@@ -84,7 +92,16 @@ fn pool_of(jobs: usize) -> ThreadPool {
         .expect("a thread pool of a positive size")
 }
 
-pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &Effort) -> Scan {
+pub fn find_duplicates(
+    root: &Path,
+    filters: Filters,
+    device: Device,
+    effort: &Effort,
+    mut cache: Option<&mut ScanCache>,
+) -> Scan {
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.open_path(root);
+    }
     let mut files_seen = 0;
     let mut bytes_seen = 0;
     let mut unreadable = Vec::new();
@@ -107,6 +124,10 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
     };
     if records.is_empty() {
         return scan;
+    }
+    if let Some(cache) = cache.as_deref_mut() {
+        // ...and for any further volume the scan turned out to reach into.
+        cache.open_for(root, &records);
     }
 
     let random_jobs = device.random_jobs();
@@ -131,9 +152,17 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
         .filter(|&index| records[index].size > DEEP_HEAD as u64)
         .collect();
 
+    let mut remembered: Vec<Vec<usize>> = Vec::new();
     if !small.is_empty() {
-        let (proven, fallback) = small_file_stage(&reader, &records, &small, &mut unreadable);
+        let (proven, attested, fallback) = small_file_stage(
+            &reader,
+            &records,
+            &small,
+            &mut unreadable,
+            cache.as_deref_mut(),
+        );
         settled.extend(proven);
+        remembered.extend(attested);
         if !fallback.is_empty() {
             staged.extend(fallback);
             staged.sort_by_key(|&index| records[index].layout());
@@ -158,6 +187,7 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
         &staged,
         Probe::Ends { keep },
         &mut unreadable,
+        cache.as_deref_mut(),
     );
     let mut pending: Vec<Vec<usize>> = end_buckets
         .into_iter()
@@ -191,6 +221,7 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
             &crowded,
             Probe::DeepHead { keep: keep_rest },
             &mut unreadable,
+            cache.as_deref_mut(),
         );
         pending.extend(rest_buckets.into_iter().filter(|bucket| bucket.len() > 1));
         if keep {
@@ -217,6 +248,7 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
             &survivors,
             Probe::Sample,
             &mut unreadable,
+            cache.as_deref_mut(),
         );
         pending.extend(sample_buckets.into_iter().filter(|bucket| bucket.len() > 1));
     }
@@ -225,6 +257,15 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
     // is not proof and this tool deletes things, so the bytes get read; doing
     // it as a comparison rather than a hash means files that turn out to
     // differ stop being read where they diverge.
+    // A group every one of whose members carries a remembered whole-file
+    // digest is set aside instead of read: it is reported, marked attested,
+    // and read again at deletion time, where being sure actually matters.
+    if let Some(cache) = cache.as_deref_mut() {
+        let (still_pending, matched) = cache.attested_runs(&records, std::mem::take(&mut pending));
+        pending = still_pending;
+        remembered.extend(matched);
+    }
+
     pending.sort_by_key(|bucket| {
         bucket
             .iter()
@@ -236,20 +277,37 @@ pub fn find_duplicates(root: &Path, filters: Filters, device: Device, effort: &E
         root,
         effort,
         solid: device.all_solid_state(),
+        learn: cache.is_some(),
     };
     let sequential_pool = pool_of(sequential_jobs);
-    settled.extend(compare_stage(
+    let compared = compare_stage(
         &context,
         &records,
         &pending,
         sequential_jobs,
         &sequential_pool,
         &mut unreadable,
-    ));
+    );
+    settled.extend(compared.matched);
+    // The bytes went past anyway, so a group read here is also a group learned.
+    // The digests come back from the pool rather than being written from inside
+    // it, so the cache never needs a lock.
+    if let Some(cache) = cache {
+        for (index, digest) in compared.learned {
+            cache.remember(&records[index], crate::cache::Field::Full, digest);
+        }
+    }
 
     let mut groups: Vec<DupGroup> = settled
         .into_iter()
-        .map(|members| DupGroup { members })
+        .map(|members| DupGroup {
+            members,
+            attested: false,
+        })
+        .chain(remembered.into_iter().map(|members| DupGroup {
+            members,
+            attested: true,
+        }))
         .collect();
     sort_groups(&records, &mut groups);
 

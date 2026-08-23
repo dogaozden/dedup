@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use rayon::ThreadPool;
 use sha2::{Digest as _, Sha256};
 
+use crate::cache::{Field, ScanCache};
 use crate::consts::{
     DEEP_HEAD, HASH_BATCH, HEAD_BYTES, RETAIN_BUDGET, RETAIN_CHECK_SPAN, SAMPLE_BYTES,
     SAMPLE_POINTS, TAIL_BYTES,
@@ -181,33 +182,67 @@ pub fn hash_stage(
     todo: &[usize],
     probe: Probe,
     unreadable: &mut Vec<String>,
+    mut cache: Option<&mut ScanCache>,
 ) -> Vec<Vec<usize>> {
-    let probed = read_batched(reader.pool, todo, reader.jobs, |&index| {
-        probe_one(reader.root, &records[index], probe, reader.effort)
-    });
+    let field = match probe {
+        Probe::Ends { .. } => Field::Ends,
+        Probe::DeepHead { .. } => Field::Deep,
+        Probe::Sample => Field::Sample,
+    };
 
+    // With a cache attached, files whose digest is already remembered are
+    // bucketed without being opened, and the ones that do get read are
+    // remembered on the way past.
     let mut buckets: Ordered<(u64, Digest), usize> = Ordered::new();
-    for (&index, outcome) in todo.iter().zip(probed) {
+    let mut to_read: Vec<usize> = Vec::new();
+    match cache.as_deref_mut() {
+        None => to_read.extend_from_slice(todo),
+        Some(cache) => {
+            for &index in todo {
+                match cache.get(&records[index], field) {
+                    Some(digest) => {
+                        buckets.push((records[index].size, digest), index);
+                    }
+                    None => to_read.push(index),
+                }
+            }
+        }
+    }
+
+    let probed = {
+        let view: &[FileRec] = records;
+        read_batched(reader.pool, &to_read, reader.jobs, |&index| {
+            probe_one(reader.root, &view[index], probe, reader.effort)
+        })
+    };
+
+    for (&index, outcome) in to_read.iter().zip(probed) {
         let Some(outcome) = outcome else {
             unreadable.push(records[index].path().to_string());
             continue;
         };
-        let record = &mut records[index];
-        match probe {
-            Probe::Ends { keep: true } => {
-                if record.head.is_empty() && record.tail.is_empty() {
-                    record.head = outcome.head;
-                    record.tail = outcome.tail;
+        let digest = outcome.digest;
+        {
+            let record = &mut records[index];
+            match probe {
+                Probe::Ends { keep: true } => {
+                    if record.head.is_empty() && record.tail.is_empty() {
+                        record.head = outcome.head;
+                        record.tail = outcome.tail;
+                    }
                 }
-            }
-            Probe::DeepHead { keep: true } => {
-                if record.head.len() == HEAD_BYTES {
-                    record.head.extend_from_slice(&outcome.head);
+                Probe::DeepHead { keep: true } => {
+                    if record.head.len() == HEAD_BYTES {
+                        record.head.extend_from_slice(&outcome.head);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-        buckets.push((record.size, outcome.digest), index);
+        buckets.push((records[index].size, digest), index);
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.remember(&records[index], field, digest);
+        }
     }
     buckets.into_values()
 }
@@ -243,13 +278,15 @@ pub fn small_file_stage(
     records: &[FileRec],
     candidates: &[usize],
     unreadable: &mut Vec<String>,
-) -> (Vec<Vec<usize>>, Vec<usize>) {
+    mut cache: Option<&mut ScanCache>,
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<usize>) {
     let mut by_size: Ordered<u64, usize> = Ordered::new();
     for &index in candidates {
         by_size.push(records[index].size, index);
     }
 
     let mut proven: Vec<Vec<usize>> = Vec::new();
+    let mut attested: Vec<Vec<usize>> = Vec::new();
     let mut fallback: Vec<usize> = Vec::new();
 
     // Content length stands in for size when grouping tiny files or tier B's
@@ -259,6 +296,30 @@ pub fn small_file_stage(
     let mut tiny: Vec<usize> = Vec::new();
     let mut headed: Vec<usize> = Vec::new();
     for (size, group) in by_size.into_pairs() {
+        // A size class is only settled from the cache when EVERY member of it
+        // already carries a remembered whole-file digest; if even one does not,
+        // the whole class is read and compared for real. That mirrors what
+        // attested_runs does in the staged pipeline, so a caller cannot tell
+        // which path settled a group from the attested/proven split alone.
+        if let Some(cache) = cache.as_deref_mut() {
+            let digests: Vec<Option<Digest>> = group
+                .iter()
+                .map(|&index| cache.get(&records[index], Field::Full))
+                .collect();
+            if digests.iter().all(Option::is_some) {
+                let mut by_digest: Ordered<Digest, usize> = Ordered::new();
+                for (&index, digest) in group.iter().zip(digests) {
+                    by_digest.push(digest.expect("checked above"), index);
+                }
+                attested.extend(
+                    by_digest
+                        .into_values()
+                        .into_iter()
+                        .filter(|run| run.len() > 1),
+                );
+                continue;
+            }
+        }
         if size <= HEAD_BYTES as u64 {
             tiny.extend(group);
         } else {
@@ -292,8 +353,14 @@ pub fn small_file_stage(
             }
         }
     }
-    for (_content, group) in distinct.into_pairs() {
+    for (content, group) in distinct.into_pairs() {
         if group.len() > 1 {
+            if let Some(cache) = cache.as_deref_mut() {
+                let digest = sha256(&content);
+                for &index in &group {
+                    cache.remember(&records[index], Field::Full, digest);
+                }
+            }
             proven.push(group);
         }
     }
@@ -362,13 +429,19 @@ pub fn small_file_stage(
             }
         }
     }
-    for (_content, group) in distinct.into_pairs() {
+    for (content, group) in distinct.into_pairs() {
         if group.len() > 1 {
+            if let Some(cache) = cache.as_deref_mut() {
+                let digest = sha256(&content);
+                for &index in &group {
+                    cache.remember(&records[index], Field::Full, digest);
+                }
+            }
             proven.push(group);
         }
     }
 
-    (proven, fallback)
+    (proven, attested, fallback)
 }
 
 /// Read a file's entire contents in one open. Used for stage-3 candidates at
