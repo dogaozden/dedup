@@ -390,6 +390,7 @@ Two of those want the maintainer's eye before anything is taken:
   0.7900, and a §8 trade: `needle` and `typical` won, `widegroup` and
   `samesize` lost. Kept only in the narrowed form, #4.
 - **A parallel sort in `candidates()`** — 1.5%, under the floor.
+- **`strip = true`** — the binary loses 276 KB and startup does not move.
 
 ### Where the wall is, and it is not where the honeypot says
 
@@ -397,8 +398,9 @@ Two of those want the maintainer's eye before anything is taken:
 exactly the per-file open cost measured in C over the same tree, at the
 thread count where that cost bottoms out (0.4429 s serial, 0.1526 s at four
 readers, flat to worse out to ten). **`typical` is on the syscall floor.**
-`needle` is at 11 µs, the difference being the 122 MB of file content the
-small-file stage must hold to prove equality byte-for-byte. Startup is
+And on `needle` the tool completes the whole scan in **0.5520–0.6030 s**
+against **0.5718 s** for a bare C loop that only opens and reads the same
+50,000 files — so `needle` is on it too. Startup is
 3.4 ms — 1.4 ms of it bare `fork`/`exec`, 1.7 ms dyld on a 3.1 MB binary —
 and is now 20–50% of five of the seven scenarios.
 
@@ -1327,47 +1329,73 @@ these two runs should not be quoted, and is not.
 
 ---
 
-## 2026-08-23 — three ideas that did not clear the floor, and the stop
+## 2026-08-23 — the floor, proved; three ideas that did not clear it; the stop
 
-Recorded together because none of them cost a scored run: two were settled
-with a throwaway build and a local A/B on a quiet machine, which is what left
-room for the ones that worked.
+**A correction to my own strike count first.** I wrote a stop summary one idea
+early. The rule is three *consecutive* ideas inside the floor, and a win resets
+the count. My order was: bulk walk (win), disk image (win), hash (win), one
+pool sized from the performance cores (fail), small-file pool (win), parallel
+walk (win), and only then the failures below. The pool-sizing failure had two
+wins after it and never counted toward a stop. Recorded because a
+miscounted stop is a contestant quitting with ideas on the table, which is
+exactly what §12 exists to prevent.
 
-**1. One reader pool sized from the performance cores.** Scored at 0.7936
-against 0.7900, and a §8 cross-scenario trade underneath. Reverted; the
-narrower version that only re-sizes the small-file stage was kept instead.
-Written up in full above.
+### First, the two scenarios that dominate the score are provably finished
 
-**2. The seek counter's mutex, re-tested.** Rejected once already this round,
-when it moved `typical` 0.15 -> 0.15. Worth re-testing because the condition
-changed underneath it: the disk-image fix took the compare stage from **one**
-reader to eight, so the contention the first test looked for did not exist
-when that test was run. §12.1 says a rejection expires when something lands
-near it. Re-measured with the same throwaway build, on a quiet machine:
+Not argued — measured, with a C program that does nothing but `open`,
+`read`, `close` over the same trees, at the thread count where that cost
+bottoms out.
 
 ```
-                  with the mutex    without it
-  widegroup          136.59 ms       137.90 ms
-  typical             97.90 ms        98.66 ms
+                     bare C open+read+close       the whole tool
+  typical  19,200 files   0.1526 s @ 4 threads     0.1036 s   (13,372 opens, 7.9 us each)
+  needle   50,000 files   0.5718 s @ 8 threads     0.5520-0.6030 s
 ```
 
-Still nothing, in the direction of very slightly worse. Two acquisitions per
-read, on a lock held for the length of a compare and a store, do not show up
-against 7.9 us of open. **Rejected twice, and the second time on purpose.**
+**On `needle` the tool does the entire scan — walk, 50,000 opens, 122 MB read,
+content hashing, grouping, the byte-for-byte proof and the JSON report — in
+the time a bare C loop takes to open and read the same files and do nothing
+with them.** On `typical` its per-open cost is exactly the saturated rate.
+There is no headroom left in either, and between them they are two of the
+seven terms.
 
-**3. A parallel sort in `candidates()`.** It sorts every walked record twice —
-50,000 of them on `needle`, at about 200 bytes each. `par_sort_unstable_by_key`
-is a two-line change and is safe here: the first sort's only ties are hardlinks
-of one inode, whose names `fold_names` sorts afterwards anyway, and the second
-sort's key is unique once folding has happened. Measured on `typical`:
-**96.41 ms against 97.90 ms**, 1.5%. `needle` would gain proportionally more of
-a much larger total. Under the ±3.7% floor either way, and §6.2 says not to
-keep a change on a 2% improvement. Reverted.
+Note also that `needle`'s opens are dearer than `typical`'s — 26.23 us serial
+against 23.19 us, 11.4 us against 7.9 us at best parallelism — on the same
+volume, with the same code. A bigger catalog costs more per lookup. That is
+the "4 us per file of overhead" I spent an hour looking for in the profile:
+it was never overhead, it was the open.
 
-**That is three consecutive ideas inside the noise floor, so this is the stop
-under §12.**
+### Then three ideas, none of which cleared ±3.7%
 
----
+**1. The seek counter's global mutex, re-tested.** Rejected earlier this round
+on a 0.15 -> 0.15. Re-tested on purpose because the condition changed
+underneath it — the disk-image fix took the compare stage from **one** reader
+to eight, which is when a shared lock would start to matter. It still does
+not: `widegroup` 136.59 ms with it against 137.90 ms without, `typical` 97.90
+against 98.66. Rejected twice, the second time deliberately.
+
+**2. `par_sort_unstable_by_key` in `candidates()`.** It sorts every walked
+record twice, 50,000 of them on `needle` at ~200 bytes each. Safe here: the
+first sort's only ties are hardlinks of one inode, whose names `fold_names`
+sorts afterwards, and the second sort's key is unique once folding has
+happened. Measured on `typical`: **96.41 ms against 97.90 ms**, 1.5%. Under
+the floor, and §6.2 says not to keep a change on a 2% improvement.
+
+**3. `strip = true` on the release profile.** Startup is 3.4 ms and is now
+20-50% of five of the seven scenarios; 1.65 ms of it is dyld on a 3.1 MB
+binary, so a smaller binary looked like the last shared lever. It shrinks to
+2,898,544 bytes from 3,174,512 and buys nothing:
+
+```
+              --help    empty tree   rescan
+  stripped    2.80 ms     3.04 ms    10.39 ms
+  unstripped  2.89 ms     2.98 ms    10.36 ms
+```
+
+Differences of 1-3% in both directions. macOS does not page a symbol table in
+at load, so the bytes removed were never on the critical path.
+
+**Three consecutive ideas inside the floor. This is the stop under §12.**
 
 ## 12. The loop, and when to stop
 
