@@ -10,7 +10,6 @@
 //! the retention budget is counting, so holding a second copy of it for the
 //! index would put the budget out by a factor of two.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -56,9 +55,67 @@ impl<K: Hash + Eq, V> Ordered<K, V> {
 }
 
 fn hash_of<K: Hash>(key: &K) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fast::default();
     key.hash(&mut hasher);
     hasher.finish()
+}
+
+/// A cheap hash for keys that are mostly file content.
+///
+/// The index this feeds is a hint and never an answer: `push` compares the
+/// key itself before it believes a match, so a weaker hash costs an extra
+/// comparison and cannot produce a wrong grouping. What it buys is real —
+/// the small-file stage keys on whole file contents, so every byte the stage
+/// reads is also a byte it hashes, and `DefaultHasher` is SipHash.
+///
+/// The digest goes on to be a `HashMap` key, where it is hashed again by that
+/// map's own SipHash, so this does not have to spread its output well. It
+/// only has to depend on every byte, which a multiply per eight of them does.
+#[derive(Default)]
+struct Fast(u64);
+
+impl Fast {
+    /// One round of the multiply-and-rotate mixer. The rotate is what stops a
+    /// run of equal words cancelling itself out.
+    fn eat(&mut self, word: u64) {
+        const ODD: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(ODD);
+    }
+}
+
+impl Hasher for Fast {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.eat(u64::from_le_bytes(word.try_into().expect("eight bytes")));
+        }
+        // The tail is padded rather than dropped, and the length is eaten
+        // below, so two keys that differ only past the last whole word still
+        // differ here.
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut last = [0_u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.eat(u64::from_le_bytes(last));
+        }
+        self.eat(bytes.len() as u64);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.eat(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.eat(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.eat(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -81,5 +138,53 @@ mod tests {
         map.push(vec![1, 2, 3], 2);
         map.push(vec![1, 2, 4], 3);
         assert_eq!(map.into_values(), [vec![1, 2], vec![3]]);
+    }
+}
+
+#[cfg(test)]
+mod hashing {
+    use super::*;
+
+    #[test]
+    fn every_byte_of_a_key_changes_its_hash() {
+        let base = vec![7_u8; 4096];
+        let plain = hash_of(&base);
+        for at in [0, 1, 7, 8, 9, 2047, 4094, 4095] {
+            let mut moved = base.clone();
+            moved[at] ^= 1;
+            assert_ne!(plain, hash_of(&moved), "byte {at} did not reach the hash");
+        }
+    }
+
+    #[test]
+    fn keys_that_differ_only_in_length_differ() {
+        assert_ne!(hash_of(&vec![0_u8; 8]), hash_of(&vec![0_u8; 9]));
+        assert_ne!(hash_of(&vec![3_u8; 100]), hash_of(&vec![3_u8; 101]));
+    }
+
+    /// The shape `prefixtrap` is made of: a long shared head, then a parting.
+    #[test]
+    fn a_long_shared_prefix_does_not_collapse_the_tail() {
+        let mut left = vec![9_u8; 65_536];
+        let mut right = left.clone();
+        left.extend_from_slice(b"one");
+        right.extend_from_slice(b"two");
+        assert_ne!(hash_of(&left), hash_of(&right));
+    }
+
+    /// Distinct content must land in distinct slots, which is the property
+    /// the small-file stage's grouping rests on.
+    #[test]
+    fn many_distinct_keys_do_not_pile_into_one_slot() {
+        let mut map: Ordered<Vec<u8>, usize> = Ordered::new();
+        for value in 0..5_000_u32 {
+            let mut key = vec![0_u8; 256];
+            key[..4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                map.push(key, value as usize),
+                "{value} was seen as a repeat"
+            );
+        }
+        assert_eq!(map.into_pairs().len(), 5_000);
     }
 }
