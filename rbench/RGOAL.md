@@ -327,36 +327,53 @@ new idea you check whether the log already killed it.
 
 ## 2026-08-23 — ROUND TWO, OPUS: STOP SUMMARY
 
-**Refereed score 0.6669**, against the `94739ad` pin, on branch `opus-r2` at
-`db6b8c7`. Unmerged, as §10 asks.
+**Refereed score 0.5886**, against the `94739ad` pin, on branch `opus-r2` at
+`a0b1ab8`. Unmerged, as §10 asks.
+
+The round stopped once at **0.6669** (`db6b8c7`) and was reopened; what
+follows covers both halves. Two changes landed in the second half and took it
+from 0.6669 to 0.5886, **11.7%**.
 
 ```
-run                                        load   score
-self,     r2, seed 1                       3.53  0.6537
-self,     r2, seed 2                       4.24  0.6592
-self,     scale default, seed 1            4.21  0.6747
-referee,  r2, seed 1  (clean main)         4.49  0.6669
+run                                                  load   score
+referee, 21 rounds, a0b1ab8   (clean main)           4.42  0.5886   <- of record
+referee,  9 rounds, 8c2e4dd                          -     0.6004
+referee,  9 rounds, 8c2e4dd  (second reading)        -     0.6125
+referee, 21 rounds, 8c2e4dd                          -     0.6029
+referee,  9 rounds, b3d81fd                          -     0.6102
+referee,  9 rounds, db6b8c7  (where the round paused) 4.49  0.6669
 ```
 
-All four on `db6b8c7`, all gates green. Self and referee agree to 2.0%,
-inside the floor. The state before the pivot compare (`3019856`) scored
-0.6717 / 0.6829 / 0.6722 by the same four runs and **0.6833** refereed. Noise floor measured twice
-that day on the same machine: **±7.4%** in the afternoon (geomean against
-itself 1.0044) and **±3.7%** in the evening (0.9931). Every gate green in
-every run; `--selftest` 5 of 5 each time.
+Noise floor measured on this machine: **±7.4%** in the afternoon, **±3.7%** in
+the evening. Every gate green in every run; `--selftest` passes each time.
+
+**The second half had to change how it measures, and that is the first
+finding.** Three referee readings of `8c2e4dd` came back 0.6004, 0.6125 and
+0.6029 against a 0.6102 of record — a 1.2% move, inside the floor — while its
+target scenario had visibly halved. The box had got busier between the two
+measurements: three `codebase-memory-mcp` processes at 98% each, and earlier a
+headless Chromium at 246%. `needle`, which cannot reach the changed code at
+all, moved 0.6986 -> 0.8982. Run both commits back to back in one window
+instead, A/B/A, and the same change is **-11.8%**. The two A runs sat 7.7%
+apart from each other, which is the size of what was drowning the signal.
+
+From then on every verdict was an A/B with the earlier commit run on **both**
+sides of the new one. A single referee reading is not enough on a shared
+machine, and the absolute number now says as much about what else is awake as
+it does about the code.
 
 Referee's per-scenario table, which is the one to read:
 
 ```
 scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
-needle       0.6893  0.4865  0.6986   ±2.4%  122.1 MB  122.1 MB  133.3 KB
-typical      0.1745  0.1006  0.5816   ±2.6%   70.6 MB   70.6 MB   33.0 MB
-samesize     0.0252  0.0206  0.8148   ±7.8%   32.8 MB   32.8 MB   22.5 MB
-widegroup    0.1851  0.0971  0.5497   ±5.6%  451.3 MB  451.3 MB  451.3 MB
-photos       0.0237  0.0180  0.7421   ±4.4%  147.9 MB  147.9 MB  147.8 MB
-bigheader    0.0228  0.0161  0.7055  ±11.5%  138.2 MB  146.2 MB  112.0 MB
-rescan       0.0570  0.0174  0.3307   ±8.4%       0 B    5.2 MB    5.2 MB
-prefixtrap*  0.0077  0.0073  0.9433   ±9.5%   16.2 MB   16.2 MB   16.0 MB
+needle       0.7741  0.5678  0.7653   ±6.0%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1785  0.1040  0.5785   ±2.0%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0244  0.0200  0.8206   ±1.5%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1750  0.1011  0.6075   ±5.1%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0275  0.0119  0.4761   ±6.0%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0268  0.0154  0.5930   ±4.6%  134.2 MB  146.2 MB  112.0 MB
+rescan       0.0265  0.0104  0.3928   ±1.0%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 ```
 
 ### Kept, in the order they landed
@@ -396,6 +413,52 @@ Two of those want the maintainer's eye before anything is taken:
   `samesize` lost. Kept only in the narrowed form, #4.
 - **A parallel sort in `candidates()`** — 1.5%, under the floor.
 - **`strip = true`** — the binary loses 276 KB and startup does not move.
+
+Second half, the four that ended it — all measured, none kept:
+
+- **A lean `getattrlistbulk` attribute set.** The Python oracle asks for
+  name/type/size and stats the survivors; this walk asks for the full eight.
+  On `rescan`'s tree, where only 220 of 11,479 files survive the min-size
+  filter and the lean form should win most, the two are **identical**: 0.0093 s
+  each, 304 calls each. The kernel reads the catalog record either way. At
+  `min_size` 1, where every file survives, lean is **57% worse** (0.0261 ->
+  0.0411) because it pays 19,200 `lstat`s for nothing. No scenario benefits.
+- **Reading the small-file tier in inode or path order.** The staged path
+  sorts by `layout()` before reading and the tiny tier does not, which looked
+  like a locality bug on the two open-bound scenarios. It is not one. Same
+  18,839 files, four readers, best of eleven: size order 83.64 ms, path order
+  84.29, inode order 83.33, random 83.85. A 1.2% spread across every order
+  there is — the catalog is entirely cached and does not care.
+- **`random_jobs` on `fast_bound` instead of `cpu_bound`.** `fast_bound`'s own
+  doc comment states the rule and the probe stages have exactly its shape, so
+  this looked like the code disagreeing with its own comment. In C it does:
+  four readers beat eight by 38% on the ends probe and 30% on the deep head.
+  In the tool it goes the other way — `hash_deep` 31.9 ms at eight readers,
+  **35.7 at four** — because `probe_one` hashes in the same task it reads in,
+  and SHA-256 wants every core there is. A/B: **-2.1%**, under §6.2's bar and
+  a §8 trade besides (`photos` -16.3%, `samesize` -6.0%, against `bigheader`
+  +6.0%). Reverted in `a0b1ab8`. **A probe that leaves out half of what a stage
+  does can only be trusted about the half it measured** — this one cost a
+  scored run to learn.
+- **`dlopen`ing IOKit off the startup path.** Linking IOKit pulls in
+  CoreFoundation, and CF is essentially the whole cost: bare 1.378 ms,
+  +CoreFoundation 2.117, +IOKit+CF 2.154. Startup is 20-35% of four scenarios
+  so 0.78 ms looked worth having. But `dlopen` on a background thread only
+  recovers part of it — 2 ms of main-thread work plus a threaded `dlopen`
+  costs 6.166 ms against 5.880 bare, so ~0.5 ms is saved, not 0.78 — which
+  prices out at **~1.8%** of the geomean for a rewrite of every IOKit and CF
+  call into `dlsym`. Not attempted.
+- **The seek counter's global mutex, a third time.** Re-tested because two
+  things had landed near it since. A diagnostic build with the accounting made
+  thread-local — seeks deliberately wrong — left `widegroup`'s compare read at
+  30.01 ms against 27.75 with the mutex in place. Rejected three times now.
+- **Reusing the comparison's read buffers.** `read_block` allocates a fresh
+  zeroed `Vec` per block and at 64 KB that is expensive — 24.23 ms against
+  14.41 for the same bytes into a reused buffer. But at the comparison's real
+  shape (457 members, 280 KB span, 64 KB prefix skipped, eight readers) it is
+  4.20 ms per group against 3.12: **1.08 ms a group, 4.3 ms over `widegroup`'s
+  four**, on a scenario that takes 130. Half a percent of the geomean for a
+  refactor of how blocks flow through `partition_blocks`. Priced and dropped.
 
 ### Where the wall is, measured scenario by scenario
 
@@ -449,9 +512,18 @@ gets there.
 2. **`widegroup` opens each file about three times** — 5,442 opens for 1,827
    files, one per stage. At 7.9 µs that is 43 ms of its 138 ms. Merging tier A
    and tier B is not available (it would read past the ceiling on `prefixtrap`),
-   so this needs the staged pipeline to keep a descriptor, which the 256-fd
-   limit forbids at this file count. It is the largest single removable term
-   left and I do not have a safe way to remove it.
+   so this needs the staged pipeline to keep a descriptor.
+
+   **The reason I gave for not doing it was wrong.** I wrote that "the 256-fd
+   limit forbids it at this file count". There is no 256-fd limit here: the
+   soft limit the tool inherits is **1,048,576**, the hard limit is unlimited,
+   and `kern.maxfilesperproc` is **61,440** — thirty-three times `widegroup`'s
+   1,827 files. Nothing was blocking it. `opens` is recorded by the harness and
+   **never gated**, so cutting 5,442 to 1,827 is legal as well as honest.
+   Re-priced with an open now measured at ~2.7 µs it is worth about 10 ms of
+   `widegroup`'s 130, which is why I did not spend the round's last hours on a
+   pipeline refactor for it — but it wants a descriptor budget rather than a
+   made-up limit, and the next person should not inherit my sentence.
 3. **The unique-small-file cache gap is still open and this bench still cannot
    see it.** `stages.rs:391` guards both `cache.remember` calls with
    `if group.len() > 1`, so a small file found unique is never remembered and
@@ -461,7 +533,34 @@ gets there.
    the round-two prep entry says that `min_size` was chosen for. Fixing it is a
    real win for real trees and worth nothing to this harness, so it wants a
    scenario before it wants a patch.
-4. **The volume cannot hold the scored set** while round-one `-default-`
+4. **Where the time actually is now, stage by stage.** Instrumented, warm,
+   `--no-cache`, best of three:
+
+   ```
+   scenario    total    dominant stage                 measured floor
+   needle      508 ms   small_file_stage  483 ms       438 ms of syscalls
+   typical      94 ms   small_file_stage   77 ms        60 ms of syscalls
+   samesize     15 ms   hash_ends           9 ms        ~7 ms of opens
+   widegroup   127 ms   compare            72 ms        ~17 ms of reads
+   bigheader    12 ms   compare            10 ms        ~8 ms of reads
+   ```
+
+   `needle` is at 1.10x its syscall floor and `typical` at 1.28x — both
+   finished, as the first half of the round said. **`widegroup`'s compare is
+   the last large gap**: 88.8 ms decomposes as 49.8 read, 13.4 partitioning the
+   retained prefix, 6.6 partitioning the chunks, 1.2 stat-and-seek, and 17.7
+   unaccounted for. The read is 346.7 MB at 7.0 GB/s where the same shape in C
+   does 20.6. It is not the seek mutex and it is not the allocator; I did not
+   find it.
+
+5. **The prefix partition copies bytes it already has.** `split_identical`
+   builds `records[index].head()[..prefix].to_vec()` for every member purely to
+   hand owned `Vec`s to `partition_blocks` — 64 KB x ~900 members, 58 MB of
+   allocate-and-copy, measured at 13.4 ms on `widegroup`. `partition_blocks`
+   only ever returns the slot indices, so it could take borrowed slices and
+   copy nothing. Not attempted; worth roughly 10% of one scenario.
+
+6. **The volume cannot hold the scored set** while round-one `-default-`
    corpora are resident: 2590 MB wanted of 2739 MB, with 424 MB already spoken
    for, and `ensure_space` evicts alphabetically so it takes `bigheader` and
    `needle` — the two costliest to rebuild — and never reaches the stale ones.
@@ -1806,6 +1905,36 @@ in one window, with the earlier commit run on both sides of the new one.
 the point two files diverge. Above the 112.0 MB floor, under the 146.2 MB
 ceiling, deterministic. `prefixtrap` does not move at 16.2 MB. 174 tests and
 the selftest pass.
+
+## 2026-08-23 — four more measured, none kept, and the stop
+
+After the 512 KB chunk landed, four ideas in a row failed to clear the floor.
+All four are written up in the stop summary at the top of this file with their
+numbers; in order they were: `random_jobs` on `fast_bound` (A/B **-2.1%**, a
+§8 trade, reverted in `a0b1ab8`), `dlopen`ing IOKit off the startup path
+(**~1.8%** for rewriting every CF call into `dlsym`, not attempted), the seek
+counter's global mutex re-tested a third time (30.01 ms against 27.75 — worse),
+and reusing the comparison's read buffers (**4.3 ms** over `widegroup`'s four
+groups, about half a percent of the geomean).
+
+**Four consecutive ideas inside the floor. This is the stop under §12.**
+
+Final: **0.5886** refereed at `a0b1ab8`, 21 rounds, load 4.42, every gate
+green. The round opened at 1.0000 and paused at 0.6669; this half took it the
+rest of the way to 0.5886.
+
+Two things I would want the next person to have, both of which cost me time:
+
+**A comment about what the machine is doing is a claim, not a fact.**
+`digest_of` said "every CPU this runs on has an instruction for it" and had
+said so since before round one, and the build had never once reached that
+instruction. Checking it was a one-line change worth 4.9x on the hash.
+
+**A probe must do everything the stage does.** The `random_jobs` idea had a
+clean C measurement behind it — four readers really are 38% better than eight
+at open/read/close — and it was still wrong, because the stage also hashes and
+the hash wants the cores the probe had proved were useless. The probe was not
+wrong about what it measured. It was wrong about what the stage was.
 
 ---
 
