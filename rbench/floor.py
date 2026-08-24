@@ -288,10 +288,17 @@ def scenario_floor(name: str, manifest: dict, ceiling: dict, machine: dict) -> d
     """The four terms and their sum, for one scenario at one scale."""
     warm = name in harness.CACHE_ON
     files = manifest["file_count"]
-    # One open per inode that has to be read end to end. The warm half of
-    # `rescan` is the one measurement whose whole point is reading nothing, so
-    # it pays neither the opens nor the bytes.
-    opens = 0 if warm else sum(len(g) for g in ceiling["groups"])
+    # One open per file that shares its size with another — any of them could
+    # be the duplicate, so a byte-exact answer must look at every one, not
+    # just the ones that turn out to match. The instrumented oracle opens
+    # exactly that set once each, which makes its count the honest floor. The
+    # old `sum(len(g) for g in groups)` priced answer-verification instead of
+    # scanning and undercounted needle a thousandfold (45 where 50,000 are
+    # forced) — found at source by the round-2 referee; the honeypot derived
+    # from it (≈0.2131/≈0.1431) is void, and the corrected serial floor is
+    # ≈0.40. The warm half of `rescan` is the one measurement whose whole
+    # point is reading nothing, so it pays neither the opens nor the bytes.
+    opens = 0 if warm else ceiling["oracle_opens"]
     read_bytes = 0 if warm else ceiling["byte_floor"]
 
     terms = {

@@ -682,6 +682,9 @@ def ensure_corpus(volume: str, name: str, scale: str, seed: int, factor: float,
             "min_size": manifest["min_size"],
             "groups": truth,
         }
+        # The volume can be torn down and remade mid-battery; a ceiling worth
+        # writing is worth recreating the directory for.
+        os.makedirs(os.path.dirname(sidecar), exist_ok=True)
         with open(sidecar, "w") as fh:
             json.dump(ceiling, fh)
         print("  ceiling {:<9} oracle read {:>9} in {:>3} opens  ({:.1f}s)".format(
