@@ -2140,6 +2140,57 @@ gate green — an absolute that barely moved because `needle` came back at
 0.8497 with a ±7.4% spread in that particular run. The A/B is the measurement
 to read here; the absolute is the machine's mood.
 
+## 2026-08-23 — a 31% win that was not there
+
+**Rejected, and worth writing down for how nearly it was kept.**
+
+Chasing the comparison's read, which the timers put at ~50 ms against a ~17 ms
+C floor, I established three things properly first. The eight readers are
+**fully busy**: summed-over-threads divided by eight was 57.69 ms against a
+58.13 ms wall, so there is no scheduling loss and rayon is not the problem. The
+per-slot lock is 0.32 ms. And the allocation itself is 13.81 ms over 9,046
+blocks — 1.5 µs each, 4.6% of the read.
+
+That left the read loop, and a good theory for it: `vec![0; want]` is
+`alloc_zeroed`, which for a 280 KB block is `calloc`, and calloc cannot hand
+back memory the allocator already holds — zeroed means fresh pages from the
+kernel, so the `read` that follows faults every one of them, and those faults
+are charged to the read loop rather than to the allocation. A diagnostic that
+read into a warm thread-local buffer and then **cloned** the result came back
+at 26.28 ms against 38.33: 31% better while doing strictly more work, which is
+exactly what the theory predicts.
+
+`Vec::with_capacity` + `resize` is the clean version of that — malloc from the
+warm cache, then a memset — and it measured 26.34 ms, matching the diagnostic.
+
+Then I ran it properly. Best-of-nine, alternating builds, three rounds:
+
+```
+  round 1:  calloc 14.93 ms   |   with_capacity 14.41 ms
+  round 2:  calloc 14.41 ms   |   with_capacity 13.99 ms
+  round 3:  calloc 14.10 ms   |   with_capacity 14.42 ms
+```
+
+**Both variants are 14 ms, and the 38-versus-26 was the machine warming up.**
+The three-sample measurements were taken minutes apart on a box that was
+getting quieter, and the whole 31% was drift. There is no effect here in either
+direction — 1.4% apart, overlapping.
+
+Reverted. `effort.rs` keeps `vec![0_u8; want]`.
+
+Two things this cost, and both are method rather than code. The first is that
+**best-of-three is not a measurement on this machine** — it was three samples
+that produced a confident, mechanistic, entirely fictional 31%. The second is
+that a theory which predicts the result you got is not evidence for the theory;
+the warm-buffer diagnostic "confirmed" a mechanism that does not exist, because
+it was run in the same drifting window as the baseline it beat.
+
+What is left of the enquiry is real, though, and worth keeping: the comparison's
+read is **not** rayon, **not** the per-slot lock, **not** the seek mutex and
+**not** the allocator. Four candidates eliminated with numbers. Whatever the
+2x against the C probe is, it is inside `read(2)` on this filesystem, and I did
+not find it.
+
 ---
 
 ## 12. The loop, and when to stop
