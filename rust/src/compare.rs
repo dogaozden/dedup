@@ -93,13 +93,15 @@ pub fn compare_chunk(profile: Profile, members: usize, solid: bool) -> usize {
 /// wide group of large blocks, this is the whole cost of the stage.
 const PARTITION_SPREAD: usize = 256 * 1024;
 
-fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> {
-    let mut runs: Vec<Vec<(usize, Vec<u8>)>> = Vec::new();
+fn partition_blocks<B: AsRef<[u8]> + Send + Sync>(
+    items: Vec<(usize, B)>,
+) -> Vec<Vec<(usize, B)>> {
+    let mut runs: Vec<Vec<(usize, B)>> = Vec::new();
     let mut pending = items;
     while !pending.is_empty() {
         let mut iter = pending.into_iter();
         let pivot = iter.next().expect("pending is not empty");
-        let others: Vec<(usize, Vec<u8>)> = iter.collect();
+        let others: Vec<(usize, B)> = iter.collect();
 
         // Every block is compared against the pivot and against nothing else,
         // so the comparisons are independent — and on a wide group of large
@@ -110,11 +112,14 @@ fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> 
         // The verdicts are collected in order and the split is done after, so
         // a run holds its members in the same order it always did. Nothing but
         // the `memcmp` moves.
-        let bytes = others.len().saturating_mul(pivot.1.len());
+        let bytes = others.len().saturating_mul(pivot.1.as_ref().len());
         let equal: Vec<bool> = if bytes >= PARTITION_SPREAD {
-            others.par_iter().map(|item| item.1 == pivot.1).collect()
+            others
+                .par_iter()
+                .map(|item| item.1.as_ref() == pivot.1.as_ref())
+                .collect()
         } else {
-            others.iter().map(|item| item.1 == pivot.1).collect()
+            others.iter().map(|item| item.1.as_ref() == pivot.1.as_ref()).collect()
         };
 
         let mut same = vec![pivot];
@@ -129,9 +134,9 @@ fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> 
         let lone = same.len() == 1;
         runs.push(same);
         if lone && rest.len() > PARTITION_FANOUT {
-            let mut by_digest: Ordered<Digest, (usize, Vec<u8>)> = Ordered::new();
+            let mut by_digest: Ordered<Digest, (usize, B)> = Ordered::new();
             for item in rest {
-                by_digest.push(sha256(&item.1), item);
+                by_digest.push(sha256(item.1.as_ref()), item);
             }
             for slot in by_digest.into_values() {
                 runs.extend(partition_blocks(slot));
@@ -143,7 +148,7 @@ fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> 
     runs
 }
 
-fn tags(run: Vec<(usize, Vec<u8>)>) -> Vec<usize> {
+fn tags<B>(run: Vec<(usize, B)>) -> Vec<usize> {
     run.into_iter().map(|(tag, _)| tag).collect()
 }
 
@@ -173,7 +178,7 @@ pub fn split_identical(
             .iter()
             .map(|&index| {
                 let record = &records[index];
-                (index, record.head()[..record.size as usize].to_vec())
+                (index, &record.head()[..record.size as usize])
             })
             .collect();
         for run in partition_blocks(blocks) {
@@ -183,7 +188,7 @@ pub fn split_identical(
             if context.learn {
                 // The whole file is in hand and it matched, so this is the
                 // same proof the reading path produces, learned for free.
-                let digest = sha256(&run[0].1);
+                let digest = sha256(run[0].1);
                 settled
                     .learned
                     .extend(run.iter().map(|&(index, _)| (index, digest)));
@@ -193,18 +198,31 @@ pub fn split_identical(
         return settled;
     }
 
+    // Every other stage opens in parallel and this one did not: a wide group
+    // is a thousand-odd opens on one thread while eight readers wait for it.
+    // Collected in `members` order, so which file lands in which slot — and
+    // the order `unreadable` is appended in — is what it always was.
+    let files: Vec<Option<File>> = {
+        let open = |&index: &usize| {
+            context
+                .effort
+                .open(&context.root.join(records[index].path()))
+                .ok()
+        };
+        match pool {
+            Some(pool) => pool.install(|| members.par_iter().map(open).collect()),
+            None => members.iter().map(open).collect(),
+        }
+    };
     let mut opened: Vec<usize> = Vec::new();
     let mut handles: Vec<Mutex<File>> = Vec::new();
-    for &index in members {
-        match context
-            .effort
-            .open(&context.root.join(records[index].path()))
-        {
-            Ok(file) => {
+    for (&index, file) in members.iter().zip(files) {
+        match file {
+            Some(file) => {
                 opened.push(index);
                 handles.push(Mutex::new(file));
             }
-            Err(_) => unreadable.push(records[index].path().to_string()),
+            None => unreadable.push(records[index].path().to_string()),
         }
     }
 
@@ -286,7 +304,7 @@ pub fn split_identical(
             opened
                 .iter()
                 .enumerate()
-                .map(|(slot, &index)| (slot, records[index].head()[..prefix].to_vec()))
+                .map(|(slot, &index)| (slot, &records[index].head()[..prefix]))
                 .collect(),
         )
         .into_iter()
@@ -382,7 +400,7 @@ pub fn split_identical(
             .into_iter()
             .map(|slot| {
                 let kept = records[opened[slot]].tail();
-                (slot, kept[kept.len() - tail..].to_vec())
+                (slot, &kept[kept.len() - tail..])
             })
             .collect();
         for run in partition_blocks(blocks) {
@@ -391,7 +409,7 @@ pub fn split_identical(
             }
             if context.learn {
                 for (slot, block) in &run {
-                    hashers[*slot].update(block);
+                    hashers[*slot].update(*block);
                     settled
                         .learned
                         .push((opened[*slot], hashers[*slot].clone().finalize().into()));
