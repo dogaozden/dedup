@@ -34,7 +34,8 @@ use crate::walk::FileRec;
 /// window resized while nobody is typing redraws while they are still looking.
 const WAIT_FOR_KEY: std::time::Duration = std::time::Duration::from_millis(250);
 
-use model::{human_count, human_size, Browser, Group, Key, Mark, Member, Mode, Outcome, Step};
+use crate::size::{human_count, human_size};
+use model::{Browser, Group, Key, Mark, Member, Mode, Outcome, Step};
 
 /// Whether a browser can run at all. Non-interactive use is `--list`/`--auto`,
 /// and a program that deletes files should not be guessing at a pipe.
@@ -409,7 +410,7 @@ fn summarise(browser: &Browser, records: &[FileRec], refused: &[DupGroup]) {
         };
         println!(
             "\n  {} files {where_to} · {} reclaimed\n",
-            human_count(browser.applied_files),
+            human_count(browser.applied_files as u64),
             human_size(browser.applied_bytes)
         );
     }
@@ -417,7 +418,7 @@ fn summarise(browser: &Browser, records: &[FileRec], refused: &[DupGroup]) {
     if !browser.failures.is_empty() {
         eprintln!(
             "  {} could not be removed:",
-            human_count(browser.failures.len())
+            human_count(browser.failures.len() as u64)
         );
         for line in browser.failures.iter().take(10) {
             eprintln!("    {line}");

@@ -14,6 +14,8 @@ mod effort;
 mod filters;
 mod ordered;
 mod pipeline;
+mod pulse;
+mod size;
 mod stages;
 mod sys;
 mod trash;
@@ -23,6 +25,7 @@ mod walk;
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -33,6 +36,7 @@ use device::{Device, VolumeProbe};
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
 use pipeline::{find_duplicates, report_names, size_stage};
+use pulse::Pulse;
 use trash::{run_auto, Removal, Rule};
 
 /// The conformance protocol object. Paths are borrowed from the scan's records
@@ -140,14 +144,20 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         other => other.flatten(),
     };
 
-    let effort = Effort::default();
+    // Shared so the pulse's ticker can read the same counters the readers are
+    // writing: the rate on the line is bytes that really moved, not an
+    // estimate kept beside them.
+    let effort = Arc::new(Effort::default());
+    // After the menu, which owns the terminal until it hands it back, and
+    // before anything is read.
+    let mut pulse = Pulse::start(options.quiet, &effort);
 
     // Started rather than answered: what kind of disk this is takes a
     // subprocess to find out, and nothing needs it until the pools are sized.
     let mut probe = VolumeProbe::start(&root, options.jobs);
     let mut cache = (!options.no_cache && options.stage != "size").then(ScanCache::new);
     let mut scan = if options.stage == "size" {
-        size_stage(&root, filters)
+        size_stage(&root, filters, &pulse)
     } else {
         find_duplicates(
             &root,
@@ -156,8 +166,12 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             &effort,
             cache.as_mut(),
             options.profile,
+            &pulse,
         )
     };
+    // The line goes before anything else is said, so nothing of it is left in
+    // the scrollback and nothing written after it lands on top of it.
+    pulse.finish();
     if let Some(hint) = scan.hint {
         eprintln!("{hint}");
     }

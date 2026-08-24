@@ -138,12 +138,15 @@ impl Form {
                     .then(|| walk.next().expect("peeked a value").clone()),
             };
             match rows.iter_mut().find(|row| row.flag.long == flag.long) {
+                // Prefilled through `Flag::show`, so the row a person reads is
+                // the row the scan runs on: the form hands these words back to
+                // the parser verbatim.
                 Some(row) => match (flag.takes, value) {
                     (Takes::Nothing, _) => row.on = true,
                     // A flag given twice fills the field with both, which is
                     // what the parser would have made of it.
-                    (_, Some(value)) if row.value.is_empty() => row.value = value,
-                    (_, Some(value)) => row.value = format!("{},{value}", row.value),
+                    (_, Some(value)) if row.value.is_empty() => row.value = flag.show(&value),
+                    (_, Some(value)) => row.value = format!("{},{}", row.value, flag.show(&value)),
                     (_, None) => {}
                 },
                 None => {
@@ -534,7 +537,10 @@ mod tests {
             "spinning",
             "--no-cache",
         ]);
-        assert_eq!(form.rows[row_of(&form, "--min-size")].value, "4096");
+        // Prefilled humanly, and prefilled with the words the form will hand
+        // back: 4096 goes in and 4 KiB comes out, and 4 KiB is what the scan
+        // then runs on.
+        assert_eq!(form.rows[row_of(&form, "--min-size")].value, "4 KiB");
         assert_eq!(form.rows[row_of(&form, "--ext")].value, "jpg,png");
         assert_eq!(form.rows[row_of(&form, "--profile")].value, "spinning");
         assert!(form.rows[row_of(&form, "--no-cache")].on);
@@ -589,7 +595,7 @@ mod tests {
         form.on_key(Key::Enter);
         assert_eq!(
             form.error.as_deref(),
-            Some("--min-size takes a whole number of bytes")
+            Some("not a size: \"lots\" — plain bytes or 512k, 100mb, 1.5g")
         );
         assert!(form.editing.is_some(), "the field keeps the cursor");
         // The same message the command line gives.
@@ -616,12 +622,15 @@ mod tests {
     fn clearing_a_field_puts_the_default_back() {
         let mut form = form(&["/tmp/tree", "--min-size", "4096"]);
         form.on_key(Key::Edit);
-        for _ in 0..4 {
+        for _ in 0.."4 KiB".len() {
             form.on_key(Key::Rub);
         }
         form.on_key(Key::Enter);
         assert_eq!(form.rows[0].value, "");
-        assert_eq!(form.rows[0].shown().0, "10485760 bytes (10 MiB)");
+        // The table's default, humanised there and shown here, and a value
+        // this field would accept if it were typed into it.
+        assert_eq!(form.rows[0].shown().0, "10 MiB");
+        assert!(form.complaint(0, "10 MiB").is_none());
         assert_eq!(
             options(&form.to_arguments()).min_size,
             crate::consts::DEFAULT_MIN_SIZE
@@ -788,9 +797,33 @@ mod tests {
         form.on_key(Key::Enter);
         let screen = render(&form, 72, 20).join("\n");
         assert!(
-            screen.contains("--min-size takes a whole number of bytes"),
+            screen.contains("not a size: \"lots\" — plain bytes or 512k, 100mb, 1.5g"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn the_min_size_field_shows_a_size_a_person_can_read_and_type() {
+        // The default first, then a value from the command line, then one
+        // typed into the field — the three ways a size reaches this row, all
+        // of them showing what the scan will actually use.
+        let screen = render(&form(&["/tmp/tree"]), 72, 20).join("\n");
+        assert!(screen.contains("min-size  10 MiB"), "{screen}");
+        assert!(!screen.contains("10485760"), "{screen}");
+
+        let screen = render(&form(&["/tmp/tree", "--min-size", "104857600"]), 72, 20).join("\n");
+        assert!(screen.contains("min-size  100 MiB"), "{screen}");
+
+        let mut form = form(&["/tmp/tree"]);
+        form.on_key(Key::Edit);
+        for letter in "100mb".chars() {
+            form.on_key(Key::Type(letter));
+        }
+        form.on_key(Key::Enter);
+        assert_eq!(form.error, None);
+        let screen = render(&form, 72, 20).join("\n");
+        assert!(screen.contains("min-size  100mb"), "{screen}");
+        assert_eq!(options(&form.to_arguments()).min_size, 100 * 1024 * 1024);
     }
 
     #[test]

@@ -12,7 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::model::{elide_left, human_count, human_size, Browser, Mode, MIN_HEIGHT, MIN_WIDTH};
+use super::model::{elide_left, Browser, Mode, MIN_HEIGHT, MIN_WIDTH};
+use crate::size::{human_count, human_size};
 
 const ACCENT: Color = Color::Cyan;
 const MARK: Color = Color::Red;
@@ -112,14 +113,14 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
 
     let summary = format!(
         "{} groups · {} reclaimable",
-        human_count(browser.groups.len()),
+        human_count(browser.groups.len() as u64),
         human_size(browser.reclaimable())
     );
     let marked = if browser.marked_count() > 0 {
         vec![Span::styled(
             format!(
                 "{} marked · {} to free",
-                human_count(browser.marked_count()),
+                human_count(browser.marked_count() as u64),
                 human_size(browser.marked_bytes())
             ),
             Style::default().fg(MARK).add_modifier(Modifier::BOLD),
@@ -163,8 +164,8 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
                 vec![Span::styled(
                     format!(
                         "Group {} of {}",
-                        human_count(browser.group + 1),
-                        human_count(browser.groups.len())
+                        human_count(browser.group as u64 + 1),
+                        human_count(browser.groups.len() as u64)
                     ),
                     accent(),
                 )],
@@ -172,7 +173,7 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
                     format!(
                         "{} × {} copies",
                         human_size(group.size),
-                        human_count(group.members.len())
+                        human_count(group.members.len() as u64)
                     ),
                     dim(),
                 )],
@@ -229,7 +230,10 @@ pub fn confirmation(browser: &Browser) -> Vec<String> {
         "Move to Trash"
     };
     let mut lines = vec![
-        format!("{verb}: {} files", human_count(browser.marked_count())),
+        format!(
+            "{verb}: {} files",
+            human_count(browser.marked_count() as u64)
+        ),
         format!("Reclaims {}", human_size(browser.marked_bytes())),
     ];
     if browser.hard {
@@ -306,7 +310,10 @@ fn draw_members(frame: &mut Frame, area: Rect, browser: &Browser) {
     frame.render_widget(List::new(items), area);
 
     if group.members.len() > visible {
-        let more = format!("… {} more", human_count(group.members.len() - visible));
+        let more = format!(
+            "… {} more",
+            human_count((group.members.len() - visible) as u64)
+        );
         let row = Rect {
             x: area.x,
             y: area.y + area.height - 1,
@@ -491,9 +498,9 @@ mod tests {
             vec![
                 " dedup                                                           /scratch/tree",
                 " ──────────────────────────────────────────────────────────────────────────────",
-                "  2 groups · 4.5 KB reclaimable",
+                "  2 groups · 4.5 KiB reclaimable",
                 "",
-                "  Group 1 of 2                                               4.0 KB × 3 copies",
+                "  Group 1 of 2                                              4.0 KiB × 3 copies",
                 " ──────────────────────────────────────────────────────────────────────────────",
                 "   › ○ photos/beach.jpg                                            2026-08-23",
                 "     ○ backup/photos/beach.jpg  +2 links                           2026-08-23",
@@ -532,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             screen[2],
-            "  2 groups · 4.5 KB reclaimable                      1 marked · 4.0 KB to free"
+            "  2 groups · 4.5 KiB reclaimable                    1 marked · 4.0 KiB to free"
         );
 
         // The glyphs carry the meaning in colour as well as in shape.
@@ -566,7 +573,7 @@ mod tests {
         let body = screen.join("\n");
         assert!(body.contains("Confirm"), "{body}");
         assert!(body.contains("Move to Trash: 1 files"), "{body}");
-        assert!(body.contains("Reclaims 4.0 KB"), "{body}");
+        assert!(body.contains("Reclaims 4.0 KiB"), "{body}");
         assert!(body.contains("y  confirm      n  cancel"), "{body}");
         assert!(
             !body.contains("cannot be undone"),
