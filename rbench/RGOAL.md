@@ -390,6 +390,7 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 8 | a 512 KB comparison chunk, not 4 MB | `8c2e4dd` | −11.8% A/B; **0.6029** refereed |
 | 9 | parallel opens + no copies in the compare setup | `5dbe9d6` | −6.2% A/B; **0.5717** refereed |
 | 10 | hash the small-file keys on the readers | `b0c3b72` | −2.1% A/B; **0.5529** refereed |
+| 11 | page probes on four readers, deep probes on eight | `cf77d35` | −3.3% A/B; **0.5538** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -2081,6 +2082,63 @@ the selftest pass.
 harness's own busy-check — another agent's harness was live out of
 `~/AI_Projects/dedup-m52` — and the retry loop simply kept asking until it
 went away. Nothing of theirs was touched.
+
+## 2026-08-23 — the same trade, cut in the right place
+
+**Change:** `rust/src/pipeline.rs` builds two readers instead of one.
+
+The reverted pool experiment above moved *every* probe stage from `cpu_bound`
+to `fast_bound` and lost `widegroup` while winning `photos` and `samesize`. I
+recorded that as "a probe that leaves out half of what the stage does", which
+was right, and then drew the wrong conclusion from it — that the probe stages
+want `cpu_bound`. They do not all want the same thing. What decides it is how
+much each stage **hashes per file**:
+
+```
+  stage        hashed/file   syscalls 4 vs 8   sha256 4 vs 8   wants
+  ends/head       4-8 KiB     6.38 / 10.25      1.3 / 0.65       4
+  deep head        60 KiB     7.40 / 10.54      9.6 / 4.8        8
+```
+
+Syscalls from the C probe over `widegroup`'s 1,827 files, best of nine; the
+sha256 column from the 2861 MB/s measured on this machine. Four readers win
+the page probes by 3.2 ms and lose the deep probe by 1.7. So stage 3's ends
+probe takes a `fast_bound` reader — the one `small_file_stage` already builds,
+so no new pool — and the deep-head and sample probes keep `cpu_bound`.
+
+**Numbers.** A/B/A at 21 rounds: **-3.3%**, and the tightest pair of the round,
+the two controls 0.3% apart with B below both:
+
+```
+  scenario      A         B         A2       B vs mean
+  needle      0.7078    0.7120    0.7266      -0.7%
+  typical     0.5989    0.5283    0.5485      -7.9%
+  samesize    0.8042    0.7306    0.7920      -8.5%
+  widegroup   0.4551    0.4899    0.4837      +4.4%
+  photos      0.4838    0.4132    0.4622     -12.6%
+  bigheader   0.5160    0.5986    0.5908      +8.2%
+  rescan      0.4300    0.3908    0.3910      -4.8%
+  SCORE       0.5571    0.5378    0.5554      -3.3%
+```
+
+`widegroup` at +4.4% is what the earlier trade had lost, so it was worth
+checking rather than accepting. Isolated, 21 rounds, twice each:
+
+```
+                A1        A2        B1        B2      B vs A
+  samesize    0.8090    0.8098    0.7500    0.7290     -8.6%
+  widegroup   0.5186    0.5058    0.4897    0.4881     -4.5%
+```
+
+`widegroup` **improves** by 4.5%; the +4.4% was noise, and its two controls in
+that run were 6.3% apart. There is no trade here at all — cut at the hashing
+volume rather than at the word "probe", both sides win. `bigheader`'s +8.2% is
+the same story: eight files, a 0.19 ms ends probe, and controls 14.5% apart.
+
+Confirmed at `--seed 2`: **0.5600**. Refereed at 21 rounds: **0.5538**, every
+gate green — an absolute that barely moved because `needle` came back at
+0.8497 with a ±7.4% spread in that particular run. The A/B is the measurement
+to read here; the absolute is the machine's mood.
 
 ---
 
