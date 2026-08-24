@@ -673,6 +673,10 @@ pub fn compare_stage(
                     // pool work, so each task reads its own members serially.
                     let settled =
                         split_identical(context, records, group, wave_chunk, &mut local, None);
+                    // Inside the wave, not after it: a whole wave is often the
+                    // whole stage, and progress counted there would arrive
+                    // only once it had stopped being progress.
+                    pulse.files(group.len() as u64);
                     (settled, local)
                 })
                 .collect()
@@ -681,7 +685,6 @@ pub fn compare_stage(
             out.absorb(settled);
             unreadable.extend(local);
         }
-        pulse.files(total as u64);
     }
     out
 }

@@ -1,0 +1,13 @@
+The grammar, through the flag table, on the real binary.
+
+$ dedup-rs <tree> --list --min-size '3145728'              exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3m'                   exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3mb'                  exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3MiB'                 exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '2.9g'                 exit=0  No duplicates found.
+$ dedup-rs <tree> --list --min-size '512 k'                exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '0'                    exit=0  2 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '12qb'                 exit=2  dedup-rs: not a size: "12qb" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '-1'                   exit=2  dedup-rs: not a size: "-1" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '1.2.3'                exit=2  dedup-rs: not a size: "1.2.3" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '18446744073709551616' exit=2  dedup-rs: not a size: "18446744073709551616" — plain bytes or 512k, 100mb, 1.5g

@@ -1,0 +1,52 @@
+$ rust/target/release/dedup-rs --help
+dedup-rs — find byte-exact duplicate files.
+
+usage: dedup-rs [root] [options]
+
+Groups of files whose bytes are identical, largest first. Nothing is
+ever called a duplicate on the strength of a hash: every group is
+read and compared. Runs on the current directory when no root is
+given. Without --list or --auto, a terminal gets the interactive
+browser.
+
+options:
+      --min-size SIZE     ignore files smaller than this; plain digits are
+                          bytes, or say 512k, 100mb, 1.5g, 2TiB — all binary
+                          multiples
+                          (default: 10 MiB)
+      --ext LIST          only these extensions, comma-separated; repeatable
+                          (default: every extension)
+      --skip-ext LIST     skip these extensions, comma-separated; repeatable
+                          (default: skip nothing)
+  -x, --exclude GLOB      skip paths matching this glob; repeatable
+                          (default: exclude nothing)
+  -j, --jobs N            readers to use
+                          (default: as many as the disk is worth)
+      --profile NAME      access patterns to use: flash, spinning or auto
+                          (default: auto)
+      --no-cache          read everything, remembering nothing
+                          (default: use the scan cache)
+  -l, --list              print the duplicate groups and stop
+                          (default: browse them, given a terminal)
+  -i, --interactive       browse them, and fail if there is no terminal
+                          (default: browse only when a terminal is there)
+      --auto [RULE]       delete without asking, keeping shortest, oldest or
+                          newest
+                          (default: delete nothing)
+  -y, --yes               do not ask before deleting
+                          (default: ask)
+      --hard              delete permanently instead of moving to the Trash
+                          (default: move to the Trash)
+      --report-json PATH  write the scan report here
+                          (default: a file in the temporary directory)
+      --stage NAME        size, to stop after grouping by length and report
+                          that; nothing there has been read, so --auto refuses
+                          it
+                          (default: full)
+  -q, --quiet             no progress line while the scan runs
+                          (default: a progress line, on a terminal)
+      --verify            accepted for the Python tool's sake; ignored here,
+                          which re-proves every group it deletes from anyway
+                          (default: ignored either way)
+  -h, --help              print this and stop
+exit=0, and -h is byte-identical: True
