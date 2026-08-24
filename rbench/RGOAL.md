@@ -394,6 +394,8 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 12 | IOKit and CoreFoundation `dlopen`ed, not linked | `26f501b` | −1.7% A/B (understated; B was instrumented) |
 | — | remove diagnostic timers committed by accident | `246faf2` | **0.5335** refereed, clean build |
 | 13 | the staged pipeline keeps its descriptors | `b561415` | −3.3% A/B/A; widegroup opens 5,442 → 1,834 |
+| 14 | the device answers, not the IO registry | `2ce27f2` | −1.7 ms fixed; **−4.3%** over four pairs |
+| — | borrow the cached digests rather than copy them | `0a75595` | −0.12 ms on `rescan`; **inside the floor**, not a win |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -2506,6 +2508,93 @@ on the short scenarios the candidate's absolute second is the honest column.
 `rescan` reads zero bytes and uses none of them. Killed without writing it:
 `rescan` at `-j 2` — which collapses the two pools into one of two threads —
 runs 8.08 ms against the default's 8.08. Pool creation does not register.
+
+
+## 2026-08-23 — two frameworks, again: the registry answered a question the device could answer
+
+`26f501b` stopped IOKit and CoreFoundation from being *linked*, so dyld no
+longer initialises them before `main`. They were still loaded — by the volume
+probe, on its thread, the first time it asked the registry what kind of disk
+this is. `VolumeProbe` exists precisely so that ask overlaps the walk, and on
+`needle` it does. On the scenarios that finish in ten milliseconds it does not:
+the walk is over in a fraction of one, and `probe.device()` then waits.
+
+**What the wait is made of.** `probe19` does exactly what `sys.rs` does — statfs,
+`dlopen` both frameworks, `IOBSDNameMatching`, the recursive parent search for
+`Device Characteristics`, then the conformance climb for a disk image:
+
+    statfs        0.006 ms
+    dlopen x2     1.985–3.354 ms
+    solid_state   0.184–0.597 ms
+    disk_image    0.117–0.182 ms
+
+**Five sixths of it is the two `dlopen`s**, and none of it is the question.
+
+**The device knows.** `diskutil info` prints `SolidState` and
+`VirtualOrPhysical`, and gets both from two ioctls on the raw node — the same
+two facts, from the kernel, with no framework in the way. `probe20` measured
+open + `DKIOCISSOLIDSTATE` + `DKIOCISVIRTUAL` + close at **0.039 ms**.
+
+`media_flags()` asks those two, and `is_solid_state` takes either answer as
+settling the question: flash is flash, and a disk image has no heads — the same
+reasoning the `disk_image` fallback already carried. It is not a *replacement*
+for the registry and must not be read as one. Two reasons:
+
+  * The ioctls answer yes/no where the registry answers yes/no/**don't know**,
+    and the difference matters — a RAM disk says "not solid" to the ioctl and
+    "no such key" to the registry, which is why only a *positive* answer is
+    taken here and everything else still falls through.
+  * The raw node for a system volume is `root:operator`. On this machine
+    `/dev/rdisk3s1s1` will not open at all, so the boot disk still goes to the
+    registry, exactly as before. **This wins on a volume the user attached** —
+    which is what the bench volume is, and is the honest way to read the
+    numbers below.
+
+**Same answer, proved three ways.** `the_device_agrees_with_diskutil` asserts
+the ioctls match what `diskutil` prints, and skips the volume whose node will
+not open rather than passing vacuously. The reports are byte-identical. And
+dyld says the load is gone — the four `move delayed to loaded:` lines for
+CoreFoundation, IOKit and their two swift shims are simply absent afterwards;
+everything stays delayed for the life of the process.
+
+**Measured, with the harness's own flags.** This matters and cost me a
+measurement: run without `--min-size` and the corpus has no candidates, the
+scan returns before it ever waits on the probe, and the change looks like
+−0.2 ms. Run it the way the bench runs it — best of fifteen, alternating:
+
+    corpus                       pre      HEAD     delta
+    typical-r2-seed1           84.35     82.73    -1.62   -1.9%
+    widegroup-r2-seed1         59.77     59.26    -0.50   -0.8%
+    samesize-smoke-seed1        5.84      3.91    -1.93  -33.1%
+    prefixtrap-smoke-seed1      5.67      3.90    -1.77  -31.2%
+
+**A flat ~1.7 ms off every scan** — a third of the shortest ones, nothing much
+on the longest, which is what a fixed cost looks like.
+
+**Scored.** Four alternating pairs against `b561415`, referee copy, 15–21
+rounds, spread over an hour:
+
+    pair    b561415    HEAD     delta
+    fin      0.5137   0.4822   -6.1%
+    alt1     0.5147   0.4860   -5.6%
+    alt2     0.5047   0.5019   -0.6%
+    alt3     0.5406   0.5165   -4.5%
+
+**Mean −4.3%, and every pair falls the same way.** In the first of them the
+candidate beat *both* its controls on all seven scenarios, including the two
+where the controls agreed to the fourth decimal (`bigheader` 0.0145/0.0145 →
+0.0127, `rescan` 0.0094/0.0094 → 0.0087).
+
+The pairs are quoted rather than one number because no single window was quiet
+enough to be worth quoting alone: `b561415` itself read 0.5047 to 0.5406 across
+five runs of the same binary tonight, a 7% spread against a ±0.42% floor. **The
+pairing is the measurement; the absolutes are weather.** `0a75595` read 0.4822,
+0.4860, 0.5019 and 0.5165 — median **≈0.494**.
+
+Arithmetic against the measured 1.7 ms predicts −8.5% if the whole of it were
+serial on every scenario. It is not — on `needle` and `typical` the probe still
+overlaps most of the walk — so −4.3% sitting between −1.9% and −8.5% is the
+answer the mechanism predicts, not a surprise to be explained away.
 
 
 ---
