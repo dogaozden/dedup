@@ -296,6 +296,67 @@ pub fn performance_cores() -> Option<usize> {
 ///
 /// `false` for anything the registry will not describe, which leaves the
 /// caller exactly where it was.
+/// What the device under a volume says about itself, in two ioctls.
+///
+/// `diskutil info` prints these as `SolidState` and `VirtualOrPhysical`, and
+/// gets them the same way this does: one open of the raw node and one ioctl
+/// each. That costs about forty microseconds. The registry below answers the
+/// same two questions and costs two to four milliseconds, almost all of it
+/// loading IOKit and CoreFoundation — a fixed price paid once per scan, which
+/// the scenarios that finish in ten milliseconds feel as a fifth of their run.
+///
+/// `None` means the device would not answer. The raw node for a system volume
+/// is `root:operator` and an ordinary user cannot open it, so this settles the
+/// question for a volume the user attached and leaves the rest to the
+/// registry, which is what ran here before and still runs when this declines.
+pub struct MediaFlags {
+    /// The disk is flash. `false` is "the device said no", not "did not say" —
+    /// which is why this cannot stand in for the registry's tri-state: a RAM
+    /// disk answers no here and "no such key" there.
+    pub solid: bool,
+    /// The block device is synthesized rather than physical — a disk image.
+    /// This is the same population `disk_image` identifies by conformance.
+    pub virtual_media: bool,
+}
+
+/// `_IOR('d', 79, uint32_t)` and `_IOR('d', 72, uint32_t)` from `<sys/disk.h>`,
+/// spelled out because there is no macro on this side to expand them.
+const DKIOCISSOLIDSTATE: libc::c_ulong = 0x4004_644f;
+const DKIOCISVIRTUAL: libc::c_ulong = 0x4004_6448;
+
+pub fn media_flags(path: &Path) -> Option<MediaFlags> {
+    let device = backing_device(path)?;
+    // The raw node, not the block node: the block one is busy while the
+    // volume is mounted and would refuse the open.
+    let mut node = Vec::with_capacity(6 + device.as_bytes().len());
+    node.extend_from_slice(b"/dev/r");
+    node.extend_from_slice(device.as_bytes());
+    let node = CString::new(node).ok()?;
+
+    // SAFETY: `node` is NUL-terminated and outlives the call.
+    let fd = unsafe { libc::open(node.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut solid: u32 = 0;
+    let mut synthesized: u32 = 0;
+    // SAFETY: both requests are `_IOR`s of one `uint32_t` and each is handed a
+    // writable `u32` of exactly that size. `fd` came from a successful open.
+    let (asked_solid, asked_virtual) = unsafe {
+        (
+            libc::ioctl(fd, DKIOCISSOLIDSTATE, &mut solid) == 0,
+            libc::ioctl(fd, DKIOCISVIRTUAL, &mut synthesized) == 0,
+        )
+    };
+    // SAFETY: `fd` came from a successful `open` and is closed once.
+    unsafe { libc::close(fd) };
+
+    (asked_solid || asked_virtual).then(|| MediaFlags {
+        solid: asked_solid && solid != 0,
+        virtual_media: asked_virtual && synthesized != 0,
+    })
+}
+
 pub fn disk_image(path: &Path) -> bool {
     let Some(device) = backing_device(path) else {
         return false;
@@ -505,6 +566,54 @@ mod agreement {
             println!("{mount}: getattrlist={ours:?} diskutil={theirs:?}");
             if theirs.is_some() {
                 assert_eq!(ours, theirs, "{mount}: disagreed with diskutil");
+            }
+        }
+    }
+
+    /// The ioctls have to say what the registry says, or the fast path is a
+    /// different tool rather than a faster one.
+    ///
+    /// On a machine whose only user-openable volume is the bench RAM disk this
+    /// asserts about one volume and skips the boot disk, which is honest: the
+    /// boot disk is precisely the case that still goes to the registry, and
+    /// `the_registry_agrees_with_diskutil` is what covers it.
+    #[test]
+    fn the_device_agrees_with_diskutil() {
+        for mount in ["/", "/Volumes/dedupbench"] {
+            let path = Path::new(mount);
+            if !path.exists() {
+                continue;
+            }
+            let Some(media) = media_flags(path) else {
+                println!("{mount}: raw node would not open — the registry answers");
+                continue;
+            };
+            let virtual_media = diskutil_string(mount, "VirtualOrPhysical");
+            println!(
+                "{mount}: solid={} virtual={} diskutil={:?}/{:?}",
+                media.solid,
+                media.virtual_media,
+                diskutil_says(mount),
+                virtual_media,
+            );
+            assert_eq!(
+                media.virtual_media,
+                virtual_media.as_deref() == Some("Virtual"),
+                "{mount}: disagreed with diskutil about being a disk image",
+            );
+            // Only where diskutil has an opinion. "Info not available" is the
+            // registry declining, and the device answering `no` to a question
+            // the registry would not answer at all is not a disagreement.
+            if let Some(theirs) = diskutil_says(mount) {
+                assert_eq!(media.solid, theirs, "{mount}: disagreed about flash");
+            }
+            // The one direction that would be a real conflict.
+            if media.solid {
+                assert_ne!(
+                    solid_state(path),
+                    Some(false),
+                    "{mount}: the device says flash and the registry says it spins",
+                );
             }
         }
     }

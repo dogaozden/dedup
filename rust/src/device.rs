@@ -251,6 +251,15 @@ fn is_solid_state(path: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return None;
     }
+    // The device itself first: two ioctls on the raw node, and either answer
+    // settles the question without loading a framework. A volume whose raw
+    // node will not open — a system disk, whose node is root-owned — falls
+    // through to the registry exactly as it did before.
+    if let Some(media) = crate::sys::media_flags(path) {
+        if media.solid || media.virtual_media {
+            return Some(true);
+        }
+    }
     if let Some(solid) = crate::sys::solid_state(path) {
         return Some(solid);
     }
