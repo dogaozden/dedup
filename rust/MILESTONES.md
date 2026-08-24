@@ -1915,10 +1915,17 @@ of, so the number on the line is bytes that really moved and cannot drift from
 what the report says. That is why `main` now holds `Effort` in an `Arc`: the
 ticker reads it while the readers write it.
 
-Counted so that a stage's total is exactly its own candidate count and no file
-is counted twice — tier B is not counted, because those files were counted when
-their head was read; cache hits are, because a warm stage that showed nothing
-would look stuck rather than fast.
+Counted so that no file is counted twice inside a stage. Tier B of the
+small-file stage is not counted, because those files were counted when their
+head was read; cache hits are, because a warm stage that showed nothing would
+look stuck rather than fast. Every stage's total is the very slice handed to
+it, so the count can only ever fall short of the total, never run past it — and
+it does fall short in one place: small-file candidates that the retention
+budget declines to hold are never read there, so a spilling small-file stage
+stops before the end of its bar and hands those files on to the head stage,
+where they are counted again under a total that includes them. Short is the
+honest direction; the bar is clamped at its total either way
+(`pulse::tests::the_bar_never_runs_past_its_own_end`).
 
 `finish` joins the ticker before wiping the line, so nothing can paint after
 it. `Drop` calls `finish` too, so a scan that panics still gives the line back.
