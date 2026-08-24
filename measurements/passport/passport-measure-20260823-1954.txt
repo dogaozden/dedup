@@ -1,0 +1,15 @@
+== passport measurement Sun Aug 23 19:54:48 EDT 2026 ==
+tree: /Volumes/My New Passport
+binary: /Users/dogaozden/.local/bin/dedup (dedup-rs — find byte-exact duplicate files.)
+
+== drive info (read-only) ==
+   Device Node:               /dev/disk7s1
+   Volume Name:               My New Passport
+   File System Personality:   APFS
+   Protocol:                  USB
+   SMART Status:              Not Supported
+   Disk Size:                 5.0 TB (5000946233344 Bytes) (exactly 9767473112 512-Byte-Units)
+   Solid State:               Info not available
+
+== walk only (metadata seeks) ==
+-- find, cold-ish:
