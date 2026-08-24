@@ -388,6 +388,7 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 6 | compare a group against its pivot in parallel | `db6b8c7` | → **0.6669** refereed |
 | 7 | hardware SHA-256 (`sha2` `asm` feature) | `b3d81fd` | → **0.6102** refereed |
 | 8 | a 512 KB comparison chunk, not 4 MB | `8c2e4dd` | −11.8% A/B; **0.6029** refereed |
+| 9 | parallel opens + no copies in the compare setup | `5dbe9d6` | −6.2% A/B; **0.5717** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -1935,6 +1936,71 @@ clean C measurement behind it — four readers really are 38% better than eight
 at open/read/close — and it was still wrong, because the stage also hashes and
 the hash wants the cores the probe had proved were useless. The probe was not
 wrong about what it measured. It was wrong about what the stage was.
+
+## 2026-08-23 — the round reopened: my own noise floor, and the comparison's setup
+
+**First, a method failure of mine.** §12 and the brief both say to measure the
+noise floor before the first idea. I inherited the previous session's ±3.7%
+instead of measuring it, and every "inside the floor" rejection in the entry
+above rests on a number I did not take. Measured now, `--calibrate --rounds 15`
+on this machine:
+
+```
+NOISE FLOOR: ±2.4%   (worst scenario: photos at 0.9763)
+  per-round dispersion, worst scenario: bigheader at ±10.2%
+  geomean of a baseline against itself: 0.9958
+```
+
+**±2.4%**, tighter than the figure I borrowed — so the bar for keeping a change
+was lower than I had been holding it to, not higher. Note the second line:
+per-round dispersion reaches ±10.2% on `bigheader` while the geomean of the
+whole run is within 0.4% of 1.0000. That is the whole reason a single scenario
+in a single run means so little here and the A/B of two commits means so much.
+
+**Change:** `rust/src/compare.rs`. Two pieces of avoidable work in
+`split_identical`'s setup, both timed inside the stage on `widegroup`:
+
+```
+  serial opens   14.3 ms   (1,804 opens, one thread)
+  prefix copy     9.25 ms  (64 KB x 1,804, purely to own the bytes)
+```
+
+**The opens were the last serial ones in the program.** Every other stage opens
+inside `read_batched`; this one was a plain `for` loop, so a wide group spent
+fourteen milliseconds opening files while eight readers waited on it. They now
+go through the same pool, collected in `members` order, so which file lands in
+which slot — and the order `unreadable` is appended in — is unchanged.
+
+**The copies existed to satisfy a signature.** `partition_blocks` took
+`Vec<(usize, Vec<u8>)>`, and `tags` throws the bytes away: only the slot index
+is ever used downstream. So all three call sites that already held the bytes —
+the whole-file fast path, the retained prefix, the retained tail — copied them
+to hand over ownership. `partition_blocks` is now generic over `AsRef<[u8]>`,
+those three pass slices, and nothing is copied. The chunk loop still passes
+owned blocks, which is what it has.
+
+**Numbers.** A/B/A at 21 rounds, the old commit on both sides:
+
+```
+  scenario      A (a0b1ab8)   B (5dbe9d6)   A2 (a0b1ab8)   B vs mean
+  needle          0.8639       0.8452         0.7658         +3.7%
+  typical         0.6103       0.5948         0.5605         +1.6%
+  samesize        0.8166       0.7907         0.8319         -4.1%
+  widegroup       0.5788       0.4779         0.5569        -15.8%
+  photos          0.4899       0.4688         0.4795         -3.3%
+  bigheader       0.6362       0.5500         0.6391        -13.7%
+  rescan          0.4246       0.3924         0.4488        -10.1%
+  SCORE           0.6142       0.5686         0.5980         -6.2%
+```
+
+**-6.2%**, against a ±2.4% floor, and B is below *both* A runs rather than
+between them. A nine-round A/B of the same pair had said -1.2%, with the two A
+runs 20% apart on `bigheader` alone; twenty-one rounds is what it took to see
+it. Confirmed at `--seed 2`: **0.5859**. Refereed at 21 rounds: **0.5717**.
+
+`widegroup` reports the same 8 groups, 5,442 opens and 473.3 MB as before —
+the same bytes, compared the same way, in the same order. 174 tests and the
+selftest pass.
 
 ---
 
