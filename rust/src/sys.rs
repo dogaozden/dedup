@@ -78,7 +78,8 @@ struct Frameworks {
         unsafe extern "C" fn(IoObject, *const c_char, CfTypeRef, CfTypeRef, u32) -> CfTypeRef,
     IOObjectRelease: unsafe extern "C" fn(IoObject) -> c_int,
     IOObjectConformsTo: unsafe extern "C" fn(IoObject, *const c_char) -> u8,
-    IORegistryEntryGetParentEntry: unsafe extern "C" fn(IoObject, *const c_char, *mut IoObject) -> c_int,
+    IORegistryEntryGetParentEntry:
+        unsafe extern "C" fn(IoObject, *const c_char, *mut IoObject) -> c_int,
     CFStringCreateWithCString: unsafe extern "C" fn(CfTypeRef, *const c_char, u32) -> CfTypeRef,
     CFGetTypeID: unsafe extern "C" fn(CfTypeRef) -> usize,
     CFDictionaryGetTypeID: unsafe extern "C" fn() -> usize,
@@ -91,7 +92,9 @@ struct Frameworks {
 static FRAMEWORKS: std::sync::OnceLock<Option<Frameworks>> = std::sync::OnceLock::new();
 
 fn frameworks() -> Option<&'static Frameworks> {
-    FRAMEWORKS.get_or_init(|| unsafe { load_frameworks() }).as_ref()
+    FRAMEWORKS
+        .get_or_init(|| unsafe { load_frameworks() })
+        .as_ref()
 }
 
 /// The handles are deliberately never closed: the process needs them for as
@@ -141,7 +144,11 @@ unsafe fn load_frameworks() -> Option<Frameworks> {
 mod shim {
     use super::*;
 
-    pub unsafe fn IOBSDNameMatching(port: IoObject, options: u32, name: *const c_char) -> *const c_void {
+    pub unsafe fn IOBSDNameMatching(
+        port: IoObject,
+        options: u32,
+        name: *const c_char,
+    ) -> *const c_void {
         match frameworks() {
             Some(f) => (f.IOBSDNameMatching)(port, options, name),
             None => std::ptr::null(),
