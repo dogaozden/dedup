@@ -2364,6 +2364,44 @@ not quoted here, because the number this window could produce would be a
 measurement of the load.
 
 
+## 2026-08-23 — `openat` measured and dropped: the name cache is already flat
+
+Two of the seven scenarios are open-bound. `needle` is 50,000 files of 1–4 KB
+with 25 planted pairs, so nearly every file shares its size with about fifteen
+others and has to be opened; at 482 ms it is more wall clock than the other six
+put together. `typical` is 19,202 files and about 13,300 opens. Both were
+already measured to sit within ten percent of a C floor doing the same opens,
+so the only way down is a *cheaper* open, not a faster one.
+
+Every open in the tree is `File::open(root.join(record.path()))` — the whole
+path from `/`, resolved again for every file. Under
+`/Volumes/dedupbench/corpora/typical-r2-seed1/` plus a seven-wide tree that is
+around nine components each time, where `openat` against a retained descriptor
+would resolve one. The walk already holds a descriptor for every directory —
+`getattrlistbulk` cannot be called without one — so the fds were there to keep.
+
+**Measured first, and it is not there.** `probe18` walks a real corpus, then
+opens and reads every file three ways on eight threads, alternating, best of
+seven:
+
+    19202 files in 481 dirs, 8 threads
+    best  full 176.33   parentfd 184.22   rootfd 178.75 ms
+    parentfd +4.5%   rootfd +1.4%
+    per file: full 9.183 us   parentfd 9.594 us   rootfd 9.309 us
+
+**Both descriptor-relative forms are slower than the full path.** The premise
+was wrong: macOS caches the whole resolved path, so the ninth component costs
+what the first does, and `openat` only adds an indirection through the
+descriptor table. The 9.18 µs per file is the open, the read and the close
+themselves — which is also, to within noise, `needle`'s 9.6 µs per file, so
+that scenario is at the syscall floor and this was never the lever.
+
+Dropped without a scored run. Cost: one C probe. **The rule that saved the hour
+is the round-one one — read the absolute time column, then measure the premise
+before writing the refactor.** The refactor here would have touched `FileRec`,
+the walk, `Effort`, and five call sites to buy −4.5%.
+
+
 ---
 
 ## 12. The loop, and when to stop
