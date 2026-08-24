@@ -391,7 +391,8 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 9 | parallel opens + no copies in the compare setup | `5dbe9d6` | −6.2% A/B; **0.5717** refereed |
 | 10 | hash the small-file keys on the readers | `b0c3b72` | −2.1% A/B; **0.5529** refereed |
 | 11 | page probes on four readers, deep probes on eight | `cf77d35` | −3.3% A/B; **0.5538** refereed |
-| 12 | IOKit and CoreFoundation `dlopen`ed, not linked | `26f501b` | −1.7% A/B; **0.5405** refereed |
+| 12 | IOKit and CoreFoundation `dlopen`ed, not linked | `26f501b` | −1.7% A/B (understated; B was instrumented) |
+| — | remove diagnostic timers committed by accident | `246faf2` | **0.5335** refereed, clean build |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -2260,6 +2261,36 @@ The test that mattered was already in the tree: `sys::agreement` checks the
 registry's answer against what `diskutil info` prints, and it passes unchanged.
 That is the thing to verify when you move an FFI boundary — not that it
 compiles, but that it still answers the same.
+
+## 2026-08-23 — diagnostic scaffolding shipped in a scored commit
+
+**Found while reading `pipeline.rs` for the next idea, not by any check I ran.**
+`26f501b` was staged with `git add -A rust/` while the file still carried the
+stage timers I had been profiling with, so eleven `prof()` calls and their
+helper went in with the lazy-framework change and stayed at HEAD through the
+journal commit after it.
+
+They are gated on `DEDUP_PROF` and print nothing without it, but "nothing" is
+still twelve `std::env::var_os` lookups per scan, and diagnostic scaffolding
+has no business in a build anybody scores.
+
+**Which way it biased the numbers, since that is the question that matters.**
+The A/B for `26f501b` ran the *instrumented* build as B against a clean A, so
+the **-1.7% it measured understated the change** rather than flattering it. Its
+refereed 0.5405 was on instrumented code too. Re-run clean, same commit content
+minus the timers: **0.5335** refereed at 21 rounds, **0.5363** at `--seed 2`.
+Both better than the instrumented figures, which is the direction the slip
+predicts.
+
+Removed in `246faf2`, and `rust/src` now greps clean for `TEMP-PROFILE`,
+`DEDUP_PROF` and every counter name used this round.
+
+The habit that caused it: `git add -A rust/` after a session of instrumenting
+and reverting. `instrument.py off` had been run before the *previous* commit
+and not before this one, and `git status` was never read between the two. The
+fix is not a better script, it is reading the diff before committing — the
+removal diff here is nineteen lines of obvious scaffolding that any glance at
+`git diff --staged` would have caught.
 
 ---
 
