@@ -4,6 +4,7 @@
 //! Every digest here only ever narrows the field. Nothing is called a
 //! duplicate on the strength of one: stage 5 compares the bytes.
 
+use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
@@ -74,6 +75,9 @@ struct Probed {
     digest: Digest,
     head: Vec<u8>,
     tail: Vec<u8>,
+    /// The descriptor this probe used, handed back so the next stage can read
+    /// the same file without opening it again.
+    file: Option<File>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,11 +103,31 @@ pub enum Probe {
     Sample,
 }
 
-fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Option<Probed> {
+/// A descriptor from an earlier stage, rewound, or a fresh one.
+///
+/// Every stage below used to start from a file it had just opened, so a
+/// position of zero was implied rather than asked for. A descriptor that has
+/// already been read from carries the previous stage's offset, so the seek is
+/// now explicit everywhere it matters.
+fn take_or_open(effort: &Effort, path: &Path, held: Option<File>) -> Option<File> {
+    match held {
+        Some(file) => Some(file),
+        None => effort.open(path).ok(),
+    }
+}
+
+fn probe_one(
+    root: &Path,
+    record: &FileRec,
+    probe: Probe,
+    effort: &Effort,
+    held: Option<File>,
+) -> Option<Probed> {
     let path = root.join(record.path());
     match probe {
         Probe::Ends { keep } => {
-            let mut file = effort.open(&path).ok()?;
+            let mut file = take_or_open(effort, &path, held)?;
+            file.seek(SeekFrom::Start(0)).ok()?;
             let head = effort
                 .read_block(&mut file, HEAD_BYTES, record.at(0))
                 .ok()?;
@@ -121,10 +145,12 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
                 digest,
                 head: if keep { head } else { Vec::new() },
                 tail: if keep { tail } else { Vec::new() },
+                file: Some(file),
             })
         }
         Probe::Head { keep } => {
-            let mut file = effort.open(&path).ok()?;
+            let mut file = take_or_open(effort, &path, held)?;
+            file.seek(SeekFrom::Start(0)).ok()?;
             let head = effort
                 .read_block(&mut file, HEAD_BYTES, record.at(0))
                 .ok()?;
@@ -133,11 +159,12 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
                 digest,
                 head: if keep { head } else { Vec::new() },
                 tail: Vec::new(),
+                file: Some(file),
             })
         }
         Probe::DeepHead { keep } => {
             let want = (record.size.min(DEEP_HEAD as u64) as usize).saturating_sub(HEAD_BYTES);
-            let mut file = effort.open(&path).ok()?;
+            let mut file = take_or_open(effort, &path, held)?;
             file.seek(SeekFrom::Start(HEAD_BYTES as u64)).ok()?;
             let block = effort
                 .read_block(&mut file, want, record.at(HEAD_BYTES as u64))
@@ -147,6 +174,7 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
                 digest,
                 head: if keep { block } else { Vec::new() },
                 tail: Vec::new(),
+                file: Some(file),
             })
         }
         Probe::Sample => {
@@ -154,7 +182,7 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
             // "small enough, just hash it whole" branch is unreachable here.
             let mut hasher = Sha256::new();
             hasher.update(record.size.to_string().as_bytes()); // same samples, different length
-            let mut file = effort.open(&path).ok()?;
+            let mut file = take_or_open(effort, &path, held)?;
             for offset in sample_points(record.size) {
                 file.seek(SeekFrom::Start(offset)).ok()?;
                 let block = effort
@@ -169,6 +197,7 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
                 digest: hasher.finalize().into(),
                 head: Vec::new(),
                 tail: Vec::new(),
+                file: Some(file),
             })
         }
     }
@@ -184,6 +213,18 @@ fn hash_keys(pool: &ThreadPool, read: Vec<Option<Vec<u8>>>) -> Vec<Option<(u64, 
             .map(|block| block.map(|block| (crate::ordered::hash_of(&block), block)))
             .collect()
     })
+}
+
+/// `read_batched` for work that has to *own* its item — a held descriptor
+/// cannot be handed out behind a shared reference.
+fn read_batched_owned<T, R, F>(pool: &ThreadPool, items: Vec<T>, jobs: usize, read: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync + Send,
+{
+    let span = batch_span(items.len(), jobs);
+    pool.install(|| items.into_par_iter().with_min_len(span).map(read).collect())
 }
 
 fn batch_span(items: usize, jobs: usize) -> usize {
@@ -227,6 +268,7 @@ pub fn hash_stage(
     probe: Probe,
     unreadable: &mut Vec<String>,
     mut cache: Option<&mut ScanCache>,
+    mut held: Option<&mut [Option<File>]>,
 ) -> Vec<Vec<usize>> {
     let field = match probe {
         Probe::Ends { .. } => Field::Ends,
@@ -254,10 +296,20 @@ pub fn hash_stage(
         }
     }
 
+    // Descriptors come out of the table before the readers start, because a
+    // held file has to be owned by the task that reads it, and go back in
+    // afterwards for whichever stage runs next.
+    let carried: Vec<(usize, Option<File>)> = to_read
+        .iter()
+        .map(|&index| {
+            let file = held.as_deref_mut().and_then(|table| table[index].take());
+            (index, file)
+        })
+        .collect();
     let probed = {
         let view: &[FileRec] = records;
-        read_batched(reader.pool, &to_read, reader.jobs, |&index| {
-            probe_one(reader.root, &view[index], probe, reader.effort)
+        read_batched_owned(reader.pool, carried, reader.jobs, |(index, file)| {
+            probe_one(reader.root, &view[index], probe, reader.effort, file)
         })
     };
 
@@ -267,6 +319,9 @@ pub fn hash_stage(
             continue;
         };
         let digest = outcome.digest;
+        if let Some(table) = held.as_deref_mut() {
+            table[index] = outcome.file;
+        }
         {
             let record = &mut records[index];
             match probe {

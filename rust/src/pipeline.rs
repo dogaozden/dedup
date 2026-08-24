@@ -7,13 +7,14 @@
 //! to bytes compared in stage 5, or to whole content held in memory by the
 //! small-file stage.
 
+use std::fs::File;
 use std::path::Path;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::cache::ScanCache;
 use crate::compare::{compare_stage, Compare};
-use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
+use crate::consts::{DEEP_HEAD, HANDLE_BUDGET, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
 use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
@@ -228,6 +229,16 @@ pub fn find_duplicates(
         .filter(|&index| records[index].size > DEEP_HEAD as u64)
         .collect();
 
+    // One descriptor per staged file, carried from the ends probe through the
+    // deep-head and sample probes. Only worth building when the staged set is
+    // small enough to hold; past that every stage reopens as before.
+    let holding = !staged.is_empty() && staged.len() <= HANDLE_BUDGET;
+    let mut held: Vec<Option<File>> = if holding {
+        (0..records.len()).map(|_| None).collect()
+    } else {
+        Vec::new()
+    };
+
     let mut remembered: Vec<Vec<usize>> = Vec::new();
     if !small.is_empty() {
         // The same shallow reader stage 3's page probe uses; see
@@ -273,6 +284,7 @@ pub fn find_duplicates(
         ends,
         &mut unreadable,
         cache.as_deref_mut(),
+        holding.then(|| held.as_mut_slice()),
     );
     let mut pending: Vec<Vec<usize>> = end_buckets
         .into_iter()
@@ -307,6 +319,7 @@ pub fn find_duplicates(
             Probe::DeepHead { keep: keep_rest },
             &mut unreadable,
             cache.as_deref_mut(),
+            holding.then(|| held.as_mut_slice()),
         );
         pending.extend(rest_buckets.into_iter().filter(|bucket| bucket.len() > 1));
         if keep {
@@ -342,6 +355,7 @@ pub fn find_duplicates(
             Probe::Sample,
             &mut unreadable,
             cache.as_deref_mut(),
+            holding.then(|| held.as_mut_slice()),
         );
         pending.extend(sample_buckets.into_iter().filter(|bucket| bucket.len() > 1));
     }
@@ -381,6 +395,7 @@ pub fn find_duplicates(
         sequential_jobs,
         &sequential_pool,
         &mut unreadable,
+        holding.then(|| held.as_mut_slice()),
     );
     settled.extend(compared.matched);
     // The bytes went past anyway, so a group read here is also a group learned.

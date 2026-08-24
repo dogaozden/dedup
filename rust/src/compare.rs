@@ -162,6 +162,10 @@ pub fn split_identical(
     chunk: usize,
     unreadable: &mut Vec<String>,
     pool: Option<&ThreadPool>,
+    // One slot per member, in `members` order: the descriptor the staged
+    // probes left open on that file, or `None` to open it here. Empty when
+    // the pipeline is holding none.
+    carried: Vec<Option<File>>,
 ) -> Settled {
     let mut settled = Settled::default();
 
@@ -204,15 +208,23 @@ pub fn split_identical(
     // Collected in `members` order, so which file lands in which slot — and
     // the order `unreadable` is appended in — is what it always was.
     let files: Vec<Option<File>> = {
-        let open = |&index: &usize| {
-            context
+        // A descriptor the probes already opened is reused; the rest are
+        // opened here, in parallel, as they were.
+        let paired: Vec<(usize, Option<File>)> = if carried.len() == members.len() {
+            members.iter().copied().zip(carried).collect()
+        } else {
+            members.iter().copied().map(|index| (index, None)).collect()
+        };
+        let open = |(index, file): (usize, Option<File>)| match file {
+            Some(file) => Some(file),
+            None => context
                 .effort
                 .open(&context.root.join(records[index].path()))
-                .ok()
+                .ok(),
         };
         match pool {
-            Some(pool) => pool.install(|| members.par_iter().map(open).collect()),
-            None => members.iter().map(open).collect(),
+            Some(pool) => pool.install(|| paired.into_par_iter().map(open).collect()),
+            None => paired.into_iter().map(open).collect(),
         }
     };
     let mut opened: Vec<usize> = Vec::new();
@@ -259,12 +271,22 @@ pub fn split_identical(
             }
         }
     }
-    if prefix > 0 {
+    // Always positioned explicitly: a descriptor handed over by the probes is
+    // wherever that probe left it, not at zero.
+    {
+        let mut failed = false;
         for handle in &handles {
             let mut file = handle.lock().expect("no reader panics");
             if file.seek(SeekFrom::Start(prefix as u64)).is_err() {
-                prefix = 0;
+                failed = true;
                 break;
+            }
+        }
+        if failed {
+            prefix = 0;
+            for handle in &handles {
+                let mut file = handle.lock().expect("no reader panics");
+                let _ = file.seek(SeekFrom::Start(0));
             }
         }
     }
@@ -446,7 +468,15 @@ fn compare_cohort(
     unreadable: &mut Vec<String>,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
     let mut reported: Vec<String> = Vec::new();
-    let outcome = split_identical(context, records, cohort, chunk, &mut reported, None);
+    let outcome = split_identical(
+        context,
+        records,
+        cohort,
+        chunk,
+        &mut reported,
+        None,
+        Vec::new(),
+    );
     settled.learned.extend(outcome.learned);
     let mut runs = outcome.matched;
     let accounted: std::collections::HashSet<usize> = runs.iter().flatten().copied().collect();
@@ -509,7 +539,15 @@ pub fn split_identical_capped(
     if members.len() <= SPIN_INTERLEAVE {
         // Narrow enough to compare in one pass, which is the ordinary
         // comparison exactly.
-        return split_identical(context, records, members, chunk, unreadable, None);
+        return split_identical(
+            context,
+            records,
+            members,
+            chunk,
+            unreadable,
+            None,
+            Vec::new(),
+        );
     }
 
     let mut clusters: Vec<Vec<usize>> = members.iter().map(|&index| vec![index]).collect();
@@ -642,7 +680,17 @@ pub fn compare_stage(
     jobs: usize,
     pool: &ThreadPool,
     unreadable: &mut Vec<String>,
+    mut held: Option<&mut [Option<File>]>,
 ) -> Settled {
+    // Every descriptor a group needs is lifted out of the table here, on this
+    // thread, before anything fans out — a wave's members run as parallel
+    // tasks and cannot share `&mut` access to it.
+    fn lift(held: &mut Option<&mut [Option<File>]>, members: &[usize]) -> Vec<Option<File>> {
+        match held.as_deref_mut() {
+            Some(table) => members.iter().map(|&index| table[index].take()).collect(),
+            None => Vec::new(),
+        }
+    }
     // One disk, one queue, one group at a time, in the order the buckets were
     // sorted into — which is inode order, so the whole stage walks the platter
     // forwards. Waves exist to keep several readers busy and there is only one.
@@ -668,6 +716,7 @@ pub fn compare_stage(
     while index < buckets.len() {
         if buckets[index].len() >= wave_members {
             let chunk = compare_chunk(context.profile, buckets[index].len(), context.solid);
+            let carried = lift(&mut held, &buckets[index]);
             out.absorb(split_identical(
                 context,
                 records,
@@ -675,6 +724,7 @@ pub fn compare_stage(
                 chunk,
                 unreadable,
                 spread,
+                carried,
             ));
             index += 1;
             continue;
@@ -693,21 +743,26 @@ pub fn compare_stage(
             // Nothing left to pack it with, and it never reached the threshold
             // alone either.
             let chunk = compare_chunk(context.profile, wave[0].len(), context.solid);
+            let carried = lift(&mut held, &wave[0]);
             out.absorb(split_identical(
-                context, records, &wave[0], chunk, unreadable, spread,
+                context, records, &wave[0], chunk, unreadable, spread, carried,
             ));
             continue;
         }
 
         let wave_chunk = compare_chunk(context.profile, total, context.solid);
+        let lifted: Vec<Vec<Option<File>>> =
+            wave.iter().map(|group| lift(&mut held, group)).collect();
         let results: Vec<(Settled, Vec<String>)> = pool.install(|| {
             wave.par_iter()
-                .map(|group| {
+                .zip(lifted.into_par_iter())
+                .map(|(group, carried)| {
                     let mut local = Vec::new();
                     // pool = None: nothing here submits pool work from inside
                     // pool work, so each task reads its own members serially.
-                    let settled =
-                        split_identical(context, records, group, wave_chunk, &mut local, None);
+                    let settled = split_identical(
+                        context, records, group, wave_chunk, &mut local, None, carried,
+                    );
                     (settled, local)
                 })
                 .collect()
@@ -755,6 +810,7 @@ pub fn verify_attested(
                 chunk,
                 &mut unreadable,
                 None,
+                Vec::new(),
             )
         };
         if settled.matched.len() == 1
@@ -926,6 +982,7 @@ mod tests {
                 chunk,
                 &mut sink,
                 None,
+                Vec::new(),
             );
             let mut sink = Vec::new();
             let capped = split_identical_capped(

@@ -35,6 +35,21 @@ pub const SLOW_CHUNK: usize = 16 * 1024 * 1024;
 pub const COMPARE_BUDGET: usize = 128 * 1024 * 1024;
 /// ...which the chunk shrinks towards, but not below.
 pub const MIN_CHUNK: usize = 128 * 1024;
+/// How many file descriptors the staged pipeline will hold open between its
+/// stages rather than reopening.
+///
+/// `widegroup` opens 5,442 times for 1,827 files — once in the ends probe,
+/// once in the deep-head probe, once in the comparison — and an open is not
+/// free: bare open-and-close over those files measures 5.54 ms on four
+/// readers. Holding the descriptor across the stages pays that once.
+///
+/// The bound exists because a tree can be much larger than this one. macOS
+/// here allows 61,440 descriptors per process and the soft limit the tool
+/// inherits is 1,048,576, so 4,096 is nowhere near the ceiling; it is small
+/// enough to be polite on a machine whose limits are lower, and past it the
+/// stages reopen exactly as they did before.
+pub const HANDLE_BUDGET: usize = 4096;
+
 /// Files handed to a reader task at a time — one task per file spends more
 /// time in the queue than in the read.
 pub const HASH_BATCH: usize = 64;
