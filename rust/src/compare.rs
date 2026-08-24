@@ -593,6 +593,9 @@ impl Round {
 /// tree of thousands of two-file groups used to leave most of `-j` idle. The
 /// chunk is sized on the whole wave's member count, so the wave's aggregate
 /// memory stays inside `COMPARE_BUDGET`.
+/// `pulse` is told a group at a time rather than a file at a time: a group is
+/// where this stage's work is indivisible anyway, and counting there keeps the
+/// reading loops — the hottest code in the program — exactly as they were.
 pub fn compare_stage(
     context: &Compare,
     records: &[FileRec],
@@ -600,6 +603,7 @@ pub fn compare_stage(
     jobs: usize,
     pool: &ThreadPool,
     unreadable: &mut Vec<String>,
+    pulse: &crate::pulse::Pulse,
 ) -> Settled {
     // One disk, one queue, one group at a time, in the order the buckets were
     // sorted into — which is inode order, so the whole stage walks the platter
@@ -611,6 +615,7 @@ pub fn compare_stage(
             out.absorb(split_identical_capped(
                 context, records, bucket, chunk, unreadable,
             ));
+            pulse.files(bucket.len() as u64);
         }
         return out;
     }
@@ -634,6 +639,7 @@ pub fn compare_stage(
                 unreadable,
                 spread,
             ));
+            pulse.files(buckets[index].len() as u64);
             index += 1;
             continue;
         }
@@ -654,6 +660,7 @@ pub fn compare_stage(
             out.absorb(split_identical(
                 context, records, &wave[0], chunk, unreadable, spread,
             ));
+            pulse.files(wave[0].len() as u64);
             continue;
         }
 
@@ -666,6 +673,10 @@ pub fn compare_stage(
                     // pool work, so each task reads its own members serially.
                     let settled =
                         split_identical(context, records, group, wave_chunk, &mut local, None);
+                    // Inside the wave, not after it: a whole wave is often the
+                    // whole stage, and progress counted there would arrive
+                    // only once it had stopped being progress.
+                    pulse.files(group.len() as u64);
                     (settled, local)
                 })
                 .collect()

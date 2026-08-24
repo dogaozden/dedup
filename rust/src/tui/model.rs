@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::size::human_count;
 use crate::trash::Rule;
 
 /// Below this the columns stop meaning anything and the paint layer draws a
@@ -351,7 +352,7 @@ impl Browser {
         self.mode = Mode::Browse;
         self.flash = format!(
             "{} files marked — keeping the {rule} copy",
-            human_count(marked)
+            human_count(marked as u64)
         );
         Step::Stay
     }
@@ -453,11 +454,11 @@ impl Browser {
         self.flash = if outcome.refused > 0 {
             format!(
                 "{} group(s) refused — their copies no longer match",
-                human_count(outcome.refused)
+                human_count(outcome.refused as u64)
             )
         } else {
             let verb = if self.hard { "deleted" } else { "moved" };
-            format!("{verb} {} files", human_count(outcome.files))
+            format!("{verb} {} files", human_count(outcome.files as u64))
         };
         if self.groups.is_empty() {
             Step::Quit
@@ -465,38 +466,6 @@ impl Browser {
             Step::Stay
         }
     }
-}
-
-/// Format a byte count the way a person would say it — the oracle's rounding,
-/// including its switch to whole numbers at 100.
-pub fn human_size(n: u64) -> String {
-    if n < 1024 {
-        return format!("{n} B");
-    }
-    let mut value = n as f64;
-    for unit in ["KB", "MB", "GB", "TB", "PB"] {
-        value /= 1024.0;
-        if value < 1024.0 {
-            return if value < 100.0 {
-                format!("{value:.1} {unit}")
-            } else {
-                format!("{value:.0} {unit}")
-            };
-        }
-    }
-    format!("{value:.1} EB")
-}
-
-pub fn human_count(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (position, digit) in digits.chars().enumerate() {
-        if position > 0 && (digits.len() - position).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
 }
 
 /// Trim from the left so the end of a path — the filename — stays visible.
@@ -1062,26 +1031,6 @@ mod tests {
         browser.groups[1].members[0].deletable = false;
         browser.groups[1].members[1].deletable = false;
         assert_eq!(browser.reclaimable(), 1000);
-    }
-
-    #[test]
-    fn sizes_read_the_way_the_oracle_says_them() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(1023), "1023 B");
-        assert_eq!(human_size(1024), "1.0 KB");
-        assert_eq!(human_size(1536), "1.5 KB");
-        // Past 100 of a unit the decimal stops earning its place.
-        assert_eq!(human_size(100 * 1024), "100 KB");
-        assert_eq!(human_size(1024 * 1024), "1.0 MB");
-        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GB");
-    }
-
-    #[test]
-    fn counts_are_grouped_in_threes() {
-        assert_eq!(human_count(0), "0");
-        assert_eq!(human_count(999), "999");
-        assert_eq!(human_count(1000), "1,000");
-        assert_eq!(human_count(1234567), "1,234,567");
     }
 
     #[test]

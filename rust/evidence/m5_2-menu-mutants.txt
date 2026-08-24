@@ -1,0 +1,33 @@
+$ python3 rust/evidence/scripts/menu_mutants.py
+Baseline: the tree as written.
+  cli::tests and tui::menu::tests all pass
+
+mutant help-misses-a-flag           renders every flag but the first
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags, the_help_text_says_something_about_every_flag
+
+mutant help-invents-a-flag          hand-writes a line for a flag the parser does not accept
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags
+
+mutant help-default-drifts          says a default the code does not have
+  caught by the_defaults_the_help_text_prints_are_the_defaults_the_code_has, clearing_a_field_puts_the_default_back, the_min_size_field_shows_a_size_a_person_can_read_and_type
+
+mutant menu-writes-its-own-default  shows a default of its own instead of the table's
+  caught by clearing_a_field_puts_the_default_back, the_form_shows_the_root_every_field_and_every_default, the_min_size_field_shows_a_size_a_person_can_read_and_type
+
+mutant menu-drops-a-field           leaves a field out of the argument list it hands back
+  caught by a_switch_toggles_and_reaches_the_options, the_command_line_prefills_the_fields_it_names
+
+mutant menu-skips-validation        accepts whatever is typed and lets the scan find out
+  caught by a_bad_profile_is_refused_the_same_way, a_field_is_refused_in_the_field_with_the_parsers_own_words, a_refusal_is_shown_beside_the_field_it_belongs_to
+
+Baseline: the same tree, built and run through tui-terminal-death.py.
+  every scenario passed
+
+mutant one-of-three-answers         enters the blocking read when poll said nothing was typed
+  caught: hangup/menu      FAIL  the menu was still running 5s after the terminal died, 5.02 CPU-seconds in that window — SPINNING
+
+mutant drop-the-dead-terminal       lets ratatui print to a descriptor that is gone, panicking on the way out
+  caught: hangup/menu      FAIL  the menu left in 0.06s but by panicking (exit 101)
+
+every mutant was caught
+MENU_MUTANTS_EXIT=0

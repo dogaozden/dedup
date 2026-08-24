@@ -45,8 +45,12 @@ MUTANTS = [
         "help-default-drifts",
         "says a default the code does not have",
         "src/cli.rs",
-        '        help: "ignore files smaller than this",\n        default: "10485760 bytes (10 MiB)",',
-        '        help: "ignore files smaller than this",\n        default: "1048576 bytes (1 MiB)",',
+        # The `default:` line alone, and not the `help:` line above it: M5.2
+        # rewrote the help wording and this anchor went stale without anything
+        # noticing, which cost five later mutants their run. The default line
+        # is unique in the file and is the only part this mutant needs.
+        '        default: "10 MiB",',
+        '        default: "1 MiB",',
     ),
     (
         "menu-writes-its-own-default",

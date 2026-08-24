@@ -2108,3 +2108,265 @@ and a clean result you did not earn:
 I did not touch the non-binding items the reviewer marked "not this branch's":
 the `-j1` attached-short-option gap, which `main` shares, and `VolumeProbe`'s
 stale doc comment.
+
+## 2026-08-23 — M5.2, sizes for humans and a live pulse
+
+Two defects in one evening, and they turn out to want opposite things from the
+same file. `100mb` typed into the menu was refused because the only grammar the
+tool had was `str::parse::<u64>`; an HDD scan showed nothing because the only
+thing the tool wrote during a scan was nothing. The first wants the flag table
+to know more; the second wants the scan path to do less.
+
+### One grammar, and two humanisers, which is one more than the spec asks for
+
+`size.rs` owns `parse_size`, and `Flag::apply` is its only caller, so the
+command line, the form and `--help` are the same code with three doors.
+Everything is binary: `k` is 1024 because MiB is what the browser prints, and a
+number read off the screen has to mean the same thing typed back in.
+
+The part worth arguing about is the display side. M5_2-UX.md says sizes are
+shown "through one humanizer shared with the TUI's `human_size`" and that every
+displayed string must parse back to exactly the bytes it came from. Those two
+cannot both hold of one function. `human_size` rounds — it has to, because the
+browser shows arbitrary file sizes and `1468006 B` is not a size a person
+reads. But a rounded size in the menu's min-size field is not a display bug, it
+is a scan the user did not agree to: the form hands its own words back to the
+parser, so a field showing `1.4 MiB` for 1500000 would run the scan at 1468006.
+
+So there are two, on one ladder, in one file:
+
+- `human_size` — rounded, for a number nobody types back in. Relabelled from
+  `KB`/`MB` to `KiB`/`MiB`, which is what it was already dividing by. Its
+  `EB` branch, inherited from the oracle, printed 1024× the truth for anything
+  past a pebibyte; the ladder now runs to `EiB` and the branch is gone.
+- `exact_size` — the largest unit that divides to one decimal place, and plain
+  bytes when none does. Never rounds, so `1500000` stays `1500000`.
+
+`exact_size` is what the help default and the menu prefill use, through
+`Flag::show`, which is `Flag::apply`'s inverse and is bound to it by test.
+`--min-size 10485760` on the command line now reaches the form as `10 MiB` and
+leaves it as `10 MiB`. The round-trip law is tested over the whole ladder plus
+a few thousand deterministic scatter values.
+
+`p` and `e` are in the grammar though nothing teaches them: without them the
+top two rungs of the ladder the browser prints would be rungs the tool cannot
+read back.
+
+### The pulse, and what "inert" had to mean
+
+The oracle's `Reporter` paints from the scan thread, on a tick passed down into
+every stage. That is one design; the trouble with porting it literally is that
+the tick is then on the scan path whether anybody is watching or not.
+
+Here the painting is a ticker thread and the scan path only ever adds to a
+counter. `Pulse` is `Option<Live>`: off, every method is a branch that falls
+through, and there is no thread, no lock, no write. The rate comes from
+`Effort::bytes_read` — the counter the honesty fields are already made of — so
+the number on the line is bytes that really moved and cannot drift away from
+what the report says. That is what made `Effort` an `Arc` in `main`: the ticker
+needs to read it while the readers write it.
+
+Counting points, one per stage, chosen so the total is exactly the stage's own
+candidate count and no file is counted twice:
+
+| stage | told by | told at |
+|---|---|---|
+| Scanning | `walk` | each file's `metadata`, with its size |
+| Reading small files | `small_file_stage` | tier A's read, and the cache-settled classes |
+| Sampling / further / deep | `hash_stage` | inside the pool closure, and on each cache hit |
+| Comparing | `compare_stage` | as each group settles, inside the wave |
+
+Tier B is not counted: those files were counted when their head was read, and
+counting them again would put the bar past its own end. Cache hits are counted,
+or a warm stage would look stuck rather than fast.
+
+Two things I got wrong first. The compare stage counted after each wave, and a
+wave is often the whole stage, so the bar sat at nought until the moment it
+stopped mattering; it counts inside the wave now. And the wave path went
+uncovered in my first pty corpus because the sample stage re-buckets across
+everything stage 3 separated — 20 pairs distinguished only by their heads
+arrive at the comparison as one group of 40. That is the oracle's shape too
+(`survivors = sorted(f for g in big for f in g)`), and it is not a correctness
+problem because stage 5 partitions as it reads. It does mean a single wide
+group shows a still bar and a moving rate, which is exactly what the oracle
+shows in the same shape.
+
+`finish` joins the ticker before it wipes the line, so nothing can paint after
+it: that is what lets the browser's alternate screen and `--list`'s stdout
+follow it without a race. `Drop` calls `finish` too, so a scan that panics
+still gives the line back. The line is truncated a column short of the
+terminal width, because a wrapped line leaves its first row behind at the next
+repaint.
+
+### Numbers
+
+`evidence/m5_2-inertness.txt` — a 30,516-file tree, stderr piped, alternating,
+15 runs a side:
+
+| | opens | bytes_read | files_seen | bytes_seen | seeks | wall-clock |
+|---|---|---|---|---|---|---|
+| -j1, m5.2 | 51052 | 647872512 | 30516 | 640221184 | 51260 | 4.601s median |
+| -j1, main | 51052 | 647872512 | 30516 | 640221184 | 51260 | 4.531s median |
+| -j8, m5.2 | 51052 | 647872512 | 30516 | 640221184 | — | 1.114s median |
+| -j8, main | 51052 | 647872512 | 30516 | 640221184 | — | 1.164s median |
+
++1.6% at one reader and -4.3% at eight, against trimmed within-build spreads of
+0.590s and 0.302s. The two halves disagree about the *sign* — slower on one,
+faster on the other, same tree, same minutes — and a cost that appears and
+disappears with the job count is not a cost. The counters, which have no
+spread, are identical either way. (Re-measured in the fix round with the
+trimmed noise floor of non-binding note 4; the first capture ran warm and this
+one cold, which is the difference in the absolute times.)
+
+`seeks` is compared at one reader only. Above that it is nondeterministic by
+design, and I checked rather than assumed: eight repeats of `main` against
+itself at the default `-j` gave 348 and 349 on the same tree, and this build
+gave the same two numbers. A comparison there would be measuring the scheduler.
+
+`cargo test` 181 passed against `main@fbc196d`'s 164, counted by building that
+commit rather than by reading the last claim. Clippy and fmt clean, `--gate
+all` 33/33.
+
+### The bug I put in and then found
+
+`multiplier_of` split the suffix with `split_at(1)` — one byte — so
+`--min-size 1€` panicked inside `core::str` rather than being refused. I found
+it reading my own diff for exactly this, which is the only reason to read your
+own diff. A flag value is whatever came off the command line; refusing is an
+answer, falling over is not, on a program that deletes files. It splits by
+character now, and `nothing_a_person_can_type_makes_the_parser_fall_over`
+throws twenty thousand words at it built from digits, dots, signs, spaces, unit
+letters, NUL, Arabic-Indic and fullwidth digits, `€` and an emoji.
+
+The lesson generalises and I went looking: every other index into a `&str` in
+this diff is either a `find` result (a char boundary by construction), a
+`split_once`, or `.chars()`. The pulse's line truncation is `.chars().take()`
+for the same reason.
+
+### What the regression suites said when I ran them, which is the point of them
+
+I re-ran M5's and M5.1's own scripts before claiming, expecting a formality.
+`m5_end_to_end.py` — the only proof in the repository that the browser deletes
+what it says it deletes — printed `18 check(s) differing`, and printed exactly
+the same thing against a build of `main@fbc196d`. It had not been testing the
+browser since M5.1: it launches with `-i`, which now lands on the pre-flight
+menu, and then types browser keys at a form that ignores them until the pty
+times out and the process is killed.
+
+That is REVIEW-M5_1's own third finding — a test that does not assert which
+screen it is on stops covering the screen it was written for the moment
+somebody adds another — fixed in `tui-terminal-death.py` at the time and not
+looked for anywhere else. Three harness bugs, no program change: wait for the
+menu by name and Enter through it, say `NOT REACHED` when the browser's screen
+never appears, make the two cases that run from inside the tree use an absolute
+`HOME` (their relative one put the run's own report, cache and Trash inside the
+tree and counted them as survivors), and start the too-small case roomy and
+shrink the pty once the browser has it, because the menu now refuses below
+54x16 before the browser is ever reached. 0 differing after, on both builds.
+
+Asking what ctrl-c does to my own progress line led somewhere older and worse.
+Ctrl-C typed at the browser is safe, and for a reason worth writing down: raw
+mode clears `ISIG`, so the keystroke raises no signal at all and arrives as a
+key event that `key_for` maps to `Key::Quit`. A signal from anywhere else —
+`kill -INT`, a supervisor, a shell's `kill %1` — skips the terminal entirely,
+and a default disposition terminates without unwinding, so neither the
+`Restore` drop guard nor the panic hook runs. The terminal is left in raw mode
+with the alternate screen still up. Byte-for-byte the same on `main@fbc196d`,
+so it predates this branch; terminal *death* is covered and passes, and it is a
+signal specifically that goes unhandled, because the crate installs no signal
+handler anywhere. That is the M5.4 law failed by the one exit path M5's two
+mechanisms cannot cover. Reported, not fixed — another milestone's screen, and
+the same `libc::signal` machinery I declined for my own line.
+
+Two scripts I did not fix, because what they turn up is not a harness bug.
+`m5_terminal_restore.py`'s ctrl-c case fails, and running it down found that
+**ctrl-c does not leave the pre-flight menu**: the browser checks
+`KeyModifiers::CONTROL` first, the menu's `key_for` is handed a `KeyCode` with
+the modifiers already dropped, and raw mode means the terminal raises no SIGINT
+either. Driven on a pty at both screens, on this build and on `main@fbc196d`
+alike: `ctrl-c at the menu: STILL RUNNING after 5s`, `ctrl-c at the browser:
+left with exit 0`. `q` and Esc still work and M5_1-MENU.md specifies only those,
+so nobody is trapped — but a user who reaches for ctrl-c gets nothing. One line,
+and it belongs to M5.1's owner, not to this milestone. `m5_screens.py` dies with
+EIO for the same menu-in-front reason, one screen further on.
+
+### Also
+
+`tools/passport-measure.sh` takes `--min-size 1m`, and gives the scan's own
+stderr to `/dev/tty` so the line is on while the maintainer sits through an
+hour of platter — only the timings go to the log, because a repainted line
+logged verbatim is a page of carriage returns. Guarded: where `/dev/tty`
+cannot be opened the line stays off and everything goes to the log as before.
+An unguarded redirection there fails the whole scan, which I found by running
+the script under a pty with no controlling terminal.
+
+## 2026-08-23 — REVIEW-M5_2, the fix round
+
+CHANGES, two binding items, both in the evidence harnesses. The program was not
+asked to move and has not: the only `rust/src` change in this round is inside a
+`#[cfg(test)]` module, taking non-binding note 2.
+
+### Binding 1 — I broke `menu_mutants.py` and did not notice
+
+The `help-default-drifts` mutant anchored on the exact `--min-size` help and
+default text, which is text this milestone rewrote. The script is well built and
+refuses to pretend — it aborts rather than skipping — so it stopped at mutant 3
+of 8 and **five mutants never ran**, including both whole-program terminal-death
+mutants M5.1 was approved on. Exit 1 here, exit 0 on `main@fbc196d`.
+
+The retarget is one line: the `default:` line is unique in `cli.rs` on its own,
+and the `help:` line above it was never what the mutant needed. 8/8 caught now,
+and two of them are caught by M5.2's own new test as well — the guard got
+*stronger* while it was not being run, which is the part that should worry
+somebody.
+
+What actually went wrong is not the anchor. It is that I ran the suites I
+remembered — `tui-terminal-death.py`, `m5_1_menu_end_to_end.py`, and the M5
+browser suite I was already repairing — instead of the ones that touch what I
+changed. This branch edits the flag table more than anything since M5.1, and
+`menu_mutants.py` is the script that exists to guard the flag table. The rule I
+should have followed, and am writing down: **before claiming, run every script
+under `evidence/scripts/` that names a file you touched.** `git diff --name-only`
+against the base, grepped through the scripts, would have found it in a second.
+
+### Binding 2 — the detector that printed and then let it pass
+
+`NOT REACHED` was printed and never counted, so the two cases whose expected
+outcome is that nothing happens reported every check ok on a run that reached
+nothing. `drive` now hands the flag back and every one of its nine call sites
+turns it into a real check.
+
+Proved the way the reviewer proved it: suppress only the menu `Enter` and
+require the suite to fail. 26 differing where the unfixed one gave 17, nine
+`NOT REACHED` lines, and both named cases now show `reached the browser: False
+(DIFFERENT)`. Nine of the ten cases fail; the tenth is `-i without a terminal`,
+which never opens a pty at all, so nothing about the menu can reach it — that
+one is honest to stay green, and the evidence file says so.
+
+### The notes, taken
+
+1. **Two of the eight lines quoted from `m5_2-pulse.txt` were from an earlier
+   run.** True, and worse than it looks: I hand-copied timing-dependent output
+   into the claim instead of pasting the file, and then re-captured the file
+   without re-syncing the quote. Corrected from the file. Then I checked the
+   whole claim the same way, mechanically, and found fifteen more lines with no
+   evidence file behind them at all — all of them from ad-hoc terminal probes I
+   ran and never saved. Those probes are now `evidence/scripts/m5_2_signals.py`,
+   which is a gate rather than a print-out: it fails if any of the four
+   behaviours it records changes. Every fenced line in the claim now comes from
+   a file in `evidence/`.
+2. **`human_size` has one string the grammar cannot read back**, and the fuzz
+   shifted by 4 bits to stay under it. Taken. The sweep now runs the whole u64
+   range and asserts the boundary from both sides, and the boundary is *searched
+   for* rather than written down, so a change to the rounding moves it instead
+   of breaking the arithmetic that names it.
+3. **`m5_2_pulse.py` wants a quiet machine.** Taken, in the docstring, with the
+   failure it actually produces under load so a reader can recognise it.
+4. **The inertness gate could not fail at `-j1` on a busy machine.** Taken. The
+   noise floor drops the slowest tenth of each build's runs. Only the slow tail
+   goes: a run cannot be spuriously fast, so the fast end is real.
+5. **`passport-measure.sh`'s guard accepted as written.** Nothing to do.
+6. **Not this branch's**, and I am leaving them: `menu_mutants.py` hardcodes one
+   session's scratchpad path at lines 23-25, and `m5_screens.py` passed for the
+   reviewer at both tips while dying with EIO for me — machine-dependent, and
+   M5.1's either way.

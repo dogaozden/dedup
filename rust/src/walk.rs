@@ -125,6 +125,7 @@ pub fn walk(
     files_seen: &mut u64,
     bytes_seen: &mut u64,
     unreadable: &mut Vec<String>,
+    pulse: &crate::pulse::Pulse,
 ) -> Vec<FileRec> {
     let mut survivors = Vec::new();
     let mut directories = vec![root.to_path_buf()];
@@ -181,6 +182,7 @@ pub fn walk(
 
             *files_seen += 1;
             *bytes_seen += metadata.len();
+            pulse.walked(metadata.len());
             if metadata.len() < filters.min_size {
                 continue;
             }

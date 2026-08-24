@@ -1809,3 +1809,630 @@ The end-to-end pty suite is unchanged and still passes all seven cases
   throughout; only the prose had drifted.
 - The one-table section now says plainly that there are strictly two tables,
   `HELP_FLAGS` beside `FLAGS`, and why that is not a drift hole.
+
+## M5.2 — sizes for humans, and a live pulse — CLAIMED
+
+Branch `m5_2-ux`, off `main@fbc196d`. Binding spec is `M5_2-UX.md`; M5-TUI.md
+and M5_1-MENU.md apply unchanged, and nothing here touches the deletion path —
+the size grammar runs before any scan exists and the pulse only reads counters.
+
+Gate command, unchanged from the M5.1 and M6 claims, `{stage}` and all:
+
+```text
+$ python3 conformance/run.py --gate all \
+    --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+### Sizes for humans
+
+`rust/src/size.rs` holds the grammar, and `Flag::apply` is its only caller, so
+the command line, the pre-flight form and `--help` are three doors onto one
+function. Plain digits stay plain bytes — the conformance templates are written
+in them and none of this moves them. A suffix multiplies: `k`, `m`, `g`, `t`,
+case-insensitive, alone or dressed as `kb` or `kib`, at most one space in
+front, decimals floored to whole bytes, all multiples binary. `p` and `e` are
+read too, though nothing teaches them, so that the whole ladder the browser
+prints is a ladder the tool can be told.
+
+On the real binary, `evidence/m5_2-sizes.txt`:
+
+```text
+$ dedup-rs <tree> --list --min-size '3145728'              exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3m'                   exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3mb'                  exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3MiB'                 exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '2.9g'                 exit=0  No duplicates found.
+$ dedup-rs <tree> --list --min-size '512 k'                exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '0'                    exit=0  2 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '12qb'                 exit=2  dedup-rs: not a size: "12qb" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '-1'                   exit=2  dedup-rs: not a size: "-1" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '1.2.3'                exit=2  dedup-rs: not a size: "1.2.3" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '18446744073709551616' exit=2  dedup-rs: not a size: "18446744073709551616" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '1€'                   exit=2  dedup-rs: not a size: "1€" — plain bytes or 512k, 100mb, 1.5g
+```
+
+That last line is a bug I put in and found reading my own diff. The suffix was
+split with `split_at(1)` — one *byte* — so `--min-size 1€` panicked inside
+`core::str` instead of being refused. A flag value is whatever came off the
+command line, and a program that deletes files may refuse but may not fall
+over. It splits by character now, and
+`size::tests::nothing_a_person_can_type_makes_the_parser_fall_over` throws
+twenty thousand words built from digits, dots, signs, spaces, unit letters,
+NUL, Arabic-Indic and fullwidth digits, `€` and an emoji at it.
+
+The `--help` line, from `evidence/m5_2-help.txt`:
+
+```text
+      --min-size SIZE     ignore files smaller than this; plain digits are
+                          bytes, or say 512k, 100mb, 1.5g, 2TiB — all binary
+                          multiples
+                          (default: 10 MiB)
+```
+
+**The display round-trip law, and where it made me split the humaniser in
+two.** M5_2-UX.md asks for one humaniser, shared with the TUI's `human_size`,
+and for every displayed size to parse back to exactly the bytes it came from.
+One function cannot do both: `human_size` rounds, because the browser shows
+arbitrary file sizes and `1468006 B` is not a size a person reads. But a
+rounded size in the menu's min-size field is not a display bug, it is a scan
+nobody agreed to — the form hands its own words back to the parser, so a field
+showing `1.4 MiB` for 1500000 would run the scan at 1468006. That is this
+repository's display-path/record-path divergence, one screen earlier.
+
+So there are two, on one ladder, in one file, bonded by test:
+
+- `human_size` — rounded, for reading. Relabelled `KB`/`MB` → `KiB`/`MiB`,
+  which is what it was already dividing by, and its inherited `EB` branch —
+  which printed 1024× the truth past a pebibyte — replaced by an `EiB` rung.
+- `exact_size` — the largest unit that divides to one decimal place, plain
+  bytes when none does. `1500000` stays `1500000`.
+
+`exact_size` is what the help default and the menu prefill use, reached through
+`Flag::show`, which is `Flag::apply`'s inverse. `--min-size 10485760` on the
+command line reaches the form as `10 MiB` and leaves it as `10 MiB`. Tests:
+`size::tests::every_size_the_tool_would_show_as_a_setting_parses_back_to_itself`
+(the ladder, its neighbours, and a few thousand deterministic scatter values),
+`size::tests::one_ladder_is_read_and_written`,
+`cli::tests::what_the_form_shows_is_what_the_parser_reads`, and
+`cli::tests::the_defaults_the_help_text_prints_are_the_defaults_the_code_has`,
+which now asserts the help default *is* `exact_size(DEFAULT_MIN_SIZE)` and
+parses back to it.
+
+`--quiet` is a setting rather than a swallowed word, and says what it does.
+`--verify` keeps its no-op arm and its reason.
+
+### The live pulse
+
+Ported from the oracle's `Reporter` (dedup.py:2149-2200): its stage names, its
+two body shapes, its `\r\033[2K` repaint, its 24-cell bar. What is new is who
+paints. The oracle ticks from the scan thread; here a ticker thread reads the
+counters and the scan path only ever adds to one. `Pulse` is `Option<Live>` —
+off, every method is a branch that falls through, and there is no thread, no
+lock and no write.
+
+The rate is `Effort::bytes_read`, the same counter the honesty fields are made
+of, so the number on the line is bytes that really moved and cannot drift from
+what the report says. That is why `main` now holds `Effort` in an `Arc`: the
+ticker reads it while the readers write it.
+
+Counted so that no file is counted twice inside a stage. Tier B of the
+small-file stage is not counted, because those files were counted when their
+head was read; cache hits are, because a warm stage that showed nothing would
+look stuck rather than fast. Every stage's total is the very slice handed to
+it, so the count can only ever fall short of the total, never run past it — and
+it does fall short in one place: small-file candidates that the retention
+budget declines to hold are never read there, so a spilling small-file stage
+stops before the end of its bar and hands those files on to the head stage,
+where they are counted again under a total that includes them. Short is the
+honest direction; the bar is clamped at its total either way
+(`pulse::tests::the_bar_never_runs_past_its_own_end`).
+
+`finish` joins the ticker before wiping the line, so nothing can paint after
+it. `Drop` calls `finish` too, so a scan that panics still gives the line back.
+The line is cut a column short of the terminal width: a wrapped line leaves its
+first row behind at the next repaint.
+
+Eight cases through a real pty, `evidence/m5_2-pulse.txt`:
+
+```text
+$ python3 rust/evidence/scripts/m5_2_pulse.py rust/target/release/dedup-rs \
+    <scratch> <a build of main@fbc196d>
+a piped run says nothing at all                ok (stdout byte-identical to main, 5188 bytes; stderr empty on both; 5 counters equal at -j1)
+a terminal gets a line, and gets it back       ok (6 repaints, stages Reading small files+Comparing, bar Reading small files 2402→12002/12002; Comparing 0→0/14, cleared before the browser)
+the walk counts files out loud                 ok (2 repaints, counts 54472…54472 against 100000 files seen, never ahead and never backwards)
+--quiet means quiet on a terminal too          ok (nothing between the menu and the browser, 9 groups found)
+--list down a pipe, the line on the terminal   ok (37729 bytes of list down the pipe, 1 repaints on the terminal, neither in the other)
+the menu takes 100mb, 1m and 1k                ok (100mb→0 group(s), 1m→7 group(s), 1k→9 group(s))
+bytes on the command line, a size on screen    ok (shown as 2 MiB, and 2 MiB is what the scan used)
+a size that is not one is refused in the field ok (refused in the field, in words that say what to type instead)
+
+every case behaves
+exit=0
+```
+
+The handover case is the one that matters most: it asserts the bytes written
+between the menu giving the screen back and the browser taking it, and that the
+last of them is the clear. Nothing of the line survives into the browser's
+screen, and `--list`'s stdout and the line never appear in each other's stream.
+The bar is checked for movement, forwards, and never past its own end, per
+stage — a stage whose counter is never told anything paints a bar frozen at
+nought and looks exactly like one that has just started.
+
+### Inertness
+
+`evidence/m5_2-inertness.txt` — a 30,516-file tree with work in every stage,
+stderr piped, alternating builds so a warming disk drifts through both sides,
+15 runs each:
+
+```text
+== stderr piped, -j1 ==
+  opens                 51052          51052   same
+  bytes_read        647872512      647872512   same
+  files_seen            30516          30516   same
+  bytes_seen        640221184      640221184   same
+  seeks                 51260          51260   same
+  groups                  254            254   same
+  m5.2         4.601s median, 4.373–4.900 over the fastest 14 of 15
+  main         4.531s median, 4.362–4.952 over the fastest 14 of 15
+  difference   +1.6% (+0.070s), against a 0.590s trimmed spread within a build
+
+== stderr piped, -j8 ==
+  opens                 51052          51052   same
+  bytes_read        647872512      647872512   same
+  files_seen            30516          30516   same
+  bytes_seen        640221184      640221184   same
+  groups                  254            254   same
+  seeks                 51260          51260   not compared: nondeterministic above one reader
+  m5.2         1.114s median, 0.948–1.250 over the fastest 14 of 15
+  main         1.164s median, 0.984–1.260 over the fastest 14 of 15
+  difference   -4.3% (-0.050s), against a 0.302s trimmed spread within a build
+
+the pulse costs a piped run nothing that can be measured
+exit=0
+```
+
+`seeks` is diffed at one reader only, and that is a measured decision rather
+than a convenience: eight repeats of `main` against itself at the default `-j`
+gave 348 and 349 on the same tree, and this build gave the same two numbers.
+Concurrent readers interleave and count against each other, which is the honest
+answer for one set of heads and is what M6 scores; a comparison there would be
+measuring the scheduler.
+
+This machine has other agents on it, and the noise floor now drops the slowest
+tenth of each build's runs before taking the spread — REVIEW-M5_2's non-binding
+note 4, taken, because a floor set by the worst outlier is a gate that cannot
+fail. Only the slow tail goes: a run cannot be spuriously *fast*, so the fast
+end is real and the trim cannot hide a regression.
+
+The two halves disagree about the sign — `+1.6%` at one reader and `-4.3%` at
+eight, this build slower on one and faster on the other, on the same tree in
+the same minutes. A cost that appears and disappears with the job count is not
+a cost. The counters, which are the evidence that does not have a spread, are
+identical on both.
+
+(The absolute times are higher than the first capture because that one ran on a
+warm page cache and this one on a freshly written tree. Both halves of each
+comparison were run alternately against the same tree, which is what the
+comparison rests on.)
+
+### Also
+
+`tools/passport-measure.sh` takes `--min-size 1m`, and gives the scan's own
+stderr to the terminal so the line is on while the maintainer sits through an
+hour of platter — only the timings go into the log, because a repainted line
+logged verbatim is a page of carriage returns. Guarded: where `/dev/tty` cannot
+be opened the line stays off and everything goes to the log exactly as before.
+An unguarded redirection there does not merely lose the line, it fails the
+whole scan, which is how I found it — under a pty with no controlling terminal.
+That guard is a step past the letter of the spec, which asks only for the human
+forms; it is here because this script is the thing the maintainer runs on the
+drive that started M5.2.
+
+### Standards and the gate
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 182 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+$ cargo clippy --all-targets -- -D warnings
+Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m52/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.95s
+
+$ cargo fmt --check
+(no output: clean)
+
+FMT_EXIT=0
+```
+
+164 tests on `main@fbc196d`, 182 here — counted by building that commit and
+running its own suite, not by reading the last claim, which said 163 before
+`main` gained one. (181 at the first claim; the fix round added one, taking
+REVIEW-M5_2's non-binding note 2.)
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+exit=0
+```
+
+### A defect found on the way, in M5's evidence rather than in M5.2
+
+`evidence/scripts/m5_end_to_end.py` — the browser's end-to-end suite, the only
+proof in the repository that the browser deletes what it says it deletes — has
+not been testing the browser since M5.1 landed. It launches with `-i`, which
+now reaches the pre-flight menu, and then types browser keys at a form that
+ignores them. Every pty case timed out and was killed:
+
+```text
+18 check(s) differing
+```
+
+...on `main@fbc196d` exactly as on this branch, so the suite was reporting the
+same wreckage whatever it was pointed at. This is REVIEW-M5_1's own third
+finding — "a test that does not assert which screen it is on stops covering the
+screen it was written for the moment somebody adds another" — which was fixed
+in `tui-terminal-death.py` and not looked for anywhere else.
+
+Three harness bugs, no program change:
+
+- It now waits for the menu by name, presses Enter, waits for the browser's
+  alternate screen, and prints `NOT REACHED` where that never happens. A case
+  that is not on the browser must say so instead of printing numbers.
+- The two cases that run from inside the scanned tree passed a relative `HOME`,
+  so the run's own report, cache and Trash were created *inside the tree* and
+  counted among the survivors. Absolute now. This is the case that guards
+  REVIEW-M5's binding item 1, the keep rules ranking the scan's own name.
+- The too-small-terminal case can no longer start small: the menu refuses
+  below 54×16 before the browser is ever reached, and correctly so. The pty
+  starts roomy and is shrunk once the browser has it, which is a window being
+  resized — the only way a browser now reaches a screen too small to read.
+
+`evidence/m5_2-m5-suite-restored.txt`:
+
+```text
+=== 2. the repaired script, both builds, unmodified ===
+this branch    0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+main@fbc196d   0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+```
+
+Byte-identical output on both builds, so nothing in M5.2 moved the browser; and
+eighteen checks that were dead are alive, including the deletion laws, the
+keep-rule law, and the refusal on a screen nobody can read.
+
+`tui-terminal-death.py` (4/4) and `m5_1_menu_end_to_end.py` (7/7) were re-run
+unchanged and are green. Two more scripts are **not**, on this branch and on
+`main@fbc196d` alike, and I have left them alone because what they turn up is
+not a harness bug:
+
+- `m5_screens.py` dies with `OSError: [Errno 5]` partway through — the same
+  menu-in-front cause, one screen further on.
+- `m5_terminal_restore.py` reports 5 checks differing. Its `quitting with q`
+  case is clean — raw mode entered and released, alternate screen entered and
+  left — but its `interrupting with ctrl-c` case is not, and running that down
+  found a program gap rather than a script one.
+
+**Ctrl-C does not leave the pre-flight menu.** The browser answers it before
+anything else (`tui/mod.rs`'s `key_for` checks `KeyModifiers::CONTROL` first);
+the menu's `key_for(editing: bool, code: KeyCode)` is never given the
+modifiers, so Ctrl-C arrives as `Char('c')` and falls through to `Key::Ignored`.
+Raw mode means the terminal raises no SIGINT of its own, so nothing happens at
+all. Driven on a pty, at both screens, on both builds:
+
+```text
+== menu / keyboard ==
+   reached menu before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (False, False, False)
+   exit: IGNORED — still running after 5s, then killed
+   alternate screen entered 1, left 0
+   terminal came back as it was: False (after our SIGKILL, not after the interrupt — the interrupt did nothing)
+
+== browser / keyboard ==
+   reached browser before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: 0
+   alternate screen entered 2, left 2
+   terminal came back as it was: True
+```
+
+The `menu / keyboard` row says the terminal did not come back, and says why in
+the same breath: the keystroke did nothing, so the probe had to `SIGKILL` the
+run, and it is the `SIGKILL` those modes describe. The interrupt itself is not
+what wrecked anything — nothing at all happened.
+
+`q` and Esc still leave, so nobody is trapped, and M5_1-MENU.md specifies only
+those two — which is why I am reporting this rather than changing another
+milestone's keymap inside this one. It is one line (take the `KeyEvent` rather
+than its `KeyCode`, as the browser does) and it belongs to whoever owns M5.1.
+
+### What a reviewer should look at hardest
+
+- **Two humanisers where the spec says one.** Argued above and in LOG.md. The
+  bond between them is `size::tests::one_ladder_is_read_and_written`; if the
+  reviewer wants one function, the price is either a rounding menu field or a
+  browser that prints raw byte counts, and I would rather be told which.
+- **A wide group shows a still bar and a moving rate.** The compare stage
+  counts as each group settles, so a single group of forty files reports
+  nothing until it finishes. That is the oracle's behaviour in the same shape —
+  its `tick` inside `split_identical` moves `hashed_bytes` and not
+  `hashed_files` — and the rate is the sign of life there.
+- **Ctrl-C mid-scan leaves one line of text behind.** The pulse writes text and
+  never a mode change, so an interrupt while it is painting cannot wreck
+  anything — but `Drop` does not run on a default SIGINT, so the last line
+  painted stays where it is and the shell's next prompt lands after it. Driven
+  on a pty, interrupt sent while the line was provably up:
+
+  From `evidence/m5_2-signals.txt`, which the fix round turned from a
+  terminal probe I pasted from into a script that fails if any of this changes:
+
+  ```text
+== scan / keyboard ==
+   reached scan before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (True, True, True)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: -2
+   alternate screen entered 0, left 0
+   terminal came back as it was: True
+  ```
+
+  The oracle clears it, because Python hands it a `KeyboardInterrupt` to catch.
+  Matching that here means a signal handler, which means `libc::signal` and an
+  `unsafe` block, which REWRITE.md §7 keeps inside `sys.rs` — new machinery for
+  one stale line on a terminal that is otherwise exactly as it was found. I
+  left it, rather than decide that quietly.
+
+  Chasing that question one step further turned up something worse, and older.
+  A **signal from anywhere but the keyboard, while the browser holds the
+  terminal, wrecks it** — and that is M5's, not M5.2's. Ctrl-C typed at the
+  browser is safe, and safe for a reason worth stating: raw mode clears `ISIG`,
+  so no signal is raised at all and the keystroke arrives as a key event that
+  `key_for` maps to `Key::Quit`. But `kill -INT`, a supervisor, or a shell's
+  `kill %1` skips the terminal entirely, and a default signal disposition
+  terminates without unwinding — so neither the `Restore` drop guard nor the
+  panic hook runs. Driven on a pty, `(canonical, echo, ISIG)` sampled before,
+  during and after:
+
+  ```text
+ctrl-c at the keyboard, by screen:
+  scan/keyboard    exit -2     terminal intact  canonical mode, so it is a real SIGINT; nothing to restore
+  menu/keyboard    exit killed ignored          raw mode clears ISIG and the menu's key map drops the modifiers, so nothing happens — M5.1's, reported not fixed
+  browser/keyboard exit 0      terminal intact  raw mode clears ISIG; read as a key and mapped to Quit
+
+a signal from anywhere but the keyboard, at the browser:
+  browser/signal   exit -2     TERMINAL WRECKED no unwinding, so neither the drop guard nor the panic hook runs — M5's, reported not fixed
+  ```
+
+  Byte-identical on `main@fbc196d` for the three rows that exist there — the
+  fourth is the scan, which `main` has no progress line to be interrupted
+  through. That is what makes the wrecked terminal M5's and the ignored ctrl-c
+  M5.1's rather than this milestone's.
+
+  Byte-for-byte the same on `main@fbc196d`, so it predates this branch. The
+  terminal is left in raw mode with the alternate screen still on — the M5.4
+  law, failed, by the one exit path M5's own drop guard and panic hook cannot
+  cover. Terminal *death* is covered and passes (`tui-terminal-death.py`, 4/4);
+  it is a signal, specifically, that goes unhandled, because the crate installs
+  no signal handler anywhere. Reported and not fixed: it is another milestone's
+  screen, and the fix is the same `libc::signal` machinery I declined above.
+
+- **Nothing here is deletion-adjacent**, and the `ProvenGroups` guard, the
+  survivor guard and `verify_attested` are untouched. `--gate all` is 33/33 and
+  the piped stdout is byte-identical to `main`'s.
+
+### Fence conditions this run was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m52` on branch `m5_2-ux`, off
+`main@fbc196d`. Nothing under `/Volumes` was read or written. Every corpus was
+generated under this worktree's `rust/target/`, including the copy of
+`main@fbc196d` used for the differentials, which was extracted with `git
+archive` and built into a target directory of its own rather than by touching
+any other worktree. No `conformance/` file, no `rbench/`, `bench/` or `xbench/`
+file, and no other branch was touched.
+
+---
+
+## M5.2 — fix round after REVIEW-M5_2 — 2026-08-23 — RE-CLAIMED
+
+`REVIEW-M5_2.md` returned **CHANGES** on two binding items, both in the evidence
+harnesses. Neither touches the program, and the program has not moved: the only
+`rust/src` change in this round is inside a `#[cfg(test)]` module, taking
+non-binding note 2.
+
+### Binding 1 — `menu_mutants.py`, broken by this branch and missing from the claim
+
+The reviewer is right, and right about the part that stings: this branch edits
+the flag table more than anything since M5.1, `menu_mutants.py` is the script
+that exists to guard the flag table, and I ran the suites I remembered instead
+of the ones that touch what I changed. It aborted at mutant 3 of 8, so five
+mutants never ran — including both whole-program terminal-death mutants M5.1 was
+approved on.
+
+The retarget is the reviewer's, one line: the `default:` line is unique in
+`cli.rs` on its own, and the `help:` line above it was never what the mutant
+needed. `evidence/m5_2-menu-mutants.txt`:
+
+```text
+$ python3 rust/evidence/scripts/menu_mutants.py
+Baseline: the tree as written.
+  cli::tests and tui::menu::tests all pass
+
+mutant help-misses-a-flag           renders every flag but the first
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags, the_help_text_says_something_about_every_flag
+
+mutant help-invents-a-flag          hand-writes a line for a flag the parser does not accept
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags
+
+mutant help-default-drifts          says a default the code does not have
+  caught by the_defaults_the_help_text_prints_are_the_defaults_the_code_has, clearing_a_field_puts_the_default_back, the_min_size_field_shows_a_size_a_person_can_read_and_type
+
+mutant menu-writes-its-own-default  shows a default of its own instead of the table's
+  caught by clearing_a_field_puts_the_default_back, the_form_shows_the_root_every_field_and_every_default, the_min_size_field_shows_a_size_a_person_can_read_and_type
+
+mutant menu-drops-a-field           leaves a field out of the argument list it hands back
+  caught by a_switch_toggles_and_reaches_the_options, the_command_line_prefills_the_fields_it_names
+
+mutant menu-skips-validation        accepts whatever is typed and lets the scan find out
+  caught by a_bad_profile_is_refused_the_same_way, a_field_is_refused_in_the_field_with_the_parsers_own_words, a_refusal_is_shown_beside_the_field_it_belongs_to
+
+Baseline: the same tree, built and run through tui-terminal-death.py.
+  every scenario passed
+
+mutant one-of-three-answers         enters the blocking read when poll said nothing was typed
+  caught: hangup/menu      FAIL  the menu was still running 5s after the terminal died, 5.02 CPU-seconds in that window — SPINNING
+
+mutant drop-the-dead-terminal       lets ratatui print to a descriptor that is gone, panicking on the way out
+  caught: hangup/menu      FAIL  the menu left in 0.06s but by panicking (exit 101)
+
+every mutant was caught
+MENU_MUTANTS_EXIT=0
+```
+
+Eight named, eight caught, exit 0 — and `help-default-drifts` and
+`menu-writes-its-own-default` are now caught by M5.2's own
+`the_min_size_field_shows_a_size_a_person_can_read_and_type` as well. The guard
+got stronger while it was not being run, which is the part worth worrying about.
+
+**The process fix, so this does not recur:** before claiming, run every script
+under `evidence/scripts/` that names a file the branch touched. `git diff
+--name-only` against the base, grepped through the scripts, finds it in a
+second. Written into `LOG.md` as a rule rather than as an apology.
+
+### Binding 2 — `NOT REACHED` now counts
+
+`drive` hands the flag back, and all nine of its call sites turn it into
+`failures += not check("reached the browser", reached, True)`. Proved the way
+the reviewer proved it — suppress only the menu `Enter`, change nothing else,
+and require the suite to fail. From `evidence/m5_2-m5-suite-restored.txt`, which
+now carries all three states end to end:
+
+```text
+=== 1. the script as of main@fbc196d, against this branch's binary ===
+18 check(s) differing
+EXIT=1
+(every pty case timed out and was killed; none of them was on the browser)
+
+=== 2. the repaired script, both builds, unmodified ===
+this branch    0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+main@fbc196d   0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+
+=== 3. the same script with only the menu Enter suppressed ===
+26 check(s) differing
+EXIT=1   NOT REACHED lines: 9
+```
+
+and the two cases the review named, on that suppressed run:
+
+```text
+=== cancelling the confirmation removes nothing ===
+    expect: all three files survive and the Trash is empty
+    NOT REACHED: the browser screen never appeared
+    reached the browser: False (DIFFERENT)
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== quitting with copies marked removes nothing ===
+    expect: all three files survive
+    NOT REACHED: the browser screen never appeared
+    reached the browser: False (DIFFERENT)
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+```
+
+26 differing where the unrepaired script gave 17. Nine of the ten cases now
+report a differing check; the tenth is `-i without a terminal refuses instead of
+guessing`, the only case in the file that never opens a pty — a plain subprocess
+with no terminal, which suppressing the menu `Enter` cannot reach. It is honest
+for that one to stay green, and the evidence file says so in as many words.
+
+### The non-binding notes, answered
+
+**1. Stale quote — taken, and then taken further.** Two of the eight lines the
+claim quoted from `evidence/m5_2-pulse.txt` were from a run before the last
+re-capture. Corrected from the file. The cause is worth naming: I hand-copied
+timing-dependent output into the claim instead of pasting the file, then
+re-captured the file and never re-synced the quote.
+
+So I checked the rest of the claim the same way the reviewer would have to —
+mechanically, every fenced line against every file in `evidence/` — and found
+fifteen more lines with no evidence file behind them at all. All of them were
+from ad-hoc terminal probes I ran, pasted from the screen, and never saved.
+Those probes are now `evidence/scripts/m5_2_signals.py`, and it is a gate rather
+than a print-out: it names the four behaviours it records and exits 1 if any of
+them changes. Every fenced line in this claim now comes from a file under
+`evidence/`.
+
+**2. The `16.0 EiB` boundary — taken.** The fuzz shifted its values by 4 bits to
+stay under the one string `human_size` can produce that the grammar refuses. It
+now sweeps the whole u64 range and asserts the boundary from both sides, in
+`what_the_browser_shows_is_at_least_readable_back` and a new
+`the_one_size_the_browser_can_show_that_the_grammar_refuses`. The boundary is
+*searched for* by bisection rather than written down, so a change to the
+rounding moves it instead of breaking the arithmetic that names it — and the
+search standing on `human_size` being non-decreasing is itself checked at the
+boundary.
+
+**3. `m5_2_pulse.py` wants a quiet machine — taken.** Said in the docstring,
+with the failure it actually produces under load (`exit -9 … [the run did not
+exit; killed]`) so a reader can recognise it rather than chase it.
+
+**4. The inertness gate could not fail at `-j1` — taken.** The noise floor now
+drops the slowest tenth of each build's runs before taking the spread. Only the
+slow tail goes, and deliberately: a run cannot be spuriously *fast*, so the fast
+end is real and the trim cannot hide a genuine regression.
+
+**5. `passport-measure.sh`'s `/dev/tty` guard — accepted as written.** Nothing
+to do; recorded here so the audit is not lost.
+
+**6. Not this branch's — left alone, as instructed.** `menu_mutants.py`
+hardcodes one session's scratchpad path at lines 23-25. `m5_screens.py` passed
+for the reviewer at both tips and dies with `EIO` for me, so it is
+machine-dependent; either way it is M5.1's.

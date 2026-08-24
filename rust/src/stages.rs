@@ -18,6 +18,7 @@ use crate::consts::{
 };
 use crate::effort::Effort;
 use crate::ordered::Ordered;
+use crate::pulse::Pulse;
 use crate::walk::FileRec;
 
 pub type Digest = [u8; 32];
@@ -29,6 +30,10 @@ pub struct Reader<'a> {
     pub effort: &'a Effort,
     pub pool: &'a ThreadPool,
     pub jobs: usize,
+    /// Told one file at a time, from inside the pool, because that is where a
+    /// stage's only sign of movement is: `read_batched` hands nothing back
+    /// until every batch is done.
+    pub pulse: &'a Pulse,
 }
 
 /// SHA-256 — every CPU this runs on has an instruction for it, which makes it
@@ -238,6 +243,9 @@ pub fn hash_stage(
                 match cache.get(&records[index], field) {
                     Some(digest) => {
                         buckets.push((records[index].size, digest), index);
+                        // Remembered is finished too: a warm stage that showed
+                        // no progress would look stuck rather than fast.
+                        reader.pulse.file();
                     }
                     None => to_read.push(index),
                 }
@@ -248,7 +256,9 @@ pub fn hash_stage(
     let probed = {
         let view: &[FileRec] = records;
         read_batched(reader.pool, &to_read, reader.jobs, |&index| {
-            probe_one(reader.root, &view[index], probe, reader.effort)
+            let probed = probe_one(reader.root, &view[index], probe, reader.effort);
+            reader.pulse.file();
+            probed
         })
     };
 
@@ -351,6 +361,7 @@ pub fn small_file_stage(
                         .into_iter()
                         .filter(|run| run.len() > 1),
                 );
+                reader.pulse.files(group.len() as u64);
                 continue;
             }
         }
@@ -374,7 +385,9 @@ pub fn small_file_stage(
         let piece = &tiny[cursor..(cursor + RETAIN_CHECK_SPAN).min(tiny.len())];
         cursor += RETAIN_CHECK_SPAN;
         let read = read_batched(reader.pool, piece, reader.jobs, |&index| {
-            read_whole(reader.root, &records[index], reader.effort)
+            let whole = read_whole(reader.root, &records[index], reader.effort);
+            reader.pulse.file();
+            whole
         });
         for (&index, content) in piece.iter().zip(read) {
             let Some(content) = content else {
@@ -410,8 +423,12 @@ pub fn small_file_stage(
         }
         let piece = &headed[cursor..(cursor + RETAIN_CHECK_SPAN).min(headed.len())];
         cursor += RETAIN_CHECK_SPAN;
+        // Tier B reads the same files again; only the first pass counts, or a
+        // stage would report twice the files it was given.
         let read = read_batched(reader.pool, piece, reader.jobs, |&index| {
-            read_head(reader.root, &records[index], reader.effort)
+            let head = read_head(reader.root, &records[index], reader.effort);
+            reader.pulse.file();
+            head
         });
         for (&index, head) in piece.iter().zip(read) {
             let Some(head) = head else {

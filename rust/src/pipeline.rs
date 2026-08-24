@@ -18,6 +18,7 @@ use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
 use crate::ordered::Ordered;
+use crate::pulse::{self, Pulse};
 use crate::stages::{has_tail, hash_stage, release, small_file_stage, Probe, Reader};
 use crate::walk::{basename, candidates, name_order, walk, FileRec};
 
@@ -97,16 +98,18 @@ fn ends_bytes(profile: Profile, size: u64) -> usize {
 /// the moment stage 3 exists, which is why the harness's own oracle driver
 /// carries the same switch. Nothing but `--gate m1` ever asks for it, and no
 /// milestone here is claimed with it — see LOG.md.
-pub fn size_stage(root: &Path, filters: Filters) -> Scan {
+pub fn size_stage(root: &Path, filters: Filters, pulse: &Pulse) -> Scan {
     let mut files_seen = 0;
     let mut bytes_seen = 0;
     let mut unreadable = Vec::new();
+    pulse.stage(pulse::SCANNING, 0);
     let entries = walk(
         root,
         filters,
         &mut files_seen,
         &mut bytes_seen,
         &mut unreadable,
+        pulse,
     );
     let records = candidates(root, entries);
     let mut buckets: Ordered<u64, usize> = Ordered::new();
@@ -151,6 +154,7 @@ pub fn find_duplicates(
     effort: &Effort,
     mut cache: Option<&mut ScanCache>,
     wanted: Wanted,
+    pulse: &Pulse,
 ) -> Scan {
     if let Some(cache) = cache.as_deref_mut() {
         cache.open_path(root);
@@ -158,12 +162,15 @@ pub fn find_duplicates(
     let mut files_seen = 0;
     let mut bytes_seen = 0;
     let mut unreadable = Vec::new();
+    // The stage names are the oracle's, and so is the order they arrive in.
+    pulse.stage(pulse::SCANNING, 0);
     let entries = walk(
         root,
         filters,
         &mut files_seen,
         &mut bytes_seen,
         &mut unreadable,
+        pulse,
     );
 
     // stage 2 — group by size, collapse hardlinks, discard unique sizes
@@ -200,6 +207,7 @@ pub fn find_duplicates(
         effort,
         pool: &random_pool,
         jobs: random_jobs,
+        pulse,
     };
     let mut unreadable = std::mem::take(&mut scan.unreadable);
     let mut settled: Vec<Vec<usize>> = Vec::new();
@@ -216,6 +224,7 @@ pub fn find_duplicates(
 
     let mut remembered: Vec<Vec<usize>> = Vec::new();
     if !small.is_empty() {
+        pulse.stage(pulse::SMALL, small.len() as u64);
         let (proven, attested, fallback) = small_file_stage(
             &reader,
             &records,
@@ -250,6 +259,7 @@ pub fn find_duplicates(
         Profile::Flash => Probe::Ends { keep },
         Profile::Spinning => Probe::Head { keep },
     };
+    pulse.stage(pulse::HEAD, staged.len() as u64);
     let end_buckets = hash_stage(
         &reader,
         &mut records,
@@ -284,6 +294,7 @@ pub fn find_duplicates(
                 .map(|&index| (records[index].size.min(DEEP_HEAD as u64) as usize) - HEAD_BYTES)
                 .sum::<usize>()
                 <= RETAIN_BUDGET;
+        pulse.stage(pulse::DEEP_HEAD, crowded.len() as u64);
         let rest_buckets = hash_stage(
             &reader,
             &mut records,
@@ -319,6 +330,7 @@ pub fn find_duplicates(
         pending.retain(|bucket| records[bucket[0]].size <= SAMPLE_SPAN);
         let mut survivors: Vec<usize> = big.into_iter().flatten().collect();
         survivors.sort_by_key(|&index| records[index].layout());
+        pulse.stage(pulse::SAMPLE, survivors.len() as u64);
         let sample_buckets = hash_stage(
             &reader,
             &mut records,
@@ -358,6 +370,10 @@ pub fn find_duplicates(
         learn: cache.is_some(),
     };
     let sequential_pool = pool_of(sequential_jobs);
+    pulse.stage(
+        pulse::COMPARE,
+        pending.iter().map(|bucket| bucket.len() as u64).sum(),
+    );
     let compared = compare_stage(
         &context,
         &records,
@@ -365,6 +381,7 @@ pub fn find_duplicates(
         sequential_jobs,
         &sequential_pool,
         &mut unreadable,
+        pulse,
     );
     settled.extend(compared.matched);
     // The bytes went past anyway, so a group read here is also a group learned.
@@ -476,6 +493,7 @@ mod tests {
                 &effort,
                 None,
                 wanted,
+                &Pulse::off(),
             )
         }
     }

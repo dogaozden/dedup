@@ -1,0 +1,26 @@
+$ python3 rust/evidence/scripts/m5_2_inertness.py rust/target/release/dedup-rs \
+    <a build of main@fbc196d> <scratch> 15
+== stderr piped, -j1 ==
+  opens                 51052          51052   same
+  bytes_read        647872512      647872512   same
+  files_seen            30516          30516   same
+  bytes_seen        640221184      640221184   same
+  seeks                 51260          51260   same
+  groups                  254            254   same
+  m5.2         4.601s median, 4.373–4.900 over the fastest 14 of 15
+  main         4.531s median, 4.362–4.952 over the fastest 14 of 15
+  difference   +1.6% (+0.070s), against a 0.590s trimmed spread within a build
+
+== stderr piped, -j8 ==
+  opens                 51052          51052   same
+  bytes_read        647872512      647872512   same
+  files_seen            30516          30516   same
+  bytes_seen        640221184      640221184   same
+  groups                  254            254   same
+  seeks                 51260          51260   not compared: nondeterministic above one reader
+  m5.2         1.114s median, 0.948–1.250 over the fastest 14 of 15
+  main         1.164s median, 0.984–1.260 over the fastest 14 of 15
+  difference   -4.3% (-0.050s), against a 0.302s trimmed spread within a build
+
+the pulse costs a piped run nothing that can be measured
+exit=0

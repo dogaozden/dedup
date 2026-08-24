@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use crate::consts::DEFAULT_MIN_SIZE;
 use crate::device::Wanted;
+use crate::size::{exact_size, parse_size};
 
 #[derive(Default, Clone, Debug)]
 pub struct Options {
@@ -33,6 +34,8 @@ pub struct Options {
     pub yes: bool,
     pub hard: bool,
     pub no_cache: bool,
+    /// No progress line, whatever stderr turns out to be attached to.
+    pub quiet: bool,
     /// "size" stops after the walk and size grouping. Only the M1 gate asks
     /// for it; every other gate leaves it empty.
     pub stage: String,
@@ -92,11 +95,7 @@ impl Flag {
         };
         match self.long {
             "--report-json" => options.report_json = Some(PathBuf::from(need()?)),
-            "--min-size" => {
-                options.min_size = need()?
-                    .parse()
-                    .map_err(|_| "--min-size takes a whole number of bytes".to_string())?
-            }
+            "--min-size" => options.min_size = parse_size(need()?)?,
             "--jobs" => {
                 let jobs: usize = need()?
                     .parse()
@@ -130,13 +129,30 @@ impl Flag {
             "--yes" => options.yes = true,
             "--hard" => options.hard = true,
             "--no-cache" => options.no_cache = true,
+            "--quiet" => options.quiet = true,
             // Accepted so a command line written for the Python tool still
-            // runs. This build has nothing to be quiet about and verifies
-            // every group it deletes from regardless.
-            "--quiet" | "--verify" => {}
+            // runs. This build verifies every group it deletes from
+            // regardless, so there is nothing for the flag to turn on.
+            "--verify" => {}
             other => return Err(format!("{other} is in the flag table and nowhere else")),
         }
         Ok(())
+    }
+
+    /// A value for this flag, in the words the menu prefills its field with.
+    ///
+    /// `apply`'s inverse, and bound to it by test: what comes out here has to
+    /// go back in there as the same setting. A size is the one value worth
+    /// rewriting — 10485760 typed on the command line comes back as `10 MiB`,
+    /// which is what the form then hands the parser, so the row a person reads
+    /// and the row the scan runs on are the same row. Anything the grammar
+    /// cannot read is echoed untouched; the parser has already accepted every
+    /// value that reaches here, so that is a fallback rather than a path.
+    pub fn show(&self, value: &str) -> String {
+        match self.long {
+            "--min-size" => parse_size(value).map_or_else(|_| value.to_string(), exact_size),
+            _ => value.to_string(),
+        }
     }
 }
 
@@ -146,9 +162,10 @@ pub const FLAGS: &[Flag] = &[
     Flag {
         long: "--min-size",
         short: None,
-        takes: Takes::Value("BYTES"),
-        help: "ignore files smaller than this",
-        default: "10485760 bytes (10 MiB)",
+        takes: Takes::Value("SIZE"),
+        help: "ignore files smaller than this; plain digits are bytes, or say \
+               512k, 100mb, 1.5g, 2TiB — all binary multiples",
+        default: "10 MiB",
     },
     Flag {
         long: "--ext",
@@ -246,8 +263,8 @@ pub const FLAGS: &[Flag] = &[
         long: "--quiet",
         short: Some("-q"),
         takes: Takes::Nothing,
-        help: "accepted for the Python tool's sake; ignored here",
-        default: "ignored either way",
+        help: "no progress line while the scan runs",
+        default: "a progress line, on a terminal",
     },
     Flag {
         long: "--verify",
@@ -441,7 +458,7 @@ mod tests {
                 let mut words = vec!["/tmp", name];
                 match flag.takes {
                     Takes::Nothing => {}
-                    Takes::Value("BYTES") | Takes::Value("N") => words.push("1"),
+                    Takes::Value("SIZE") | Takes::Value("N") => words.push("1"),
                     Takes::Value("NAME") if flag.long == "--profile" => words.push("flash"),
                     Takes::Value("NAME") => words.push("full"),
                     Takes::Value(_) => words.push("x"),
@@ -462,13 +479,18 @@ mod tests {
         // somebody changed in the code and not here.
         let bare = parse(&["/tmp"]).expect("a root is enough");
         let said = |long: &str| flag_named(long).expect("in the table").default;
-        assert!(said("--min-size").starts_with(&bare.min_size.to_string()));
+        // Shown humanly, and shown as the very words that would set it — a
+        // default nobody could type back in is a default that has drifted.
+        assert_eq!(said("--min-size"), "10 MiB");
+        assert_eq!(said("--min-size"), exact_size(bare.min_size));
+        assert_eq!(parse_size(said("--min-size")), Ok(bare.min_size));
         assert_eq!(bare.min_size, DEFAULT_MIN_SIZE);
         assert_eq!(said("--profile"), "auto");
         assert_eq!(bare.profile, Wanted::Auto);
         assert_eq!(bare.jobs, None);
         assert!(bare.ext.is_empty() && bare.skip_ext.is_empty() && bare.excludes.is_empty());
         assert!(!bare.list && !bare.interactive && !bare.yes && !bare.hard && !bare.no_cache);
+        assert!(!bare.quiet);
         assert_eq!(bare.auto, None);
         assert_eq!(bare.stage, "");
         assert_eq!(bare.report_json, None);
@@ -533,8 +555,8 @@ mod tests {
     #[test]
     fn a_value_the_parser_refuses_says_why() {
         assert_eq!(
-            parse(&["/tmp", "--min-size", "big"]).unwrap_err(),
-            "--min-size takes a whole number of bytes"
+            parse(&["/tmp", "--min-size", "12qb"]).unwrap_err(),
+            "not a size: \"12qb\" — plain bytes or 512k, 100mb, 1.5g"
         );
         assert_eq!(
             parse(&["/tmp", "--profile", "rotational"]).unwrap_err(),
@@ -552,6 +574,53 @@ mod tests {
             parse(&["/tmp", "--min-size"]).unwrap_err(),
             "--min-size needs a value"
         );
+    }
+
+    #[test]
+    fn the_command_line_takes_a_size_the_way_a_person_writes_one() {
+        // The grammar reached through the table, which is the only way the
+        // menu and --help can reach it either.
+        let bytes = |word: &str| parse(&["/tmp", "--min-size", word]).map(|o| o.min_size);
+        assert_eq!(bytes("10485760"), Ok(10 * 1024 * 1024));
+        assert_eq!(bytes("100mb"), Ok(100 * 1024 * 1024));
+        assert_eq!(bytes("512k"), Ok(512 * 1024));
+        assert_eq!(bytes("1.5g"), Ok(1024 * 1024 * 1024 + 1024 * 1024 * 512));
+        assert_eq!(bytes("2TiB"), Ok(2 * 1024_u64.pow(4)));
+        assert_eq!(bytes("10 MiB"), Ok(10 * 1024 * 1024));
+        assert_eq!(bytes("0"), Ok(0));
+    }
+
+    #[test]
+    fn what_the_form_shows_is_what_the_parser_reads() {
+        // The display round-trip law, at the seam where it can break: the menu
+        // prefills a field with `show` and hands `apply` back what it showed.
+        // A rounded `show` would quietly change the scan somebody agreed to.
+        let min_size = flag_named("--min-size").expect("in the table");
+        for word in [
+            "0", "1", "1023", "1024", "10485760", "10485761", "1500000", "100mb", "1.5g", "2TiB",
+            "10 MiB",
+        ] {
+            let (mut typed, mut shown) = (Options::new(), Options::new());
+            min_size.apply(&mut typed, Some(word)).expect("a size");
+            let echo = min_size.show(word);
+            min_size.apply(&mut shown, Some(&echo)).expect("a size");
+            assert_eq!(
+                typed.min_size, shown.min_size,
+                "{word:?} was shown as {echo:?}"
+            );
+        }
+        // Every other flag is echoed exactly, so no field can be rewritten by
+        // a rule nobody wrote for it.
+        for flag in FLAGS.iter().filter(|flag| flag.long != "--min-size") {
+            assert_eq!(flag.show("whatever"), "whatever", "{}", flag.long);
+        }
+    }
+
+    #[test]
+    fn quiet_is_a_setting_now_and_verify_is_still_not() {
+        assert!(parse(&["/tmp", "--quiet"]).unwrap().quiet);
+        assert!(parse(&["/tmp", "-q"]).unwrap().quiet);
+        assert!(!parse(&["/tmp", "--verify"]).unwrap().quiet);
     }
 
     #[test]

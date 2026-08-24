@@ -36,12 +36,25 @@ if [[ "$NFILES" -lt 100 ]]; then
   log "(Fine for a compare-heavy corpus of few large files; otherwise pick a bigger subtree.)"
 fi
 
+# The scan's own stderr goes to the terminal rather than into the log, so the
+# live progress line is on while you sit through an hour of platter; only the
+# timings are captured, because a repainted line logged verbatim is a page of
+# carriage returns. Where there is no controlling terminal to write to, the
+# line stays off and everything goes to the log as it always did — a missing
+# /dev/tty must not cost you the measurement.
+LIVE=/dev/stderr
+( : >/dev/tty ) 2>/dev/null && LIVE=/dev/tty
+
+timed() {  # timed <flags...>
+  ( time "$BIN" "$TREE" "$@" >/dev/null 2>"$LIVE" ) 2>&1 | tee -a "$OUT"
+}
+
 run_scan() {  # run_scan <label> <extra flags...>
   local label="$1"; shift
   log ""
   log "== $label =="
   log "$ dedup <tree> --list --no-cache $*"
-  ( time "$BIN" "$TREE" --list --no-cache "$@" >/dev/null ) 2>&1 | tee -a "$OUT"
+  timed --list --no-cache "$@"
 }
 
 # IMPORTANT: between the two profile runs, EJECT and re-attach the drive if
@@ -49,14 +62,14 @@ run_scan() {  # run_scan <label> <extra flags...>
 # or SKIP_SPIN=1 to do one half at a time. Same-session back-to-back runs
 # share the page cache — still informative, but say so when reading results.
 
-[[ "${SKIP_FLASH:-0}" = 1 ]] || run_scan "flash profile (current default behavior)" --profile flash --min-size 1048576
-[[ "${SKIP_SPIN:-0}"  = 1 ]] || run_scan "spinning profile" --profile spinning --min-size 1048576
+[[ "${SKIP_FLASH:-0}" = 1 ]] || run_scan "flash profile (current default behavior)" --profile flash --min-size 1m
+[[ "${SKIP_SPIN:-0}"  = 1 ]] || run_scan "spinning profile" --profile spinning --min-size 1m
 
 log ""
 log "== warm re-scan (cache on) =="
 log "$ dedup <tree> --list   (twice; second one shows the cache)"
-( time "$BIN" "$TREE" --list --min-size 1048576 >/dev/null ) 2>&1 | tee -a "$OUT"
-( time "$BIN" "$TREE" --list --min-size 1048576 >/dev/null ) 2>&1 | tee -a "$OUT"
+timed --list --min-size 1m
+timed --list --min-size 1m
 
 log ""
 log "== done — results in $OUT =="

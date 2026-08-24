@@ -699,6 +699,7 @@ mod selection {
                 effort,
                 None,
                 wanted,
+                &crate::pulse::Pulse::off(),
             )
         }
 
