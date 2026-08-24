@@ -1349,7 +1349,7 @@ mod tests {
         // below that the chunk is what flash prefers.
         assert_eq!(compare_chunk(flash, 64, true), CHUNK);
         assert_eq!(compare_chunk(flash, 512, true), COMPARE_BUDGET / 512);
-        assert!(COMPARE_BUDGET / 512 < CHUNK, "512 members must shrink it");
+        const { assert!(COMPARE_BUDGET / 512 < CHUNK, "512 members must shrink it") };
         assert_eq!(compare_chunk(flash, 100_000, true), MIN_CHUNK);
     }
 
