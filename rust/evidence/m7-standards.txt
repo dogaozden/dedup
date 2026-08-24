@@ -1,0 +1,43 @@
+=== main@cc654c4, for the before-count and the clippy verdict that predates this branch ===
+$ cargo test
+
+test result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+
+$ cargo clippy --all-targets -- -D warnings
+error: this assertion has a constant value
+   --> src/compare.rs:898:9
+    |
+898 |         assert!(COMPARE_BUDGET / 512 < CHUNK, "512 members must shrink it");
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider moving this into a const block: `const { assert!(..) }`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.92.0/index.html#assertions_on_constants
+    = note: `-D clippy::assertions-on-constants` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::assertions_on_constants)]`
+
+error: could not compile `dedup-rs` (bin "dedup-rs" test) due to 1 previous error
+   exit 101
+
+=== this branch ===
+$ cargo test
+
+test result: ok. 224 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m7/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.94s
+   exit 0
+
+$ cargo fmt --check
+(no output: clean)
+
+=== the binary the evidence was measured with is the committed source ===
+    Finished `release` profile [optimized] target(s) in 0.09s
+$ shasum -a 256 target/release/dedup-rs
+d61455257d5e735bbed1b947e439760293eb1af9750900791c938146eef11382  target/release/dedup-rs
+$ touch src/compare.rs src/consts.rs && cargo build --release
+    Finished `release` profile [optimized] target(s) in 12.22s
+$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
+d61455257d5e735bbed1b947e439760293eb1af9750900791c938146eef11382  target/release/dedup-rs

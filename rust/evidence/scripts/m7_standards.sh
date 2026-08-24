@@ -15,7 +15,7 @@
 # Usage, from rust/:  evidence/scripts/m7_standards.sh <base-checkout>/rust \
 #                       > evidence/m7-standards.txt
 set -u
-BASE="${1:?the base checkout's rust/ directory}"
+BASE="${1:?usage: m7_standards.sh <base-checkout>/rust}"
 HERE="$PWD"
 
 echo "=== main@cc654c4, for the before-count and the clippy verdict that predates this branch ==="
@@ -41,3 +41,16 @@ echo "   exit ${PIPESTATUS[0]}"
 echo
 echo '$ cargo fmt --check'
 cargo fmt --check && echo '(no output: clean)'
+
+# The release binary every measurement in the claim was taken with, proved
+# current rather than assumed: a stale one burned the maintainer once already.
+echo
+echo "=== the binary the evidence was measured with is the committed source ==="
+cargo build --release 2>&1 | tail -1
+echo '$ shasum -a 256 target/release/dedup-rs'
+shasum -a 256 target/release/dedup-rs
+echo '$ touch src/compare.rs src/consts.rs && cargo build --release'
+touch src/compare.rs src/consts.rs
+cargo build --release 2>&1 | tail -1
+echo '$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)'
+shasum -a 256 target/release/dedup-rs

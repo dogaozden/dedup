@@ -2370,3 +2370,64 @@ one is honest to stay green, and the evidence file says so.
    session's scratchpad path at lines 23-25, and `m5_screens.py` passed for the
    reviewer at both tips while dying with EIO for me — machine-dependent, and
    M5.1's either way.
+
+## 2026-08-24 — M7, the pivot-window compare
+
+M7-PIVOT.md, from a wall the maintainer hit on real spinning media: stage 5 at
+~44 MB/s against a ~110–130 MB/s ceiling, because lockstep round-robins the
+head between every member of a group. Under `--profile spinning` the pivot is
+now read a window at a time and held, and every other member streams past it.
+
+### The thing I nearly got wrong
+
+The first version had one size where it needed two. I read a window in runs as
+long as the comparison chunk, which is the obvious thing, and the differential
+caught it: `cohort-boundary` — four content classes in files shorter than one
+chunk — went from `main`'s 49.8 MB to 90.4 MB. Every class needs a pass of its
+own, and a run as long as the file gives the next pass nothing to skip: a
+member that parted at the last kilobyte was filed under offset zero and read
+from zero again.
+
+Runs inside a window carry straight on from each other, so their length costs
+no head movement at all. Only the window buys movements. Once they are two
+different constants — `PIVOT_WINDOW` for what a movement buys, `PIVOT_RUN` for
+where a parting is placed — the same tree reads 35.4 MB, which is *below*
+`main`. That is what `pivot_run_size.py` exists for: it builds a
+`PIVOT_RUN = SLOW_CHUNK` variant and measures all three, so the constant is a
+measurement rather than an argument. 78.5 MiB, 47.5 MiB, 33.5 MiB.
+
+The lesson worth keeping: the differential is not decoration. I would have
+claimed a bytes regression as a win if I had only run the shapes the feature is
+good at, and my own seek corpus started out as five shapes that were all good
+at it. `classes-in-one-run` exists in `pivot_seeks.py` because of this, and it
+is the row that reports 1.0x.
+
+### Growth of four, not two
+
+Windows doubling took four steps to reach the ceiling, and a 256 MiB file cost
+five windows. Growing by four costs three, and the waste on a class that falls
+apart is still bounded — a window is at most N times the bytes the class had
+already agreed on, so the growth factor IS the price cap on being wrong.
+Measured over `pivot_seeks.py`'s corpora the change is worth 1.5-2.7x fewer
+seeks at two against 1.0-5.8x at four.
+
+### What I did not do
+
+`verify_attested` still calls the capped cohort comparison. The spec says
+"`verify_attested` untouched" and it is on the deletion path, so I read that
+literally rather than helpfully. It leaves two spinning splitters in the file;
+`bench.partitions` now runs lockstep, the capped sweep and the pivot sweep over
+every shape and requires all three to agree, so the older one earns its place
+as a second opinion. If the maintainer wants it moved it is one call site.
+
+### Two defects reported and not fixed
+
+A wide group of all-distinct same-size files is quadratic under both spinning
+comparisons — the pivot loop strips one class per pass and there is no
+`PARTITION_FANOUT` equivalent on this path. Not new, improved here, still
+there. And `cargo clippy --all-targets -- -D warnings` was already red on
+`main@cc654c4` (clippy 1.92's `assertions_on_constants` against M6's chunk-floor
+test, whose operands became const-foldable at the round-2 merge). The maintainer
+fixed that on main and I cherry-picked it; the side-by-side capture in
+`m7-standards.txt` stays, because a claim that says "clippy is green" should be
+able to show what it was before.

@@ -2436,3 +2436,604 @@ to do; recorded here so the audit is not lost.
 hardcodes one session's scratchpad path at lines 23-25. `m5_screens.py` passed
 for the reviewer at both tips and dies with `EIO` for me, so it is
 machine-dependent; either way it is M5.1's.
+
+---
+
+## M7 — the pivot-window compare — CLAIMED
+
+Branch `m7-pivot`, off `main@cc654c4`. Binding spec `M7-PIVOT.md`; the
+maintainer review is BLOCKING (`rust/REVIEW-M7.md`).
+
+Under `--profile spinning` ONLY, stage 5 stops interleaving. Per group the
+pivot is read a window at a time and held; every other member then reads the
+same range in one run of its own and is compared, in memory, against the bytes
+in hand. A member that parts from the pivot leaves its class and is filed under
+the run it parted in; members filed under the same run are compared among
+themselves from the start of that run, the first of them becoming the next
+pivot, recursively, until every class is settled.
+
+The flash profile is untouched — same parallel lockstep, same waves, same
+descriptors — and the gate below is run with no profile flag at all, which is
+the proof of that. `verify_attested` is untouched too: the deletion path keeps
+the capped cohort comparison it was reviewed on at M6. Nothing outside
+`rust/src/compare.rs` and `rust/src/consts.rs` changed.
+
+**HDD wall-clock unvalidated.** No rotational drive is available to an agent —
+the only one on this machine is fenced — so no speed claim is made here. What is
+claimed is correctness, which is proved against the oracle, and the access
+pattern, which is counted. A user-supervised run on a real spinning disk is
+still owed. The wall this was commissioned from is the maintainer's, measured on
+real spinning media (`measurements/passport/`, and a live scan): stage 5 moving
+at ~44 MB/s against a ~110–130 MB/s sequential ceiling. That figure is cited,
+not reproduced; nothing here measured it.
+
+### Why the answer is the same answer
+
+A *run* is one read the pivot asked for. Every member is asked for the same
+lengths at the same offsets, so the runs are the same runs for everybody, and
+comparing a run against the pivot's is the same `memcmp` on the same boundaries
+lockstep does.
+
+- A member kept in the pivot's class matched every run to the end of the
+  pivot's file, so the class the sweep settles is exactly the members equal to
+  the pivot.
+- Two members that parted in DIFFERENT runs cannot be equal, and are never read
+  again to find out: the one that parted in the earlier run differs from the
+  pivot somewhere inside it, and the one that parted later matched the pivot
+  through the whole of that run.
+- Two members that parted in the SAME run agree with the pivot — and so with
+  each other — everywhere before it, and are compared among themselves from
+  exactly there. Recursively, so every pair either meets or is told apart by the
+  rule above.
+
+It is M6's reasoning at a finer grain. Where the capped comparison rests on
+byte-equality being transitive between cluster representatives, this rests on
+the same transitivity plus one extra fact — that agreeing with a third file over
+a range and disagreeing with it inside that range cannot both be true of two
+equal files. Every pair in a reported group is still joined by a chain of
+comparisons that each read real bytes this scan. No digest settles anything.
+
+**Two sizes, for two reasons.** A window is what a head movement buys: it starts
+at the comparison chunk and grows by `PIVOT_GROWTH` to `PIVOT_WINDOW`, so a
+group that parts early costs exactly what the lockstep round it replaces cost,
+and one that keeps agreeing pays a movement per member per 256 MiB. A run is
+what a parting is placed to, and runs inside a window carry straight on from
+each other, so their length costs no movement at all — `PIVOT_RUN` is
+`MIN_CHUNK`, and a member that parts is read barely past the byte it parted at.
+Three constants, all in `consts.rs` beside the other budgets.
+
+**Memory.** One window and one member's run, `held_ceiling(chunk)`, however wide
+the group. There is no term for the group's width, which is what M7-PIVOT.md
+asks for by name: a 1,800-member group holds one window, not 1,800. A
+`debug_assert` in the sweep says so on every window, and
+`the_window_budget_is_the_cap_however_wide_the_group_is` runs it over a group of
+200.
+
+### The gate, with no profile flag
+
+Run from the repository root:
+
+```
+rust/evidence/scripts/m7_gate.sh > rust/evidence/m7-gate.txt
+```
+
+which runs
+
+```
+python3 conformance/run.py --gate all \
+  --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+Quoted from `evidence/m7-gate.txt`:
+
+```text
+$ ls /Volumes   (before)
+\]
+dedupbench
+
+$ python3 conformance/run.py --gate all \
+    --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+   exit 0
+
+$ ls /Volumes   (after)
+\]
+dedupbench
+
+$ hdiutil info | grep -c dedupconf   (0 = the check detached its image)
+0
+```
+
+33 checks, 0 failed, exit 0. Nothing in the harness passes `--profile`, so all
+33 ran the flash pipeline. The `ls /Volumes` lines either side are the fence
+condition the maintainer set for running `m4-trashes`, whose check makes,
+mounts, uses and detaches an 80 MB image of its own at `/Volumes/dedupconf`:
+the two volumes already mounted are unchanged and were never in any path this
+branch used, and `hdiutil info` afterwards shows the check's image gone.
+
+### Groups are profile-independent
+
+```
+python3 rust/evidence/scripts/spinning_differential.py
+```
+
+M6's eight scratch trees, unchanged, each shaped at something the profile
+removes. On each the oracle, `--profile flash`, `--profile spinning` and a
+flagless run are compared. `evidence/m7-differential.txt`:
+
+```text
+tree                  files  groups   flash seeks  spinning seeks   flash bytes  spinning bytes  verdict
+tails                     5       2            18              18        319488          425984  same
+middles                   3       1            63               9      27856896        26279936  same
+last-chunk                3       1            60              12      38805504        56623104  same
+cohort-boundary          16       4           110              76      33554432        35389440  same
+wide                     24       1           693              72     239075328       226492416  same
+links                     6       2            16              12       1048576         1048576  same
+unreadable                5       1            70               9      29884416        28311552  same
+mixed                    46      10           132              75      20717575        45826056  same
+
+8 trees, every profile identical to the oracle
+```
+
+The tree to read is `cohort-boundary` — sixteen files in four content classes,
+each file shorter than one comparison chunk, which is the shape a pivot sweep is
+worst at because every class needs a pass of its own, and the one that decided
+how long a run is.
+
+### Why a run is `MIN_CHUNK` and not the chunk
+
+A run costs no head movement, so its length is free to choose; what it decides
+is how many bytes a member reads past a parting and how many it reads again when
+its class is compared to itself. That is an argument, so it was measured rather
+than asserted: the same corpus read by `main`, by this branch, and by this
+branch built with `PIVOT_RUN = SLOW_CHUNK` — the obvious implementation, and
+the one the constant exists to reject. The variant is built from a copy of the
+tree with a target directory of its own, so no variant binary is ever produced
+in the working checkout.
+
+```
+python3 rust/evidence/scripts/pivot_run_size.py <main-build>/rust/target/release/dedup-rs
+```
+
+`evidence/m7-run-size.txt`:
+
+```text
+16 x 2 MiB in 4 classes, parting in the last kilobyte, --profile spinning, one reader.
+
+read as                    bytes_read       MiB   seeks
+main, capped cohorts         49807360      47.5      73
+PIVOT_RUN = SLOW_CHUNK       82313216      78.5      72
+PIVOT_RUN = MIN_CHUNK        35127296      33.5      72
+
+all three report the same groups
+a run as long as the chunk reads 2.34x what this branch reads, and 1.65x what
+main's capped comparison reads; at MIN_CHUNK it is 0.71x main
+```
+
+A run as long as the chunk would have made this milestone a bytes REGRESSION on
+this shape — 78.5 MiB against the 47.5 MiB `main` reads. At `MIN_CHUNK` it is an
+improvement, at 33.5 MiB. `main`'s 49,807,360 bytes here is byte-for-byte the
+number M6's own claim reports for `cohort-boundary`, from a differently written
+generator in a different script — which is two harnesses agreeing about what the
+old sweep does on this shape, and is the reason to believe the third row.
+
+### Seeks, against the sweep this replaces
+
+```
+python3 rust/evidence/scripts/pivot_seeks.py <main-build>/rust/target/release/dedup-rs
+```
+
+Seven generated corpora, `--profile spinning`, one reader, every count checked
+for determinism across two runs and every shape checked for the same groups from
+all three of `main`, this branch, and `--profile flash`.
+`evidence/m7-seeks.txt`:
+
+```text
+Seeks, one reader (-j 1). main is the capped cohort sweep under --profile spinning;
+`ours` is this branch under the same flag. `flash` is the profile the gate grades,
+for comparison with M6, whose table read flash against spinning.
+
+Whole-scan counts: stages 1-4 are untouched by this branch and cost a head movement
+per file between them, so the stage-5 ratio is higher than the column below.
+
+shape               groups  flash   main   ours vs main vs flash     opens
+one-wide-group           1   1668     89     48    1.9x    34.8x    25->12
+several-groups           3   3210    192    120    1.6x    26.8x    63->30
+few-and-long             2   3138    114     30    3.8x   104.6x     12->6
+one-long-pair            1   2070     70     12    5.8x   172.5x      4->2
+parting-groups           3   2504    166    108    1.5x    23.2x    47->19
+small-and-many           4    816     80     64    1.2x    12.8x    32->16
+classes-in-one-run       4    112     73     72    1.0x     1.6x    40->16
+
+shape                what it is
+  one-wide-group     one group of 12 x 64 MiB
+  several-groups     3 groups of 10 x 48 MiB
+  few-and-long       2 groups of 3 x 256 MiB
+  one-long-pair      one group of 2 x 512 MiB
+  parting-groups     3 bands of 6 x 64 MiB sharing 40 MiB, plus one unique
+  small-and-many     4 groups of 4 x 20 MiB
+  classes-in-one-run 16 x 2 MiB in 4 classes, parting in the last kilobyte
+
+bytes. SPIN.md lets `spinning` read MORE than the profile the gate grades — it trades bytes for seeks by design — so what matters here is this branch against main, which is the sweep it replaces:
+  shape                  flash MiB      main MiB       our MiB ours/main
+  one-wide-group             774.0         831.9         768.0     0.92x
+  several-groups            1455.0        1583.8        1440.0     0.91x
+  few-and-long              1539.0        1536.0        1536.0     1.00x
+  one-long-pair             1025.0        1024.0        1024.0     1.00x
+  parting-groups            1161.0        1695.8        1194.6     0.70x
+  small-and-many             328.0         320.0         320.0     1.00x
+  classes-in-one-run          32.0          47.5          33.5     0.71x
+
+seeks: between 1.0x and 5.8x fewer than main on every shape above
+groups identical across main, this branch, and --profile flash, on every shape
+HDD wall-clock unvalidated: no rotational drive is available here.
+```
+
+**Bytes are equal or lower on every shape** — 0.70x to 1.00x of what `main`
+reads — which is more than M7-PIVOT.md asked for; it asked for equal. Two shapes
+read strictly less, and both for the same reason: `main`'s capped comparison
+re-reads a pivot once per cohort, and this sweep opens and reads each member
+once per pass instead. The `opens` column is the same fact from the other side —
+at least halved on every shape, and better than halved where `main` re-opened a
+pivot in several cohorts — and it is where the descriptor table shows up
+(below).
+
+### Where the win is, and where it is not
+
+`few-and-long` and `one-long-pair` are the shape SPIN.md commissioned the
+profile for — a USB disk full of video — and they are where the ratio lives:
+3.8x and 5.8x fewer head movements than `main`, 104.6x and 172.5x fewer than
+the flash pipeline. The ratio grows with the file, because a sweep pays a movement
+per member per window and lockstep pays one per member per chunk.
+
+`classes-in-one-run` is the floor: 1.0x. Sixteen 2 MiB files in four classes,
+every file shorter than one chunk, so the cost is the number of passes rather
+than the length of the reads and there is nothing for a longer window to buy.
+`small-and-many` at 1.2x is the same story less sharply. Read "1.0x to 5.8x"
+as a statement about large files, not about every tree — and note that the
+counts are whole-scan: stages 1 to 4 are untouched here and spend a head
+movement per file between them, so stage 5's own ratio is higher than the
+column.
+
+The `vs flash` column is there to be comparable with M6's table, which read
+flash against spinning and reported 3.0x to 3.6x. It is not comparable with
+M6's *numbers*: flash's own seek counts moved on `main` when the round-2
+optimiser landed, and the corpora are not M6's.
+
+### What the default profile does, which is nothing new
+
+RBENCH scores the default profile and never passes a profile flag, so the claim
+it is owed is that its scenarios do not move.
+
+**This is not RBENCH.** The harness keeps its corpora on the `dedupbench` RAM
+disk under `/Volumes`, which this agent's fence forbids it to touch at all. So
+the corpora here are built by `bench/corpus.py` — the same seeded generators,
+the same names, the same shapes — under `rust/target/` in this worktree, and
+timed on the local SSD. The score of record is still the refereed harness's;
+this is evidence that there is nothing for it to find.
+
+```
+python3 rust/evidence/scripts/pivot_flash_inert.py <main-checkout>
+```
+
+`evidence/m7-flash-inert.txt`:
+
+```text
+RBENCH-shaped, on the local SSD in this worktree. Corpora from bench/corpus.py at
+scale smoke, seed 20260824. No profile flag on any run — this is the profile the harness scores.
+load average: 1.14 1.71 2.30  (shared machine: a figure above about 1 makes every
+timing below indicative only)
+
+scenario       files   bytes_read         opens    groups ours/base
+needle         10000     24682520          9635        10   1.008x
+typical         1600      2812459           430        64   0.995x
+samesize         142      3702784           142         4   1.012x
+widegroup         70     14501888            84         8   0.987x
+photos            13     47846337            11         3   0.992x
+bigheader          8     32677888             8         1   0.997x
+prefixtrap        32     16973824            32         4   1.008x
+
+geomean over 7 scenarios: 1.000x
+noise floor (base against itself, same corpus, same rounds): 0.988x
+load average at the end: 2.57 2.00 2.40
+
+bytes_read, opens, files_seen, bytes_seen and the groups are identical between the two
+builds on every scenario — that is the part of this that is a fact. The wall clock is not
+claimed: see the noise floor above.
+```
+
+`bytes_read`, `opens`, `files_seen`, `bytes_seen` and the groups are identical
+between the two builds on all seven scenarios — that is the part of this that is
+a fact, and it is what RBENCH's byte-determinism gate and correctness gate read.
+The wall clock is not claimed: the geomean is 1.000x and the noise floor, the
+base build against itself over the same corpus and the same rounds, is 0.988x,
+so every per-scenario figure between 0.987x and 1.012x is inside it. The machine
+was at load average 1.1 rising to 2.6 and is shared with other agents.
+
+### Where `--profile` meets the other flags
+
+```
+python3 rust/evidence/scripts/spinning_meets_the_rest.py
+```
+
+M6's combination suite, unchanged, re-run because this branch edits the stage
+`--auto` deletes on. `evidence/m7-combinations.txt`:
+
+```text
+cache: flash first, then spinning          ok (1 groups, the new copy joined its twins)
+cache: spinning first, then flash          ok (1 groups, the new copy joined its twins)
+cache: spinning twice                      ok (1 groups, the new copy joined its twins)
+--auto under either profile                ok (both kept a.bin, c.bin, d.bin)
+the browser under either profile           ok (both removed b.bin, nested/a-copy.bin and kept a.bin, c.bin, d.bin)
+--stage size --auto --profile spinning     ok (exit 2, nothing removed): dedup-rs: --auto cannot act on a --stage size scan
+--profile with a name it does not know     ok (exit 2): dedup-rs: --profile takes flash, spinning or auto
+
+every combination behaves
+```
+
+### The tests are guards, not decoration
+
+```
+python3 rust/evidence/scripts/pivot_mutants.py
+```
+
+Twelve deliberate breaks, each a plausible implementation of the same feature,
+built and run in a copy of the tree so no mutant binary is ever left in the
+checkout. `evidence/m7-mutants.txt`:
+
+```text
+Baseline: the tree as written.
+  compare::tests all pass
+
+mutant merge-the-residue                calls everything that left the pivot in one run equal, without reading again
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_where_nothing_matches_reports_nothing, a_member_that_matches_nobody_is_carried_to_every_later_pass, a_residue_class_that_parts_later_parts_at_the_right_byte, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start, a_residue_that_is_two_classes_is_split_again_rather_than_merged, equal_members_split_across_cohorts_are_still_found, members_that_left_in_one_run_at_different_bytes_are_not_merged, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_two_comparisons_are_the_same_function
+
+mutant drop-the-residue                 never offers a member that left the pivot to any later pivot
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_divergence_in_a_middle_window_splits_the_group, a_divergence_in_the_first_window_splits_the_group, a_divergence_in_the_last_window_splits_the_group, a_divergence_on_a_window_boundary_splits_the_group, a_group_taking_several_rounds_is_partitioned_the_same_way, a_member_that_cannot_be_read_leaves_the_rest_of_its_group_alone, a_pivot_that_cannot_be_read_hands_its_class_to_the_next_one, a_residue_class_that_parts_later_parts_at_the_right_byte, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start, a_residue_that_is_two_classes_is_split_again_rather_than_merged, a_window_longer_than_a_run_is_still_split_at_the_right_byte, equal_members_split_across_cohorts_are_still_found, members_that_left_in_different_runs_are_never_compared_again, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_sweep_finds_the_same_classes_wherever_the_files_part, the_two_comparisons_agree_where_a_window_holds_several_runs, the_two_comparisons_are_the_same_function, two_members_that_left_the_pivot_in_different_runs_still_find_their_own, two_members_that_left_the_pivot_together_are_compared_to_each_other
+
+mutant regroup-past-the-parting         restarts a residue AFTER the run it parted in, so the parting byte is never re-read
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_where_nothing_matches_reports_nothing, a_member_that_matches_nobody_is_carried_to_every_later_pass, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start, a_residue_that_is_two_classes_is_split_again_rather_than_merged, equal_members_split_across_cohorts_are_still_found, members_that_left_in_one_run_at_different_bytes_are_not_merged, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_two_comparisons_are_the_same_function
+
+mutant regroup-at-the-window            restarts a residue at the window rather than at the run it parted in
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start
+
+mutant one-bucket-for-every-parting     files every leaver under one offset, so two that parted in different runs meet again
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start
+
+mutant hash-the-run-that-parted         lets a leaver's last run reach its digest, which it will read again
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_group_read_here_is_learned_as_the_digest_of_the_whole_file
+
+mutant only-the-first-run-of-a-window   judges a member on the first run of each window and skips the rest
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_divergence_in_a_middle_window_splits_the_group, a_divergence_in_the_last_window_splits_the_group, a_divergence_on_a_window_boundary_splits_the_group, a_group_read_here_is_learned_as_the_digest_of_the_whole_file, a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_where_nothing_matches_reports_nothing, a_member_that_cannot_be_read_leaves_the_rest_of_its_group_alone, a_pivot_that_cannot_be_read_hands_its_class_to_the_next_one, a_residue_class_that_parts_later_parts_at_the_right_byte, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start, a_residue_that_is_two_classes_is_split_again_rather_than_merged, a_window_longer_than_a_run_is_still_split_at_the_right_byte, members_that_left_in_one_run_at_different_bytes_are_not_merged, the_kept_head_is_compared_rather_than_read_a_second_time, the_kept_tail_settles_the_end_without_reading_it, the_sweep_finds_the_same_classes_wherever_the_files_part, the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window, the_two_comparisons_agree_where_a_window_holds_several_runs, the_two_comparisons_are_the_same_function, two_members_that_left_the_pivot_in_different_runs_still_find_their_own, two_members_that_left_the_pivot_together_are_compared_to_each_other
+
+mutant settle-on-a-lost-pivot           settles the pivot's class even though the pivot could not be read
+  caught by a_pivot_that_cannot_be_read_hands_its_class_to_the_next_one
+
+mutant strand-a-lost-pivots-class       drops the members a lost pivot had already proved equal to each other
+  caught by a_pivot_that_cannot_be_read_hands_its_class_to_the_next_one, a_pivot_that_goes_away_mid_sweep_settles_nothing_and_carries_its_class_on
+
+mutant flat-windows                     never lets a window grow, so every window costs a head movement per member
+  caught by the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window
+
+mutant no-seek-back                     leaves a regrouped class's handles wherever the last comparison stopped
+  caught by a_digest_survives_the_regrouping_that_reads_a_run_twice, a_group_taking_several_rounds_is_partitioned_the_same_way, a_group_where_nothing_matches_reports_nothing, a_member_that_matches_nobody_is_carried_to_every_later_pass, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start, a_residue_that_is_two_classes_is_split_again_rather_than_merged, equal_members_split_across_cohorts_are_still_found, members_that_left_in_one_run_at_different_bytes_are_not_merged, the_capped_sweep_agrees_with_the_uncapped_one_on_every_shape, the_two_comparisons_are_the_same_function
+
+mutant runs-as-long-as-the-chunk        reads a window in chunk-long runs, so a parting is placed a chunk wide
+  caught by a_member_that_parts_is_read_to_the_end_of_its_run_and_no_further, a_residue_is_read_again_from_its_own_run_rather_than_from_the_start, the_window_budget_is_the_cap_however_wide_the_group_is
+
+every mutant was caught
+```
+
+The three worth naming are `merge-the-residue`, which calls everything that
+parted in one run equal without reading it again — the exact "two files that
+differ, reported as one group" this stage exists to prevent;
+`regroup-past-the-parting`, the off-by-one that restarts a residue after the run
+it parted in, so the parting byte is never compared; and
+`hash-the-run-that-parted`, which is invisible to every group assertion and
+shows up only as a whole-file digest of a file that does not exist — the kind
+that would be remembered and matched against on the NEXT scan.
+
+### The descriptor table, and what the sweep does with it
+
+The held-`File` table composes rather than being bypassed. `compare_stage`'s
+spinning branch now lifts a group's carried descriptors exactly as the flash
+branch does, and the sweep opens each member once and keeps it for every window
+— so a carried descriptor saves exactly the open it saves on the flash path. The
+capped comparison never did this: it re-opened the pivot in every cohort.
+
+End to end, and as a gate rather than a print-out:
+
+```
+python3 rust/evidence/scripts/pivot_descriptors.py <main-build>/rust/target/release/dedup-rs
+```
+
+`evidence/m7-descriptors.txt`:
+
+```text
+three 6 MiB copies, --profile spinning, one reader:
+main@cc654c4    "bytes_read": 18874368, "opens": 6, "seeks": 12
+this branch     "bytes_read": 18874368, "opens": 3, "seeks": 9
+
+one open per member instead of two, the same bytes, fewer seeks
+```
+
+What the sweep does NOT carry over from the capped comparison is
+`SPIN_INTERLEAVE`. That cap existed to bound how many files a round-robin read
+at once; holding a descriptor costs nothing on a disk that is only ever asked to
+read from one of them at a time, and the flash path has always opened a whole
+group at once. `the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window`
+holds the count to one per member.
+
+### What was not touched, and why
+
+- **`verify_attested`.** M7-PIVOT.md says "Deletion path untouched.
+  `verify_attested` untouched", so it still calls `split_identical_capped` under
+  `spinning`. That is a deliberate literal reading: the function is on the
+  deletion path, it was reviewed at M6 on that comparison, and re-proving an
+  attested group is not where this milestone's seeks are. The consequence is
+  that two spinning splitters now exist. Both are exercised by
+  `bench.partitions`, which runs lockstep, the capped sweep and the pivot sweep
+  over every shape in the file and requires all three to agree — so the older
+  one is now a second opinion on the newer one rather than dead weight. Say the
+  word and it moves.
+- **The flash path.** The only edit inside it is that its reading preliminaries
+  — opening the group, comparing what stage 3 kept, seeding the hashers,
+  positioning the handles — moved into a `prepare` both splitters call. The code
+  is the same code; duplicating the trickiest twenty lines in the program into a
+  second copy was the alternative.
+- **`COMPARE_BUDGET`, `SLOW_CHUNK`, `SPIN_INTERLEAVE`.** Unchanged. REWRITE.md
+  §8 forbids re-tuning settled measurements, and the sweep's budget is a new
+  constant rather than a new value for an old one.
+
+### Standards
+
+```
+rust/evidence/scripts/m7_standards.sh <main-checkout>/rust > evidence/m7-standards.txt
+```
+
+The before-count is re-derived by building `main@cc654c4` from a `git archive`
+into a target directory of its own, not copied from the previous claim.
+`evidence/m7-standards.txt`:
+
+```text
+=== main@cc654c4, for the before-count and the clippy verdict that predates this branch ===
+$ cargo test
+
+test result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+
+$ cargo clippy --all-targets -- -D warnings
+error: this assertion has a constant value
+   --> src/compare.rs:898:9
+    |
+898 |         assert!(COMPARE_BUDGET / 512 < CHUNK, "512 members must shrink it");
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider moving this into a const block: `const { assert!(..) }`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.92.0/index.html#assertions_on_constants
+    = note: `-D clippy::assertions-on-constants` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::assertions_on_constants)]`
+
+error: could not compile `dedup-rs` (bin "dedup-rs" test) due to 1 previous error
+   exit 101
+
+=== this branch ===
+$ cargo test
+
+test result: ok. 224 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m7/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.94s
+   exit 0
+
+$ cargo fmt --check
+(no output: clean)
+
+=== the binary the evidence was measured with is the committed source ===
+    Finished `release` profile [optimized] target(s) in 0.09s
+$ shasum -a 256 target/release/dedup-rs
+d61455257d5e735bbed1b947e439760293eb1af9750900791c938146eef11382  target/release/dedup-rs
+$ touch src/compare.rs src/consts.rs && cargo build --release
+    Finished `release` profile [optimized] target(s) in 12.22s
+$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
+d61455257d5e735bbed1b947e439760293eb1af9750900791c938146eef11382  target/release/dedup-rs
+```
+
+194 tests to 224. Thirty new, and five that existed already now guard the new
+sweep as well: `bench.partitions` returns all three comparisons and every shape
+test asserts the pivot sweep agrees with lockstep.
+
+**The clippy line is not this branch's.** `cargo clippy --all-targets -- -D
+warnings` fails on `main@cc654c4` itself — clippy 1.92's `assertions_on_constants`
+rejects M6's `assert!(COMPARE_BUDGET / 512 < CHUNK, ...)`, whose operands became
+const-foldable when the round-2 optimiser merged. Reported rather than fixed;
+the maintainer fixed it on `main` at `06548c2` and it is cherry-picked here as
+`6f032ef`, which is why the branch runs green above while the base does not. The
+side-by-side capture is kept deliberately: it is the proof the red predates this
+work.
+
+**No stale binary.** Every measurement above was taken with
+`rust/target/release/dedup-rs` built from the committed source. Proved rather
+than assumed, in the same capture: `shasum -a 256` of the binary, then `touch
+src/compare.rs src/consts.rs && cargo build --release` — a real twelve-second
+recompile, not a cache replay — then `shasum` again. Byte-identical, so it was
+not stale. A stale mutant binary cost the maintainer a day yesterday, which is
+why this is a line in the standards script rather than a sentence here.
+
+### Defects found and not fixed
+
+1. **A wide group of all-distinct files is quadratic, on both spinning
+   comparisons.** The pivot loop strips one class per pass, so N unique files of
+   the same size cost N passes. `partition_blocks` has `PARTITION_FANOUT` for
+   exactly this on the flash path and neither spinning path has an equivalent.
+   It is not new and this branch improves it — `main`'s capped sweep re-reads a
+   whole cohort per pass where this reads one run per member after the first —
+   but it is still there, and a `widegroup`-sized tree of genuinely unique files
+   would be very slow under `--profile spinning`. Not fixed: it is not in
+   M7-PIVOT.md, and the fix (digesting the run a member parted in, to pick a
+   slot the way `partition_blocks` does) belongs with a measurement of how often
+   the shape occurs.
+2. **`/Volumes` has a volume named `\]`** on this machine, present before and
+   after every run here. Nothing this branch did created or touched it; recorded
+   because the gate evidence shows it and a reader should not have to wonder.
+
+### Fence conditions this run was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m7` on branch `m7-pivot`, off
+`main@cc654c4`, plus the cherry-pick of the maintainer's `06548c2`. Nothing
+under `/Volumes` was read or written, with the single exception the maintainer
+ruled in: the ephemeral APFS image the conformance `m4-trashes` check creates,
+attaches at `/Volumes/dedupconf` and detaches itself, recorded either side by
+`ls /Volumes` in `evidence/m7-gate.txt`. The `dedupbench` RAM disk was not
+touched, mounted, unmounted or read. Every corpus was generated under this
+worktree's `rust/target/m7/` and removed after use, including the copy of
+`main@cc654c4` used for the differentials, which was extracted with `git
+archive` and built into a target directory of its own rather than by touching
+any other worktree. No `conformance/`, `rbench/`, `bench/` or `xbench/` file was
+modified, and no other branch was touched. No `sudo`. Free space on the volume
+was 13 GiB throughout, which is why the largest corpus here is 1.5 GiB.
