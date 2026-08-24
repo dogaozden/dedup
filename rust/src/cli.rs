@@ -306,7 +306,8 @@ pub fn parse_arguments_from<I: Iterator<Item = String>>(arguments: I) -> Result<
             None => return Err(format!("unknown argument: {argument}")),
         }
     }
-    options.root = root.ok_or("usage: dedup-rs <root> [options]")?;
+    // The oracle runs on the current directory when no path is given.
+    options.root = root.unwrap_or_else(|| PathBuf::from("."));
     Ok(Parsed::Scan(Box::new(options)))
 }
 
@@ -344,11 +345,12 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
 pub fn help_text() -> String {
     let mut out = String::from(
         "dedup-rs — find byte-exact duplicate files.\n\n\
-         usage: dedup-rs <root> [options]\n\n\
+         usage: dedup-rs [root] [options]\n\n\
          Groups of files whose bytes are identical, largest first. Nothing is\n\
          ever called a duplicate on the strength of a hash: every group is\n\
-         read and compared. Without --list or --auto, a terminal gets the\n\
-         interactive browser.\n\noptions:\n",
+         read and compared. Runs on the current directory when no root is\n\
+         given. Without --list or --auto, a terminal gets the interactive\n\
+         browser.\n\noptions:\n",
     );
     let widest = FLAGS
         .iter()
@@ -387,6 +389,14 @@ mod tests {
             Parsed::Scan(options) => Ok(*options),
             Parsed::Help => Err("help".to_string()),
         }
+    }
+
+    #[test]
+    fn no_root_means_the_current_directory() {
+        // Parity with the oracle: "Runs on the current directory when no
+        // path is given."
+        assert_eq!(parse(&[]).unwrap().root, PathBuf::from("."));
+        assert_eq!(parse(&["--list"]).unwrap().root, PathBuf::from("."));
     }
 
     /// Every flag token the help text mentions.

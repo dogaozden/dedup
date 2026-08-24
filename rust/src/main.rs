@@ -182,7 +182,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // another copy of every reported path.
     serde_json::to_writer_pretty(BufWriter::new(fs::File::create(destination)?), &report)?;
 
-    if options.list {
+    // A pipe with neither --list nor --auto still gets the report: the oracle
+    // prints one when there is no terminal to browse in, and a run that reads
+    // a whole tree and says nothing looks like a hang.
+    if options.list || (rule.is_none() && !options.interactive && !tui::has_terminal()) {
         print_report(&report.groups);
     }
 
