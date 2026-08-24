@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 
 use crate::consts::{CACHE_SCHEMA, CACHE_TICK_NS, CACHE_TTL_DAYS};
@@ -324,9 +325,15 @@ fn read_rows(database: &Path) -> rusqlite::Result<HashMap<u64, Row>> {
     while let Some(row) = cursor.next()? {
         let mut digests = [None; COLUMNS.len()];
         for (slot, digest) in digests.iter_mut().enumerate() {
-            *digest = row
-                .get::<_, Option<Vec<u8>>>(3 + slot)?
-                .and_then(|bytes| Digest::try_from(bytes.as_slice()).ok());
+            // Borrowed from sqlite's own row buffer rather than copied out of
+            // it: a digest is thirty-two bytes and there are five columns of
+            // them, so `Option<Vec<u8>>` here is one allocate-copy-free per
+            // column per row — fifty-six thousand of them on `rescan` — to
+            // fill a fixed-size array that was going to copy the bytes anyway.
+            *digest = match row.get_ref(3 + slot)? {
+                ValueRef::Blob(bytes) => Digest::try_from(bytes).ok(),
+                _ => None,
+            };
         }
         rows.insert(
             row.get::<_, i64>(0)? as u64,
