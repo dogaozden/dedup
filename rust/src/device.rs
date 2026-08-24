@@ -205,7 +205,15 @@ fn cpu_bound(ceiling: usize) -> usize {
     ceiling.min(std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get))
 }
 
-/// The bound for the stages that open a file, read a little of it and move on.
+/// The bound for the stages that open a file, read a page of it and move on.
+///
+/// Three stages have that shape: the small-file stage, stage 3's one-page
+/// probe, and stage 3's ends probe. What separates them from the deep-head
+/// and sample probes is not the reading but the *hashing* — a page is 4 KiB
+/// to digest and a deep head is sixty, so the deep probes have enough CPU
+/// work per file to want every core while these are still waiting on the
+/// catalog. Measured over `widegroup`'s 1,827 files, four readers against
+/// eight: the page probes win by 3.2 ms and the deep probe loses by 1.7.
 ///
 /// Those stages are waiting on the filesystem, not computing, and past a
 /// point more readers only queue deeper: the catalog they are all asking is

@@ -195,11 +195,25 @@ pub fn find_duplicates(
     let random_jobs = device.random_jobs(profile);
     let sequential_jobs = device.sequential_jobs(profile);
     let random_pool = pool_of(random_jobs);
+    // The deep reader, for the stages that hash enough per file to want every
+    // core: `DeepHead` reads 60 KiB and `Sample` half a megabyte.
     let reader = Reader {
         root,
         effort,
         pool: &random_pool,
         jobs: random_jobs,
+    };
+    // The shallow reader, for the stages that read a page and hash a page.
+    // Those are waiting on the catalog, not computing, and `fast_bound` is
+    // where that bottoms out — the same pool the small-file stage wants, so
+    // where the two counts agree there is one pool and not two.
+    let shallow_jobs = device.small_file_jobs(profile);
+    let shallow_pool = (shallow_jobs != random_jobs).then(|| pool_of(shallow_jobs));
+    let shallow = Reader {
+        root,
+        effort,
+        pool: shallow_pool.as_ref().unwrap_or(&random_pool),
+        jobs: shallow_jobs,
     };
     let mut unreadable = std::mem::take(&mut scan.unreadable);
     let mut settled: Vec<Vec<usize>> = Vec::new();
@@ -216,20 +230,10 @@ pub fn find_duplicates(
 
     let mut remembered: Vec<Vec<usize>> = Vec::new();
     if !small.is_empty() {
-        // Its own pool, because it is the one stage whose reads are all open
-        // and no seek; see `Device::small_file_jobs`. Built here rather than
-        // beside the others so a tree with nothing small in it never pays for
-        // the threads, and skipped entirely where the two counts agree.
-        let small_jobs = device.small_file_jobs(profile);
-        let dedicated = (small_jobs != random_jobs).then(|| pool_of(small_jobs));
-        let small_reader = Reader {
-            root,
-            effort,
-            pool: dedicated.as_ref().unwrap_or(&random_pool),
-            jobs: small_jobs,
-        };
+        // The same shallow reader stage 3's page probe uses; see
+        // `Device::small_file_jobs`.
         let (proven, attested, fallback) = small_file_stage(
-            &small_reader,
+            &shallow,
             &records,
             &small,
             &mut unreadable,
@@ -263,7 +267,7 @@ pub fn find_duplicates(
         Profile::Spinning => Probe::Head { keep },
     };
     let end_buckets = hash_stage(
-        &reader,
+        &shallow,
         &mut records,
         &staged,
         ends,
