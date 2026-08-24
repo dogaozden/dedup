@@ -2108,3 +2108,127 @@ and a clean result you did not earn:
 I did not touch the non-binding items the reviewer marked "not this branch's":
 the `-j1` attached-short-option gap, which `main` shares, and `VolumeProbe`'s
 stale doc comment.
+
+## 2026-08-23 — M5.2, sizes for humans and a live pulse
+
+Two defects in one evening, and they turn out to want opposite things from the
+same file. `100mb` typed into the menu was refused because the only grammar the
+tool had was `str::parse::<u64>`; an HDD scan showed nothing because the only
+thing the tool wrote during a scan was nothing. The first wants the flag table
+to know more; the second wants the scan path to do less.
+
+### One grammar, and two humanisers, which is one more than the spec asks for
+
+`size.rs` owns `parse_size`, and `Flag::apply` is its only caller, so the
+command line, the form and `--help` are the same code with three doors.
+Everything is binary: `k` is 1024 because MiB is what the browser prints, and a
+number read off the screen has to mean the same thing typed back in.
+
+The part worth arguing about is the display side. M5_2-UX.md says sizes are
+shown "through one humanizer shared with the TUI's `human_size`" and that every
+displayed string must parse back to exactly the bytes it came from. Those two
+cannot both hold of one function. `human_size` rounds — it has to, because the
+browser shows arbitrary file sizes and `1468006 B` is not a size a person
+reads. But a rounded size in the menu's min-size field is not a display bug, it
+is a scan the user did not agree to: the form hands its own words back to the
+parser, so a field showing `1.4 MiB` for 1500000 would run the scan at 1468006.
+
+So there are two, on one ladder, in one file:
+
+- `human_size` — rounded, for a number nobody types back in. Relabelled from
+  `KB`/`MB` to `KiB`/`MiB`, which is what it was already dividing by. Its
+  `EB` branch, inherited from the oracle, printed 1024× the truth for anything
+  past a pebibyte; the ladder now runs to `EiB` and the branch is gone.
+- `exact_size` — the largest unit that divides to one decimal place, and plain
+  bytes when none does. Never rounds, so `1500000` stays `1500000`.
+
+`exact_size` is what the help default and the menu prefill use, through
+`Flag::show`, which is `Flag::apply`'s inverse and is bound to it by test.
+`--min-size 10485760` on the command line now reaches the form as `10 MiB` and
+leaves it as `10 MiB`. The round-trip law is tested over the whole ladder plus
+a few thousand deterministic scatter values.
+
+`p` and `e` are in the grammar though nothing teaches them: without them the
+top two rungs of the ladder the browser prints would be rungs the tool cannot
+read back.
+
+### The pulse, and what "inert" had to mean
+
+The oracle's `Reporter` paints from the scan thread, on a tick passed down into
+every stage. That is one design; the trouble with porting it literally is that
+the tick is then on the scan path whether anybody is watching or not.
+
+Here the painting is a ticker thread and the scan path only ever adds to a
+counter. `Pulse` is `Option<Live>`: off, every method is a branch that falls
+through, and there is no thread, no lock, no write. The rate comes from
+`Effort::bytes_read` — the counter the honesty fields are already made of — so
+the number on the line is bytes that really moved and cannot drift away from
+what the report says. That is what made `Effort` an `Arc` in `main`: the ticker
+needs to read it while the readers write it.
+
+Counting points, one per stage, chosen so the total is exactly the stage's own
+candidate count and no file is counted twice:
+
+| stage | told by | told at |
+|---|---|---|
+| Scanning | `walk` | each file's `metadata`, with its size |
+| Reading small files | `small_file_stage` | tier A's read, and the cache-settled classes |
+| Sampling / further / deep | `hash_stage` | inside the pool closure, and on each cache hit |
+| Comparing | `compare_stage` | as each group settles, inside the wave |
+
+Tier B is not counted: those files were counted when their head was read, and
+counting them again would put the bar past its own end. Cache hits are counted,
+or a warm stage would look stuck rather than fast.
+
+Two things I got wrong first. The compare stage counted after each wave, and a
+wave is often the whole stage, so the bar sat at nought until the moment it
+stopped mattering; it counts inside the wave now. And the wave path went
+uncovered in my first pty corpus because the sample stage re-buckets across
+everything stage 3 separated — 20 pairs distinguished only by their heads
+arrive at the comparison as one group of 40. That is the oracle's shape too
+(`survivors = sorted(f for g in big for f in g)`), and it is not a correctness
+problem because stage 5 partitions as it reads. It does mean a single wide
+group shows a still bar and a moving rate, which is exactly what the oracle
+shows in the same shape.
+
+`finish` joins the ticker before it wipes the line, so nothing can paint after
+it: that is what lets the browser's alternate screen and `--list`'s stdout
+follow it without a race. `Drop` calls `finish` too, so a scan that panics
+still gives the line back. The line is truncated a column short of the
+terminal width, because a wrapped line leaves its first row behind at the next
+repaint.
+
+### Numbers
+
+`evidence/m5_2-inertness.txt` — a 30,516-file tree, stderr piped, alternating,
+15 runs a side:
+
+| | opens | bytes_read | files_seen | bytes_seen | seeks | wall-clock |
+|---|---|---|---|---|---|---|
+| -j1, m5.2 | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.877s median |
+| -j1, main | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.871s median |
+| -j8, m5.2 | 51052 | 647872512 | 30516 | 640221184 | — | 0.782s median |
+| -j8, main | 51052 | 647872512 | 30516 | 640221184 | — | 0.782s median |
+
++0.8% at one reader and +0.0% at eight, against spreads of 1.179s and 0.185s
+within a single build — this machine has other agents on it, and the alternating
+design is what keeps that from landing on one side.
+
+`seeks` is compared at one reader only. Above that it is nondeterministic by
+design, and I checked rather than assumed: eight repeats of `main` against
+itself at the default `-j` gave 348 and 349 on the same tree, and this build
+gave the same two numbers. A comparison there would be measuring the scheduler.
+
+`cargo test` 180 passed against `main@fbc196d`'s 164, counted by building that
+commit rather than by reading the last claim. Clippy and fmt clean, `--gate
+all` 33/33.
+
+### Also
+
+`tools/passport-measure.sh` takes `--min-size 1m`, and gives the scan's own
+stderr to `/dev/tty` so the line is on while the maintainer sits through an
+hour of platter — only the timings go to the log, because a repainted line
+logged verbatim is a page of carriage returns. Guarded: where `/dev/tty`
+cannot be opened the line stays off and everything goes to the log as before.
+An unguarded redirection there fails the whole scan, which I found by running
+the script under a pty with no controlling terminal.

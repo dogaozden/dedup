@@ -1809,3 +1809,281 @@ The end-to-end pty suite is unchanged and still passes all seven cases
   throughout; only the prose had drifted.
 - The one-table section now says plainly that there are strictly two tables,
   `HELP_FLAGS` beside `FLAGS`, and why that is not a drift hole.
+
+## M5.2 — sizes for humans, and a live pulse — CLAIMED
+
+Branch `m5_2-ux`, off `main@fbc196d`. Binding spec is `M5_2-UX.md`; M5-TUI.md
+and M5_1-MENU.md apply unchanged, and nothing here touches the deletion path —
+the size grammar runs before any scan exists and the pulse only reads counters.
+
+Gate command, unchanged from the M5.1 and M6 claims, `{stage}` and all:
+
+```text
+$ python3 conformance/run.py --gate all \
+    --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+```
+
+### Sizes for humans
+
+`rust/src/size.rs` holds the grammar, and `Flag::apply` is its only caller, so
+the command line, the pre-flight form and `--help` are three doors onto one
+function. Plain digits stay plain bytes — the conformance templates are written
+in them and none of this moves them. A suffix multiplies: `k`, `m`, `g`, `t`,
+case-insensitive, alone or dressed as `kb` or `kib`, at most one space in
+front, decimals floored to whole bytes, all multiples binary. `p` and `e` are
+read too, though nothing teaches them, so that the whole ladder the browser
+prints is a ladder the tool can be told.
+
+On the real binary, `evidence/m5_2-sizes.txt`:
+
+```text
+$ dedup-rs <tree> --list --min-size '3145728'              exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3m'                   exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3mb'                  exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '3MiB'                 exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '2.9g'                 exit=0  No duplicates found.
+$ dedup-rs <tree> --list --min-size '512 k'                exit=0  1 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '0'                    exit=0  2 duplicate group(s)
+$ dedup-rs <tree> --list --min-size '12qb'                 exit=2  dedup-rs: not a size: "12qb" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '-1'                   exit=2  dedup-rs: not a size: "-1" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '1.2.3'                exit=2  dedup-rs: not a size: "1.2.3" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '18446744073709551616' exit=2  dedup-rs: not a size: "18446744073709551616" — plain bytes or 512k, 100mb, 1.5g
+```
+
+The `--help` line, from `evidence/m5_2-help.txt`:
+
+```text
+      --min-size SIZE     ignore files smaller than this; plain digits are
+                          bytes, or say 512k, 100mb, 1.5g, 2TiB — all binary
+                          multiples
+                          (default: 10 MiB)
+```
+
+**The display round-trip law, and where it made me split the humaniser in
+two.** M5_2-UX.md asks for one humaniser, shared with the TUI's `human_size`,
+and for every displayed size to parse back to exactly the bytes it came from.
+One function cannot do both: `human_size` rounds, because the browser shows
+arbitrary file sizes and `1468006 B` is not a size a person reads. But a
+rounded size in the menu's min-size field is not a display bug, it is a scan
+nobody agreed to — the form hands its own words back to the parser, so a field
+showing `1.4 MiB` for 1500000 would run the scan at 1468006. That is this
+repository's display-path/record-path divergence, one screen earlier.
+
+So there are two, on one ladder, in one file, bonded by test:
+
+- `human_size` — rounded, for reading. Relabelled `KB`/`MB` → `KiB`/`MiB`,
+  which is what it was already dividing by, and its inherited `EB` branch —
+  which printed 1024× the truth past a pebibyte — replaced by an `EiB` rung.
+- `exact_size` — the largest unit that divides to one decimal place, plain
+  bytes when none does. `1500000` stays `1500000`.
+
+`exact_size` is what the help default and the menu prefill use, reached through
+`Flag::show`, which is `Flag::apply`'s inverse. `--min-size 10485760` on the
+command line reaches the form as `10 MiB` and leaves it as `10 MiB`. Tests:
+`size::tests::every_size_the_tool_would_show_as_a_setting_parses_back_to_itself`
+(the ladder, its neighbours, and a few thousand deterministic scatter values),
+`size::tests::one_ladder_is_read_and_written`,
+`cli::tests::what_the_form_shows_is_what_the_parser_reads`, and
+`cli::tests::the_defaults_the_help_text_prints_are_the_defaults_the_code_has`,
+which now asserts the help default *is* `exact_size(DEFAULT_MIN_SIZE)` and
+parses back to it.
+
+`--quiet` is a setting rather than a swallowed word, and says what it does.
+`--verify` keeps its no-op arm and its reason.
+
+### The live pulse
+
+Ported from the oracle's `Reporter` (dedup.py:2149-2200): its stage names, its
+two body shapes, its `\r\033[2K` repaint, its 24-cell bar. What is new is who
+paints. The oracle ticks from the scan thread; here a ticker thread reads the
+counters and the scan path only ever adds to one. `Pulse` is `Option<Live>` —
+off, every method is a branch that falls through, and there is no thread, no
+lock and no write.
+
+The rate is `Effort::bytes_read`, the same counter the honesty fields are made
+of, so the number on the line is bytes that really moved and cannot drift from
+what the report says. That is why `main` now holds `Effort` in an `Arc`: the
+ticker reads it while the readers write it.
+
+Counted so that a stage's total is exactly its own candidate count and no file
+is counted twice — tier B is not counted, because those files were counted when
+their head was read; cache hits are, because a warm stage that showed nothing
+would look stuck rather than fast.
+
+`finish` joins the ticker before wiping the line, so nothing can paint after
+it. `Drop` calls `finish` too, so a scan that panics still gives the line back.
+The line is cut a column short of the terminal width: a wrapped line leaves its
+first row behind at the next repaint.
+
+Eight cases through a real pty, `evidence/m5_2-pulse.txt`:
+
+```text
+$ python3 rust/evidence/scripts/m5_2_pulse.py rust/target/release/dedup-rs \
+    <scratch> <a build of main@fbc196d>
+a piped run says nothing at all                ok (stdout byte-identical to main, 5188 bytes; stderr empty on both; 5 counters equal at -j1)
+a terminal gets a line, and gets it back       ok (5 repaints, stages Reading small files+Sampling+Comparing, bar Reading small files 5469→12002/12002; Sampling 6→6/14; Comparing 6→6/14, cleared before the browser)
+the walk counts files out loud                 ok (2 repaints, counts 59320…59320 against 100000 files seen, never ahead and never backwards)
+--quiet means quiet on a terminal too          ok (nothing between the menu and the browser, 9 groups found)
+--list down a pipe, the line on the terminal   ok (37729 bytes of list down the pipe, 1 repaints on the terminal, neither in the other)
+the menu takes 100mb, 1m and 1k                ok (100mb→0 group(s), 1m→7 group(s), 1k→9 group(s))
+bytes on the command line, a size on screen    ok (shown as 2 MiB, and 2 MiB is what the scan used)
+a size that is not one is refused in the field ok (refused in the field, in words that say what to type instead)
+
+every case behaves
+exit=0
+```
+
+The handover case is the one that matters most: it asserts the bytes written
+between the menu giving the screen back and the browser taking it, and that the
+last of them is the clear. Nothing of the line survives into the browser's
+screen, and `--list`'s stdout and the line never appear in each other's stream.
+The bar is checked for movement, forwards, and never past its own end, per
+stage — a stage whose counter is never told anything paints a bar frozen at
+nought and looks exactly like one that has just started.
+
+### Inertness
+
+`evidence/m5_2-inertness.txt` — a 30,516-file tree with work in every stage,
+stderr piped, alternating builds so a warming disk drifts through both sides,
+15 runs each:
+
+```text
+== stderr piped, -j1 ==
+  opens                 51052          51052   same
+  bytes_read        647872512      647872512   same
+  files_seen            30516          30516   same
+  bytes_seen        640221184      640221184   same
+  seeks                 51260          51260   same
+  groups                  254            254   same
+  m5.2         0.877s median, 0.854–2.033
+  main         0.871s median, 0.858–0.955
+  difference   +0.8% (+0.007s), against a 1.179s spread within a build
+
+== stderr piped, -j8 ==
+  opens                 51052          51052   same
+  bytes_read        647872512      647872512   same
+  files_seen            30516          30516   same
+  bytes_seen        640221184      640221184   same
+  groups                  254            254   same
+  seeks                 51260          51260   not compared: nondeterministic above one reader
+  m5.2         0.782s median, 0.760–0.945
+  main         0.782s median, 0.774–0.798
+  difference   +0.0% (+0.000s), against a 0.185s spread within a build
+
+the pulse costs a piped run nothing that can be measured
+exit=0
+```
+
+`seeks` is diffed at one reader only, and that is a measured decision rather
+than a convenience: eight repeats of `main` against itself at the default `-j`
+gave 348 and 349 on the same tree, and this build gave the same two numbers.
+Concurrent readers interleave and count against each other, which is the honest
+answer for one set of heads and is what M6 scores; a comparison there would be
+measuring the scheduler. This machine has other agents on it, which is what the
+2.033s outlier and the wide `-j1` spread are.
+
+### Also
+
+`tools/passport-measure.sh` takes `--min-size 1m`, and gives the scan's own
+stderr to the terminal so the line is on while the maintainer sits through an
+hour of platter — only the timings go into the log, because a repainted line
+logged verbatim is a page of carriage returns. Guarded: where `/dev/tty` cannot
+be opened the line stays off and everything goes to the log exactly as before.
+An unguarded redirection there does not merely lose the line, it fails the
+whole scan, which is how I found it — under a pty with no controlling terminal.
+That guard is a step past the letter of the spec, which asks only for the human
+forms; it is here because this script is the thing the maintainer runs on the
+drive that started M5.2.
+
+### Standards and the gate
+
+```text
+$ cargo test
+test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
+
+test result: ok. 180 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+$ cargo clippy --all-targets -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+
+$ cargo fmt --check
+(no output: clean)
+
+FMT_EXIT=0
+```
+
+164 tests on `main@fbc196d`, 180 here — counted by building that commit and
+running its own suite, not by reading the last claim, which said 163 before
+`main` gained one.
+
+```text
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+exit=0
+```
+
+### What a reviewer should look at hardest
+
+- **Two humanisers where the spec says one.** Argued above and in LOG.md. The
+  bond between them is `size::tests::one_ladder_is_read_and_written`; if the
+  reviewer wants one function, the price is either a rounding menu field or a
+  browser that prints raw byte counts, and I would rather be told which.
+- **A wide group shows a still bar and a moving rate.** The compare stage
+  counts as each group settles, so a single group of forty files reports
+  nothing until it finishes. That is the oracle's behaviour in the same shape —
+  its `tick` inside `split_identical` moves `hashed_bytes` and not
+  `hashed_files` — and the rate is the sign of life there.
+- **Nothing here is deletion-adjacent**, and the `ProvenGroups` guard, the
+  survivor guard and `verify_attested` are untouched. `--gate all` is 33/33 and
+  the piped stdout is byte-identical to `main`'s.
+
+### Fence conditions this run was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m52` on branch `m5_2-ux`, off
+`main@fbc196d`. Nothing under `/Volumes` was read or written. Every corpus was
+generated under this worktree's `rust/target/`, including the copy of
+`main@fbc196d` used for the differentials, which was extracted with `git
+archive` and built into a target directory of its own rather than by touching
+any other worktree. No `conformance/` file, no `rbench/`, `bench/` or `xbench/`
+file, and no other branch was touched.
