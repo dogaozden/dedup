@@ -2219,9 +2219,25 @@ design, and I checked rather than assumed: eight repeats of `main` against
 itself at the default `-j` gave 348 and 349 on the same tree, and this build
 gave the same two numbers. A comparison there would be measuring the scheduler.
 
-`cargo test` 180 passed against `main@fbc196d`'s 164, counted by building that
+`cargo test` 181 passed against `main@fbc196d`'s 164, counted by building that
 commit rather than by reading the last claim. Clippy and fmt clean, `--gate
 all` 33/33.
+
+### The bug I put in and then found
+
+`multiplier_of` split the suffix with `split_at(1)` — one byte — so
+`--min-size 1€` panicked inside `core::str` rather than being refused. I found
+it reading my own diff for exactly this, which is the only reason to read your
+own diff. A flag value is whatever came off the command line; refusing is an
+answer, falling over is not, on a program that deletes files. It splits by
+character now, and `nothing_a_person_can_type_makes_the_parser_fall_over`
+throws twenty thousand words at it built from digits, dots, signs, spaces, unit
+letters, NUL, Arabic-Indic and fullwidth digits, `€` and an emoji.
+
+The lesson generalises and I went looking: every other index into a `&str` in
+this diff is either a `find` result (a char boundary by construction), a
+`split_once`, or `.chars()`. The pulse's line truncation is `.chars().take()`
+for the same reason.
 
 ### What the regression suites said when I ran them, which is the point of them
 

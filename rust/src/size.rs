@@ -61,8 +61,11 @@ fn multiplier_of(suffix: &str) -> Option<u128> {
     if suffix.is_empty() || suffix == "b" {
         return Some(1);
     }
-    let (letter, dress) = suffix.split_at(1);
-    if !matches!(dress, "" | "b" | "ib") {
+    // By character and not by byte: whatever a person typed lands here, and
+    // splitting `€` down the middle is a panic rather than a refusal.
+    let mut letters = suffix.chars();
+    let letter = letters.next()?;
+    if !matches!(letters.as_str(), "" | "b" | "ib") {
         return None;
     }
     let step = "kmgtpe".find(letter)? + 1;
@@ -236,6 +239,17 @@ mod tests {
             "16e",
             "17e",
             "9999999999999999999999999999999999999999",
+            // Not every word a person types is ASCII, and a size that is not
+            // one has to come back as a refusal rather than as a panic.
+            "1€",
+            "€",
+            "1 €",
+            "1k€",
+            "١٢٣",
+            "1２",
+            "1kв",
+            "🙂",
+            "1 MiB🙂",
         ];
         for text in refused {
             let outcome = parse_size(text);
@@ -248,6 +262,30 @@ mod tests {
         // The line is where u64 stops, not where the digits do.
         assert_eq!(parse_size("15e"), Ok(15 * (1_u64 << 60)));
         assert_eq!(parse_size("1.5e"), Ok(15 * (1_u64 << 60) / 10));
+    }
+
+    #[test]
+    fn nothing_a_person_can_type_makes_the_parser_fall_over() {
+        // A flag value is whatever came off the command line. Refusing is an
+        // answer; panicking is a crash on a program that deletes files.
+        let alphabet: Vec<char> = "0123456789.,-+ kmgtpeKMGTPEbiBIxе€🙂\t\n\u{0}١２"
+            .chars()
+            .collect();
+        let mut seed = 0xDEAD_BEEF_CAFE_F00D_u64;
+        for _ in 0..20000 {
+            let mut word = String::new();
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            for _ in 0..(seed % 12) {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                word.push(alphabet[(seed >> 33) as usize % alphabet.len()]);
+            }
+            // Whatever it decides, it decides without unwinding.
+            let _ = parse_size(&word);
+        }
     }
 
     #[test]

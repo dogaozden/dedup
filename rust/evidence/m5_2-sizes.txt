@@ -11,3 +11,4 @@ $ dedup-rs <tree> --list --min-size '12qb'                 exit=2  dedup-rs: not
 $ dedup-rs <tree> --list --min-size '-1'                   exit=2  dedup-rs: not a size: "-1" — plain bytes or 512k, 100mb, 1.5g
 $ dedup-rs <tree> --list --min-size '1.2.3'                exit=2  dedup-rs: not a size: "1.2.3" — plain bytes or 512k, 100mb, 1.5g
 $ dedup-rs <tree> --list --min-size '18446744073709551616' exit=2  dedup-rs: not a size: "18446744073709551616" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '1€'                   exit=2  dedup-rs: not a size: "1€" — plain bytes or 512k, 100mb, 1.5g

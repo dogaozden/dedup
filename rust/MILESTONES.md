@@ -1848,7 +1848,17 @@ $ dedup-rs <tree> --list --min-size '12qb'                 exit=2  dedup-rs: not
 $ dedup-rs <tree> --list --min-size '-1'                   exit=2  dedup-rs: not a size: "-1" — plain bytes or 512k, 100mb, 1.5g
 $ dedup-rs <tree> --list --min-size '1.2.3'                exit=2  dedup-rs: not a size: "1.2.3" — plain bytes or 512k, 100mb, 1.5g
 $ dedup-rs <tree> --list --min-size '18446744073709551616' exit=2  dedup-rs: not a size: "18446744073709551616" — plain bytes or 512k, 100mb, 1.5g
+$ dedup-rs <tree> --list --min-size '1€'                   exit=2  dedup-rs: not a size: "1€" — plain bytes or 512k, 100mb, 1.5g
 ```
+
+That last line is a bug I put in and found reading my own diff. The suffix was
+split with `split_at(1)` — one *byte* — so `--min-size 1€` panicked inside
+`core::str` instead of being refused. A flag value is whatever came off the
+command line, and a program that deletes files may refuse but may not fall
+over. It splits by character now, and
+`size::tests::nothing_a_person_can_type_makes_the_parser_fall_over` throws
+twenty thousand words built from digits, dots, signs, spaces, unit letters,
+NUL, Arabic-Indic and fullwidth digits, `€` and an emoji at it.
 
 The `--help` line, from `evidence/m5_2-help.txt`:
 
@@ -2001,7 +2011,7 @@ drive that started M5.2.
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 180 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+test result: ok. 181 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
 
 $ cargo clippy --all-targets -- -D warnings
 Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
@@ -2012,7 +2022,7 @@ $ cargo fmt --check
 FMT_EXIT=0
 ```
 
-164 tests on `main@fbc196d`, 180 here — counted by building that commit and
+164 tests on `main@fbc196d`, 181 here — counted by building that commit and
 running its own suite, not by reading the last claim, which said 163 before
 `main` gained one.
 
