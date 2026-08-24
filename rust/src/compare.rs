@@ -153,6 +153,38 @@ fn tags<B>(run: Vec<(usize, B)>) -> Vec<usize> {
     run.into_iter().map(|(tag, _)| tag).collect()
 }
 
+/// What the preliminaries came to: the whole answer, for a group already in
+/// memory, or the open handles and the kept-byte bookkeeping a reading loop
+/// works from.
+enum Prepared {
+    Answered(Settled),
+    Reading(Reading),
+}
+
+/// A group opened and positioned, with whatever the kept bytes could settle
+/// already settled.
+///
+/// Both comparisons start from exactly this. They differ only in the order
+/// they read what is left: lockstep advances every member a chunk at a time,
+/// the spinning sweep holds one member's window and streams the others past
+/// it.
+struct Reading {
+    /// Record index per slot, in `members` order, for the members that opened.
+    opened: Vec<usize>,
+    handles: Vec<Mutex<File>>,
+    /// Kept head bytes, compared here rather than read a second time.
+    prefix: usize,
+    /// Kept tail bytes, which settle the end of the file without reading it.
+    tail: usize,
+    /// Where reading stops so the kept tail is not read twice.
+    limit: Option<usize>,
+    /// One hasher per slot when `learn`, seeded with the kept head; empty
+    /// otherwise.
+    hashers: Vec<Sha256>,
+    /// Slots the kept head could not tell apart, in `members` order.
+    live: Vec<Vec<usize>>,
+}
+
 /// Compare one group of same-size candidates and return the runs that agree to
 /// the last byte.
 pub fn split_identical(
@@ -167,6 +199,22 @@ pub fn split_identical(
     // the pipeline is holding none.
     carried: Vec<Option<File>>,
 ) -> Settled {
+    match prepare(context, records, members, unreadable, pool, carried) {
+        Prepared::Answered(settled) => settled,
+        Prepared::Reading(reading) => lockstep(context, records, chunk, unreadable, pool, reading),
+    }
+}
+
+/// Open the group, compare whatever earlier stages kept of it, and leave the
+/// handles where reading has to start.
+fn prepare(
+    context: &Compare,
+    records: &[FileRec],
+    members: &[usize],
+    unreadable: &mut Vec<String>,
+    pool: Option<&ThreadPool>,
+    carried: Vec<Option<File>>,
+) -> Prepared {
     let mut settled = Settled::default();
 
     // A short file that stage 3 read to its end is already here in full.
@@ -200,7 +248,7 @@ pub fn split_identical(
             }
             settled.matched.push(tags(run));
         }
-        return settled;
+        return Prepared::Answered(settled);
     }
 
     // Every other stage opens in parallel and this one did not: a wide group
@@ -305,7 +353,7 @@ pub fn split_identical(
     // then the tail as each run finishes. A digest built any other way would be
     // remembered as a whole-file digest without being one, and the next scan
     // would match two files on their middles alone.
-    let mut hashers: Vec<Sha256> = if context.learn {
+    let hashers: Vec<Sha256> = if context.learn {
         opened
             .iter()
             .map(|&index| {
@@ -320,7 +368,7 @@ pub fn split_identical(
         Vec::new()
     };
 
-    let mut live: Vec<Vec<usize>> = if opened.len() < 2 {
+    let live: Vec<Vec<usize>> = if opened.len() < 2 {
         Vec::new()
     } else if prefix > 0 {
         partition_blocks(
@@ -338,6 +386,37 @@ pub fn split_identical(
         vec![(0..opened.len()).collect()]
     };
 
+    Prepared::Reading(Reading {
+        opened,
+        handles,
+        prefix,
+        tail,
+        limit,
+        hashers,
+        live,
+    })
+}
+
+/// Advance every member of a group a chunk at a time, splitting it the moment
+/// two of them disagree.
+fn lockstep(
+    context: &Compare,
+    records: &[FileRec],
+    chunk: usize,
+    unreadable: &mut Vec<String>,
+    pool: Option<&ThreadPool>,
+    reading: Reading,
+) -> Settled {
+    let Reading {
+        opened,
+        handles,
+        prefix,
+        tail,
+        limit,
+        mut hashers,
+        mut live,
+    } = reading;
+    let mut settled = Settled::default();
     let mut matched: Vec<Vec<usize>> = Vec::new();
     // Where each handle actually is, counted from the bytes that came back
     // rather than from the bytes asked for: a read stopped short by the end of
