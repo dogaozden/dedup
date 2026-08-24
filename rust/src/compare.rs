@@ -38,6 +38,16 @@ pub struct Compare<'a> {
     /// does not, so a group read here is also a group learned — but only with
     /// a cache to put it in.
     pub learn: bool,
+    /// Where to open this stage's files.
+    ///
+    /// The comparison reads with `sequential_jobs` because it streams whole
+    /// files and that genuinely wants every core. Opening them is the other
+    /// shape — one catalog, and past the performance cores the readers only
+    /// queue deeper. Measured over `widegroup`'s 1,827 files, open and close
+    /// and nothing else, best of nine: **5.54 ms on four readers against
+    /// 10.60 on eight.** So the opens go to the same shallow pool the page
+    /// probes use, and the reads stay where they were.
+    pub open_pool: Option<&'a ThreadPool>,
 }
 
 /// What one comparison settled: the runs that agree to the last byte, and the
@@ -93,9 +103,7 @@ pub fn compare_chunk(profile: Profile, members: usize, solid: bool) -> usize {
 /// wide group of large blocks, this is the whole cost of the stage.
 const PARTITION_SPREAD: usize = 256 * 1024;
 
-fn partition_blocks<B: AsRef<[u8]> + Send + Sync>(
-    items: Vec<(usize, B)>,
-) -> Vec<Vec<(usize, B)>> {
+fn partition_blocks<B: AsRef<[u8]> + Send + Sync>(items: Vec<(usize, B)>) -> Vec<Vec<(usize, B)>> {
     let mut runs: Vec<Vec<(usize, B)>> = Vec::new();
     let mut pending = items;
     while !pending.is_empty() {
@@ -119,7 +127,10 @@ fn partition_blocks<B: AsRef<[u8]> + Send + Sync>(
                 .map(|item| item.1.as_ref() == pivot.1.as_ref())
                 .collect()
         } else {
-            others.iter().map(|item| item.1.as_ref() == pivot.1.as_ref()).collect()
+            others
+                .iter()
+                .map(|item| item.1.as_ref() == pivot.1.as_ref())
+                .collect()
         };
 
         let mut same = vec![pivot];
@@ -209,7 +220,7 @@ pub fn split_identical(
                 .open(&context.root.join(records[index].path()))
                 .ok()
         };
-        match pool {
+        match context.open_pool.or(pool) {
             Some(pool) => pool.install(|| members.par_iter().map(open).collect()),
             None => members.iter().map(open).collect(),
         }
@@ -919,6 +930,7 @@ mod tests {
                     profile: Profile::Flash,
                     solid: true,
                     learn: false,
+                    open_pool: None,
                 },
                 &self.records,
                 &members,
@@ -934,6 +946,7 @@ mod tests {
                     profile: Profile::Spinning,
                     solid: true,
                     learn: false,
+                    open_pool: None,
                 },
                 &self.records,
                 &members,
@@ -1061,6 +1074,7 @@ mod tests {
                 profile: Profile::Spinning,
                 solid: true,
                 learn: false,
+                open_pool: None,
             },
             &bench.records,
             &members,
@@ -1153,6 +1167,7 @@ mod tests {
                 profile: Profile::Spinning,
                 solid: true,
                 learn: false,
+                open_pool: None,
             },
             &bench.records,
             &members,

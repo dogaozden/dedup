@@ -201,6 +201,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                     profile: scan.profile,
                     solid: device.all_solid_state(),
                     learn: false,
+                    // Deletion re-reads a handful of groups; there is no
+                    // second pool here and nothing that would use one.
+                    open_pool: None,
                 };
                 let removal = Removal {
                     rule,
@@ -271,6 +274,7 @@ fn browse(
         profile: scan.profile,
         solid: device.all_solid_state(),
         learn: false,
+        open_pool: None,
     };
     tui::run(scan, proven, root, options.hard, &context, cache)
 }

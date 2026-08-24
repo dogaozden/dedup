@@ -372,6 +372,7 @@ pub fn find_duplicates(
         profile,
         solid: device.all_solid_state(),
         learn: cache.is_some(),
+        open_pool: Some(shallow.pool),
     };
     let sequential_pool = pool_of(sequential_jobs);
     let compared = compare_stage(
