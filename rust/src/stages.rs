@@ -177,6 +177,15 @@ fn probe_one(root: &Path, record: &FileRec, probe: Probe, effort: &Effort) -> Op
 /// Enough batches to keep every reader busy, but no smaller: on a tree of a
 /// hundred thousand small files, one task per file costs more in queueing than
 /// the read it is carrying.
+/// Hash each block where it was read, not on the thread that groups.
+fn hash_keys(pool: &ThreadPool, read: Vec<Option<Vec<u8>>>) -> Vec<Option<(u64, Vec<u8>)>> {
+    pool.install(|| {
+        read.into_par_iter()
+            .map(|block| block.map(|block| (crate::ordered::hash_of(&block), block)))
+            .collect()
+    })
+}
+
 fn batch_span(items: usize, jobs: usize) -> usize {
     HASH_BATCH.min(items.div_ceil(jobs.max(1) * 4)).max(1)
 }
@@ -376,13 +385,16 @@ pub fn small_file_stage(
         let read = read_batched(reader.pool, piece, reader.jobs, |&index| {
             read_whole(reader.root, &records[index], reader.effort)
         });
-        for (&index, content) in piece.iter().zip(read) {
-            let Some(content) = content else {
+        // Hashing the key is a pass over every byte just read, so it happens
+        // on the readers rather than on the one thread that groups.
+        let keyed = hash_keys(reader.pool, read);
+        for (&index, content) in piece.iter().zip(keyed) {
+            let Some((hash, content)) = content else {
                 unreadable.push(records[index].path().to_string());
                 continue;
             };
             let length = content.len();
-            if distinct.push(content, index) {
+            if distinct.push_hashed(hash, content, index) {
                 retained += length;
             }
         }
@@ -413,13 +425,25 @@ pub fn small_file_stage(
         let read = read_batched(reader.pool, piece, reader.jobs, |&index| {
             read_head(reader.root, &records[index], reader.effort)
         });
-        for (&index, head) in piece.iter().zip(read) {
-            let Some(head) = head else {
+        let keyed: Vec<Option<(u64, (u64, Vec<u8>))>> = reader.pool.install(|| {
+            piece
+                .par_iter()
+                .zip(read.into_par_iter())
+                .map(|(&index, head)| {
+                    head.map(|head| {
+                        let key = (records[index].size, head);
+                        (crate::ordered::hash_of(&key), key)
+                    })
+                })
+                .collect()
+        });
+        for (&index, slot) in piece.iter().zip(keyed) {
+            let Some((hash, key)) = slot else {
                 unreadable.push(records[index].path().to_string());
                 continue;
             };
-            let length = head.len();
-            if by_head.push((records[index].size, head), index) {
+            let length = key.1.len();
+            if by_head.push_hashed(hash, key, index) {
                 retained += length;
             }
         }
@@ -449,16 +473,30 @@ pub fn small_file_stage(
         let read = read_batched(reader.pool, piece, reader.jobs, |(_, index)| {
             read_rest(reader.root, &records[*index], reader.effort)
         });
-        for ((head, index), rest) in piece.iter().zip(read) {
-            let Some(rest) = rest else {
+        // The join and the hash are both passes over the whole file, so both
+        // go on the readers.
+        let keyed: Vec<Option<(u64, Vec<u8>)>> = reader.pool.install(|| {
+            piece
+                .par_iter()
+                .zip(read.into_par_iter())
+                .map(|((head, _), rest)| {
+                    rest.map(|rest| {
+                        let mut content = Vec::with_capacity(head.len() + rest.len());
+                        content.extend_from_slice(head);
+                        content.extend_from_slice(&rest);
+                        (crate::ordered::hash_of(&content), content)
+                    })
+                })
+                .collect()
+        });
+        for ((_, index), slot) in piece.iter().zip(keyed) {
+            let Some((hash, content)) = slot else {
                 unreadable.push(records[*index].path().to_string());
                 continue;
             };
-            let mut content = head.clone();
-            content.extend_from_slice(&rest);
             debug_assert_eq!(content.len(), records[*index].size as usize);
             let length = content.len();
-            if distinct.push(content, *index) {
+            if distinct.push_hashed(hash, content, *index) {
                 retained += length;
             }
         }

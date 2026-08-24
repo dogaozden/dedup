@@ -29,7 +29,18 @@ impl<K: Hash + Eq, V> Ordered<K, V> {
     /// Add `value` under `key`. True when this key had not been seen before —
     /// which is when a caller charging a retention budget has to pay for it.
     pub fn push(&mut self, key: K, value: V) -> bool {
-        let hash = hash_of(&key);
+        self.push_hashed(hash_of(&key), key, value)
+    }
+
+    /// `push`, for a caller that already has `hash_of(&key)` in hand.
+    ///
+    /// The small-file stage hashes whole file contents, so the hash is a pass
+    /// over every byte it read and the loop that does it is the one place in
+    /// that stage still running on one thread. Handing the hash in lets the
+    /// caller compute it wherever it read the bytes — the key still decides
+    /// the grouping, and is still compared in full before a match is believed,
+    /// so a wrong hash here could only cost a comparison, never a wrong group.
+    pub fn push_hashed(&mut self, hash: u64, key: K, value: V) -> bool {
         let found = self.index.get(&hash).and_then(|slots| {
             slots
                 .iter()
@@ -54,7 +65,7 @@ impl<K: Hash + Eq, V> Ordered<K, V> {
     }
 }
 
-fn hash_of<K: Hash>(key: &K) -> u64 {
+pub fn hash_of<K: Hash>(key: &K) -> u64 {
     let mut hasher = Fast::default();
     key.hash(&mut hasher);
     hasher.finish()
