@@ -2403,6 +2403,14 @@ is the round-one one — read the absolute time column, then measure the premise
 before writing the refactor.** The refactor here would have touched `FileRec`,
 the walk, `Effort`, and five call sites to buy −4.5%.
 
+**This was already in the rejected list and I did not read it first.** The
+earlier entry says "`openat` on the walk's directory fd — 1.04x at one thread,
+1.00x at four". §12 step 1 exists exactly to stop this, and the excuse
+available to me — that descriptor reuse had landed near it since — is the
+excuse §12 step 1 anticipates. The re-test is a better measurement than the one
+it repeats (three forms, a real corpus, at the thread count the tool uses) and
+it agrees with it to within a point, which is worth something; the hour is not.
+
 
 ## 2026-08-23 — the catalog is the floor: three more measured, none kept
 
