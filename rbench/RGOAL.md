@@ -393,6 +393,7 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 11 | page probes on four readers, deep probes on eight | `cf77d35` | −3.3% A/B; **0.5538** refereed |
 | 12 | IOKit and CoreFoundation `dlopen`ed, not linked | `26f501b` | −1.7% A/B (understated; B was instrumented) |
 | — | remove diagnostic timers committed by accident | `246faf2` | **0.5335** refereed, clean build |
+| 13 | the staged pipeline keeps its descriptors | `b561415` | −3.3% A/B/A; widegroup opens 5,442 → 1,834 |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -2291,6 +2292,77 @@ and not before this one, and `git status` was never read between the two. The
 fix is not a better script, it is reading the diff before committing — the
 removal diff here is nineteen lines of obvious scaffolding that any glance at
 `git diff --staged` would have caught.
+
+## 2026-08-23 — the staged pipeline reopened every file it had just closed
+
+`widegroup` opened 5,442 descriptors to settle 1,827 files. Three of every
+four were the same inode a stage had opened, read a few kilobytes of, and
+dropped a moment earlier: the ends probe opens, the deep-head probe opens the
+same file again, the sample probe a third time, and the comparison a fourth.
+Nothing was wrong with any of them — each stage was written to start from a
+file it had just opened — and together they paid four path resolutions and
+four opens per file to read four pieces of one.
+
+`b561415` threads an `Option<File>` alongside the records. A side table of
+descriptors, one slot per record, is carried into `hash_stage` and
+`compare_stage`; a stage takes the slot's descriptor if there is one, opens if
+there is not, and puts back what it finishes with. Slots are lifted out
+serially before any fan-out and stored back in the serial post-loop, so no two
+readers ever hold the same slot.
+
+Three things had to become explicit that had been implied:
+
+  * **Position.** Every stage used to start from a fresh descriptor, so an
+    offset of zero was assumed rather than asked for. A carried descriptor
+    arrives wherever the last stage stopped, so `probe_one`'s `Ends` and
+    `Head` arms now seek to zero, and the comparison's retained-prefix seek is
+    unconditional with a rewind if it fails.
+  * **A budget.** `HANDLE_BUDGET = 4096` — the table is only built when the
+    staged set fits inside it, and the old open-every-time path is what runs
+    when it does not. The real limits here are far higher (soft `RLIMIT_NOFILE`
+    1,048,576, `kern.maxfilesperproc` 61,440); 4,096 is chosen to leave the
+    rest of the process room, not because anything is near a ceiling. An
+    earlier note in this journal claiming a 256-descriptor limit was wrong.
+  * **Ownership.** `read_batched_owned` takes the items by value so a
+    descriptor can be moved onto a reader and moved back, which the borrowing
+    version could not express.
+
+**Counters.** `widegroup` 5,442 → 1,834 opens, `typical` 13,372 → 13,310. Same
+groups, same bytes, byte-for-byte identical manifests. `opens` is recorded and
+never gated, so this moves nothing a gate reads except by being faster.
+
+**Measured.** Alternating best-of-eleven, two rounds, isolated scenarios:
+
+    round 1   BASE typical 114.5   widegroup 80.9
+              HOLD typical 115.9   widegroup 65.8
+    round 2   BASE typical 118.6   widegroup 92.0
+              HOLD typical 119.3   widegroup 65.1
+
+`widegroup` −24%, `typical` unmoved — which is right: `typical` settles almost
+everything in the small-file stage, and that stage never reopened anything.
+
+**Scored, A/B/A at 21 rounds** (`212d754` → `b561415` → `212d754`):
+
+    scenario      A(old)   B(new)   A2(old)
+    needle        0.9118   0.8723   0.8694
+    typical       0.6856   0.6624   0.6721
+    samesize      0.8037   0.7799   0.7710
+    widegroup     0.4635   0.3922   0.4728
+    photos        0.4996   0.4998   0.4948
+    bigheader     0.5749   0.6071   0.6490
+    rescan        0.4065   0.4027   0.3986
+    SCORE         0.5975   0.5781   0.5977
+
+**−3.3% against the mean of its two controls**, and eight times the ±0.42%
+geomean floor. The two controls landing 0.03% apart is what makes the window
+readable at all: this one was taken with another session's orphaned process
+spinning a core and the load average climbing 3.84 → 8.28 through it, which is
+why every absolute number here is worse than the same commit's quiet-machine
+0.5335. **A/B/A survives that; a single reading would not have.** The refereed
+absolute for this commit is owed and will be taken on a quiet machine — it is
+not quoted here, because the number this window could produce would be a
+measurement of the load.
+
 
 ---
 
