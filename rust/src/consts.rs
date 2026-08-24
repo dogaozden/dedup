@@ -80,11 +80,15 @@ pub const PIVOT_WINDOW: usize = 256 * 1024 * 1024;
 /// the class had already agreed on — so this is the price cap on being wrong
 /// about a group, expressed as a multiple of how right it had been so far.
 ///
-/// Four, not two, because the ceiling is sixteen chunks away and the number of
-/// head movements is what this profile is for: at two the ramp takes four
-/// windows to get there and a 256 MiB file costs five, where at four it costs
-/// three. Measured over the corpora in `pivot_seeks.py`, the whole change is
-/// worth 1.5-2.7x fewer seeks at two and 2.5-4.8x at four.
+/// Four, not two, because the ceiling is sixteen chunks away and head
+/// movements are what this profile is for: at two the ramp takes four windows
+/// to reach it and a 256 MiB file costs five, where at four it costs three.
+///
+/// Measured by `evidence/scripts/pivot_growth.py`, which builds a variant of
+/// this constant at two and reads the same corpora with both: four issues
+/// 1.25x-1.40x fewer head movements and reads exactly the same bytes for them.
+/// Nothing but head movements may move when this changes, and that script
+/// asserts it.
 pub const PIVOT_GROWTH: usize = 4;
 /// How much of a window is read at a time.
 ///

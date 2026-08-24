@@ -1,0 +1,17 @@
+One group of N identical files, --profile spinning, one reader (-j 1).
+Whole-scan counts; stages 1-4 are the same either way.
+
+shape               growth2  growth4 fewer at 4  bytes equal       groups
+3 x 256 MiB              21       15      1.40x         True            1
+2 x 512 MiB              16       12      1.33x         True            1
+4 x 64 MiB               20       16      1.25x         True            1
+
+growth four issues 1.25x to 1.40x fewer head movements than growth two,
+reading exactly the same bytes for them
+
+And the guard that has to notice the ramp moving. `cargo test compare::` in the
+same growth-2 tree — these must FAIL there, or they are not testing boundaries:
+  the_windows_are_where_the_growth_factor_puts_them    FAILED at growth 2, as it must
+  (also failing at growth 2, which is fine: the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window)
+
+four is the better factor, and the guard fails when it changes
