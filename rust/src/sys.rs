@@ -50,44 +50,198 @@ const K_IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
 const K_IO_REGISTRY_ITERATE_PARENTS: u32 = 2;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
-#[link(name = "IOKit", kind = "framework")]
-extern "C" {
-    fn IOBSDNameMatching(
-        main_port: IoObject,
-        options: u32,
-        bsd_name: *const c_char,
-    ) -> *const c_void;
-    fn IOServiceGetMatchingService(main_port: IoObject, matching: *const c_void) -> IoObject;
-    fn IORegistryEntrySearchCFProperty(
+// IOKit and CoreFoundation are loaded on first use rather than linked, and
+// the reason is startup. `otool -L` on a build that links them shows both
+// frameworks plus `libiconv`, and dyld maps and initialises all three before
+// `main` runs: measured on this machine, a C program that does nothing costs
+// 1.349 ms and the same program linked against the two costs 2.136 ms. That
+// 0.787 ms is paid by every scan, and on the short scenarios it is a fifth of
+// process start. Nothing needs the answer until the pools are sized, and
+// `VolumeProbe` already asks for it from a thread, so the load can happen
+// there and overlap the walk instead of preceding it.
+//
+// `-Wl,-lazy_framework` would have been the free version of this and the
+// linker on this machine refuses it: "lazy-load will be ignored ... because
+// deployment target version is too low", at every deployment target tried.
+//
+// Every entry point below keeps the name and signature it had as an `extern`
+// declaration, so no call site knows the difference. A framework that will not
+// load, or a symbol that is not there, leaves `frameworks()` at `None` and
+// each wrapper returns what the real call returns when it fails — which the
+// callers already handle, because a volume that will not answer is a volume
+// this has always had to cope with.
+#[allow(non_snake_case)]
+struct Frameworks {
+    IOBSDNameMatching: unsafe extern "C" fn(IoObject, u32, *const c_char) -> *const c_void,
+    IOServiceGetMatchingService: unsafe extern "C" fn(IoObject, *const c_void) -> IoObject,
+    IORegistryEntrySearchCFProperty:
+        unsafe extern "C" fn(IoObject, *const c_char, CfTypeRef, CfTypeRef, u32) -> CfTypeRef,
+    IOObjectRelease: unsafe extern "C" fn(IoObject) -> c_int,
+    IOObjectConformsTo: unsafe extern "C" fn(IoObject, *const c_char) -> u8,
+    IORegistryEntryGetParentEntry: unsafe extern "C" fn(IoObject, *const c_char, *mut IoObject) -> c_int,
+    CFStringCreateWithCString: unsafe extern "C" fn(CfTypeRef, *const c_char, u32) -> CfTypeRef,
+    CFGetTypeID: unsafe extern "C" fn(CfTypeRef) -> usize,
+    CFDictionaryGetTypeID: unsafe extern "C" fn() -> usize,
+    CFStringGetTypeID: unsafe extern "C" fn() -> usize,
+    CFDictionaryGetValue: unsafe extern "C" fn(CfTypeRef, CfTypeRef) -> CfTypeRef,
+    CFStringGetCString: unsafe extern "C" fn(CfTypeRef, *mut c_char, isize, u32) -> u8,
+    CFRelease: unsafe extern "C" fn(CfTypeRef),
+}
+
+static FRAMEWORKS: std::sync::OnceLock<Option<Frameworks>> = std::sync::OnceLock::new();
+
+fn frameworks() -> Option<&'static Frameworks> {
+    FRAMEWORKS.get_or_init(|| unsafe { load_frameworks() }).as_ref()
+}
+
+/// The handles are deliberately never closed: the process needs them for as
+/// long as it runs, and `dlclose` on a system framework is not something to do
+/// on the way out.
+unsafe fn load_frameworks() -> Option<Frameworks> {
+    unsafe fn open(path: &[u8]) -> *mut c_void {
+        libc::dlopen(path.as_ptr().cast(), libc::RTLD_LAZY)
+    }
+    let iokit = open(b"/System/Library/Frameworks/IOKit.framework/IOKit\0");
+    if iokit.is_null() {
+        return None;
+    }
+    let cf = open(b"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation\0");
+    if cf.is_null() {
+        return None;
+    }
+    macro_rules! sym {
+        ($handle:expr, $name:literal) => {{
+            let found = libc::dlsym($handle, concat!($name, "\0").as_ptr().cast());
+            if found.is_null() {
+                return None;
+            }
+            std::mem::transmute(found)
+        }};
+    }
+    Some(Frameworks {
+        IOBSDNameMatching: sym!(iokit, "IOBSDNameMatching"),
+        IOServiceGetMatchingService: sym!(iokit, "IOServiceGetMatchingService"),
+        IORegistryEntrySearchCFProperty: sym!(iokit, "IORegistryEntrySearchCFProperty"),
+        IOObjectRelease: sym!(iokit, "IOObjectRelease"),
+        IOObjectConformsTo: sym!(iokit, "IOObjectConformsTo"),
+        IORegistryEntryGetParentEntry: sym!(iokit, "IORegistryEntryGetParentEntry"),
+        CFStringCreateWithCString: sym!(cf, "CFStringCreateWithCString"),
+        CFGetTypeID: sym!(cf, "CFGetTypeID"),
+        CFDictionaryGetTypeID: sym!(cf, "CFDictionaryGetTypeID"),
+        CFStringGetTypeID: sym!(cf, "CFStringGetTypeID"),
+        CFDictionaryGetValue: sym!(cf, "CFDictionaryGetValue"),
+        CFStringGetCString: sym!(cf, "CFStringGetCString"),
+        CFRelease: sym!(cf, "CFRelease"),
+    })
+}
+
+// The wrappers. Each one is the call it replaced, or that call's own failure
+// answer when the frameworks are not there.
+#[allow(non_snake_case)]
+mod shim {
+    use super::*;
+
+    pub unsafe fn IOBSDNameMatching(port: IoObject, options: u32, name: *const c_char) -> *const c_void {
+        match frameworks() {
+            Some(f) => (f.IOBSDNameMatching)(port, options, name),
+            None => std::ptr::null(),
+        }
+    }
+    pub unsafe fn IOServiceGetMatchingService(port: IoObject, matching: *const c_void) -> IoObject {
+        match frameworks() {
+            Some(f) => (f.IOServiceGetMatchingService)(port, matching),
+            None => 0,
+        }
+    }
+    pub unsafe fn IORegistryEntrySearchCFProperty(
         entry: IoObject,
         plane: *const c_char,
         key: CfTypeRef,
         allocator: CfTypeRef,
         options: u32,
-    ) -> CfTypeRef;
-    fn IOObjectRelease(object: IoObject) -> c_int;
-    fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> u8;
-    fn IORegistryEntryGetParentEntry(
+    ) -> CfTypeRef {
+        match frameworks() {
+            Some(f) => (f.IORegistryEntrySearchCFProperty)(entry, plane, key, allocator, options),
+            None => std::ptr::null(),
+        }
+    }
+    pub unsafe fn IOObjectRelease(object: IoObject) -> c_int {
+        match frameworks() {
+            Some(f) => (f.IOObjectRelease)(object),
+            None => 0,
+        }
+    }
+    pub unsafe fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> u8 {
+        match frameworks() {
+            Some(f) => (f.IOObjectConformsTo)(object, class_name),
+            None => 0,
+        }
+    }
+    pub unsafe fn IORegistryEntryGetParentEntry(
         entry: IoObject,
         plane: *const c_char,
         parent: *mut IoObject,
-    ) -> c_int;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    fn CFStringCreateWithCString(
+    ) -> c_int {
+        match frameworks() {
+            Some(f) => (f.IORegistryEntryGetParentEntry)(entry, plane, parent),
+            None => -1,
+        }
+    }
+    pub unsafe fn CFStringCreateWithCString(
         allocator: CfTypeRef,
         c_string: *const c_char,
         encoding: u32,
-    ) -> CfTypeRef;
-    fn CFGetTypeID(value: CfTypeRef) -> usize;
-    fn CFDictionaryGetTypeID() -> usize;
-    fn CFStringGetTypeID() -> usize;
-    fn CFDictionaryGetValue(dictionary: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
-    fn CFStringGetCString(value: CfTypeRef, buffer: *mut c_char, size: isize, encoding: u32) -> u8;
-    fn CFRelease(value: CfTypeRef);
+    ) -> CfTypeRef {
+        match frameworks() {
+            Some(f) => (f.CFStringCreateWithCString)(allocator, c_string, encoding),
+            None => std::ptr::null(),
+        }
+    }
+    // The three type-id calls answer distinct nonsense when there is no
+    // CoreFoundation, so that a comparison between them is false rather than
+    // accidentally true.
+    pub unsafe fn CFGetTypeID(value: CfTypeRef) -> usize {
+        match frameworks() {
+            Some(f) => (f.CFGetTypeID)(value),
+            None => 0,
+        }
+    }
+    pub unsafe fn CFDictionaryGetTypeID() -> usize {
+        match frameworks() {
+            Some(f) => (f.CFDictionaryGetTypeID)(),
+            None => 1,
+        }
+    }
+    pub unsafe fn CFStringGetTypeID() -> usize {
+        match frameworks() {
+            Some(f) => (f.CFStringGetTypeID)(),
+            None => 2,
+        }
+    }
+    pub unsafe fn CFDictionaryGetValue(dictionary: CfTypeRef, key: CfTypeRef) -> CfTypeRef {
+        match frameworks() {
+            Some(f) => (f.CFDictionaryGetValue)(dictionary, key),
+            None => std::ptr::null(),
+        }
+    }
+    pub unsafe fn CFStringGetCString(
+        value: CfTypeRef,
+        buffer: *mut c_char,
+        size: isize,
+        encoding: u32,
+    ) -> u8 {
+        match frameworks() {
+            Some(f) => (f.CFStringGetCString)(value, buffer, size, encoding),
+            None => 0,
+        }
+    }
+    pub unsafe fn CFRelease(value: CfTypeRef) {
+        if let Some(f) = frameworks() {
+            (f.CFRelease)(value);
+        }
+    }
 }
+use shim::*;
 
 /// How many cores of the fastest kind this machine has, on a machine whose
 /// cores are not all alike.
