@@ -5,34 +5,47 @@ for comparison with M6, whose table read flash against spinning.
 Whole-scan counts: stages 1-4 are untouched by this branch and cost a head movement
 per file between them, so the stage-5 ratio is higher than the column below.
 
-shape               groups  flash   main   ours vs main vs flash     opens
-one-wide-group           1   1668     89     48    1.9x    34.8x    25->12
-several-groups           3   3210    192    120    1.6x    26.8x    63->30
-few-and-long             2   3138    114     30    3.8x   104.6x     12->6
-one-long-pair            1   2070     70     12    5.8x   172.5x      4->2
-parting-groups           3   2504    166    108    1.5x    23.2x    47->19
-small-and-many           4    816     80     64    1.2x    12.8x    32->16
-classes-in-one-run       4    112     73     72    1.0x     1.6x    40->16
+shape                  groups  flash   main   ours vs main vs flash     opens
+one-wide-group              1   1668     89     48    1.9x    34.8x    25->12
+several-groups              3   3210    192    120    1.6x    26.8x    63->30
+few-and-long                2   3138    114     30    3.8x   104.6x     12->6
+one-long-pair               1   2070     70     12    5.8x   172.5x      4->2
+parting-groups              3   2504    166    108    1.5x    23.2x    47->19
+small-and-many              4    816     80     64    1.2x    12.8x    32->16
+classes-in-one-run          4    112     73     72    1.0x     1.6x    40->16
+three-way-in-one-run        3     90     24     24    1.0x     3.8x     12->6
+strangers-of-one-size       0     16     24     51    0.5x     0.3x     16->8
 
-shape                what it is
-  one-wide-group     one group of 12 x 64 MiB
-  several-groups     3 groups of 10 x 48 MiB
-  few-and-long       2 groups of 3 x 256 MiB
-  one-long-pair      one group of 2 x 512 MiB
-  parting-groups     3 bands of 6 x 64 MiB sharing 40 MiB, plus one unique
-  small-and-many     4 groups of 4 x 20 MiB
-  classes-in-one-run 16 x 2 MiB in 4 classes, parting in the last kilobyte
+shape                    what it is
+  one-wide-group         one group of 12 x 64 MiB
+  several-groups         3 groups of 10 x 48 MiB
+  few-and-long           2 groups of 3 x 256 MiB
+  one-long-pair          one group of 2 x 512 MiB
+  parting-groups         3 bands of 6 x 64 MiB sharing 40 MiB, plus one unique
+  small-and-many         4 groups of 4 x 20 MiB
+  classes-in-one-run     16 x 2 MiB in 4 classes, parting in the last kilobyte
+  three-way-in-one-run   3 pairs of 6 MiB parting inside one run
+  strangers-of-one-size  8 x 4 MiB, every one its own class
 
 bytes. SPIN.md lets `spinning` read MORE than the profile the gate grades — it trades bytes for seeks by design — so what matters here is this branch against main, which is the sweep it replaces:
-  shape                  flash MiB      main MiB       our MiB ours/main
-  one-wide-group             774.0         831.9         768.0     0.92x
-  several-groups            1455.0        1583.8        1440.0     0.91x
-  few-and-long              1539.0        1536.0        1536.0     1.00x
-  one-long-pair             1025.0        1024.0        1024.0     1.00x
-  parting-groups            1161.0        1695.8        1194.6     0.70x
-  small-and-many             328.0         320.0         320.0     1.00x
-  classes-in-one-run          32.0          47.5          33.5     0.71x
+  shape                      flash MiB      main MiB       our MiB ours/main
+  one-wide-group                 774.0         831.9         768.0     0.92x
+  several-groups                1455.0        1583.8        1440.0     0.91x
+  few-and-long                  1539.0        1536.0        1536.0     1.00x
+  one-long-pair                 1025.0        1024.0        1024.0     1.00x
+  parting-groups                1161.0        1695.8        1194.6     0.70x
+  small-and-many                 328.0         320.0         320.0     1.00x
+  classes-in-one-run              32.0          47.5          33.5     0.71x
+  three-way-in-one-run            36.0          36.0          36.4     1.01x
+  strangers-of-one-size            0.1          32.0          33.7     1.05x
 
-seeks: between 1.0x and 5.8x fewer than main on every shape above
+On THESE shapes, and only these: seeks between 0.5x and 5.8x main's
+(below 1.0x means MORE head movements than main), bytes between 0.70x and 1.05x
+of main's (above 1.00x means MORE bytes).
+Neither range is a universal. SPIN.md lets `spinning` read more and seek more;
+the shapes below are where this sweep does, and they are in the corpus on purpose.
+  reads more than main: three-way-in-one-run, strangers-of-one-size
+  seeks more than main: strangers-of-one-size
+
 groups identical across main, this branch, and --profile flash, on every shape
 HDD wall-clock unvalidated: no rotational drive is available here.

@@ -16,6 +16,13 @@ property of the pipeline and repeat exactly, which each shape is checked for.
 grades, and every shape asserts that all three runs report the same groups. A
 seek count is worth nothing if the answer moved.
 
+The corpus deliberately contains shapes the sweep is BAD at as well as shapes
+it exists for. `classes-in-one-run`, `three-way-in-one-run` and
+`strangers-of-one-size` cost more bytes or more head movements than the
+comparison this replaces; SPIN.md permits that in terms, and a corpus without
+them would let a ratio measured on seven friendly shapes be written down as a
+universal. REVIEW-M7 made that binding after REVIEW-M6 raised it as a note.
+
 No wall clock is measured here and none is claimed. SPIN.md forbids an HDD
 speed claim without an HDD, and no rotational drive is available to an agent.
 
@@ -127,6 +134,38 @@ def classes_in_one_run(root: str) -> str:
     return "16 x 2 MiB in 4 classes, parting in the last kilobyte"
 
 
+def three_way_in_one_run(root: str) -> str:
+    """Three classes that all part from each other inside a single run.
+
+    Here the sweep costs MORE than the comparison it replaces, and it is in the
+    table for that reason. Every class needs a pass of its own, and a member
+    that parts is read to the end of its 128 KiB run and then reads that run
+    again when its class is regrouped. REVIEW-M7 found this shape at 1.04x
+    bytes and required the claim to stop saying "every shape".
+    """
+    shared = page(80) * (6 * MIB // 4096)
+    for band in range(3):
+        body = bytes(shared[:-4096]) + bytes([70 + band]) * 4096
+        copies(root, "t{}c".format(band), body, 2)
+    return "3 pairs of 6 MiB parting inside one run"
+
+
+def strangers_of_one_size(root: str) -> str:
+    """Eight same-size files that are all different.
+
+    The worst shape for a pivot loop: each pass strips exactly one class, so
+    eight files cost eight passes. It costs more seeks here than main's capped
+    cohorts do at this width, and it is the small-N end of the pre-existing
+    super-linear behaviour both spinning comparisons have.
+    """
+    shared = page(90) * (4 * MIB // 4096)
+    for index in range(8):
+        body = bytes(shared[:-8]) + bytes([index]) * 8
+        with open(os.path.join(root, "s{:02d}.bin".format(index)), "wb") as fh:
+            fh.write(body)
+    return "8 x 4 MiB, every one its own class"
+
+
 SHAPES = [
     ("one-wide-group", one_wide_group),
     ("several-groups", several_groups),
@@ -135,6 +174,8 @@ SHAPES = [
     ("parting-groups", parting_groups),
     ("small-and-many", small_and_many),
     ("classes-in-one-run", classes_in_one_run),
+    ("three-way-in-one-run", three_way_in_one_run),
+    ("strangers-of-one-size", strangers_of_one_size),
 ]
 
 
@@ -180,7 +221,7 @@ def main() -> int:
     print("Whole-scan counts: stages 1-4 are untouched by this branch and cost "
           "a head movement\nper file between them, so the stage-5 ratio is "
           "higher than the column below.\n")
-    print("{:<19} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>9}".format(
+    print("{:<22} {:>6} {:>6} {:>6} {:>6} {:>7} {:>8} {:>9}".format(
         "shape", "groups", "flash", "main", "ours", "vs main", "vs flash",
         "opens"))
     rows = []
@@ -199,40 +240,52 @@ def main() -> int:
             opens = "{}->{}".format(old["opens"], new["opens"])
         else:
             opens = str(new["opens"])
-        print("{:<19} {:>6} {:>6} {:>6} {:>6} {:>6.1f}x {:>7.1f}x {:>9}".format(
+        print("{:<22} {:>6} {:>6} {:>6} {:>6} {:>6.1f}x {:>7.1f}x {:>9}".format(
             name, len(new["groups"]), flash["seeks"], old["seeks"], new["seeks"],
             old["seeks"] / max(new["seeks"], 1),
             flash["seeks"] / max(new["seeks"], 1), opens))
         rows.append((name, described, old, new, flash))
         shutil.rmtree(root, ignore_errors=True)
 
-    print("\nshape                what it is")
+    print("\nshape                    what it is")
     for name, described, _, _, _ in rows:
-        print("  {:<18} {}".format(name, described))
+        print("  {:<22} {}".format(name, described))
 
     print("\nbytes. SPIN.md lets `spinning` read MORE than the profile the gate "
           "grades — it trades bytes for seeks by design — so what matters here "
           "is this branch against main, which is the sweep it replaces:")
-    print("  {:<18} {:>13} {:>13} {:>13} {:>9}".format(
+    print("  {:<22} {:>13} {:>13} {:>13} {:>9}".format(
         "shape", "flash MiB", "main MiB", "our MiB", "ours/main"))
     for name, _, old, new, flash in rows:
-        print("  {:<18} {:>13.1f} {:>13.1f} {:>13.1f} {:>8.2f}x".format(
+        print("  {:<22} {:>13.1f} {:>13.1f} {:>13.1f} {:>8.2f}x".format(
             name, flash["bytes_read"] / MIB, old["bytes_read"] / MIB,
             new["bytes_read"] / MIB,
             new["bytes_read"] / max(old["bytes_read"], 1)))
 
     shutil.rmtree(BASE, ignore_errors=True)
-    worst = min(o["seeks"] / max(n["seeks"], 1) for _, _, o, n, _ in rows)
-    best = max(o["seeks"] / max(n["seeks"], 1) for _, _, o, n, _ in rows)
-    print("\nseeks: between {:.1f}x and {:.1f}x fewer than main on every shape "
-          "above".format(worst, best))
+    seek_ratios = [(name, o["seeks"] / max(n["seeks"], 1))
+                   for name, _, o, n, _ in rows]
+    byte_ratios = [(name, n["bytes_read"] / max(o["bytes_read"], 1))
+                   for name, _, o, n, _ in rows]
+    worse_seeks = [name for name, r in seek_ratios if r < 1.0]
+    worse_bytes = [name for name, r in byte_ratios if r > 1.0]
+
+    print("\nOn THESE shapes, and only these: seeks between {:.1f}x and {:.1f}x "
+          "main's\n(below 1.0x means MORE head movements than main), bytes "
+          "between {:.2f}x and {:.2f}x\nof main's (above 1.00x means MORE "
+          "bytes).".format(
+              min(r for _, r in seek_ratios), max(r for _, r in seek_ratios),
+              min(r for _, r in byte_ratios), max(r for _, r in byte_ratios)))
+    print("Neither range is a universal. SPIN.md lets `spinning` read more and "
+          "seek more;\nthe shapes below are where this sweep does, and they are "
+          "in the corpus on purpose.")
+    print("  reads more than main: {}".format(", ".join(worse_bytes) or "none"))
+    print("  seeks more than main: {}".format(", ".join(worse_seeks) or "none"))
+
     if wrong:
-        print("{} shape(s) wrong".format(wrong))
+        print("\n{} shape(s) wrong".format(wrong))
         return 1
-    if worst <= 1.0:
-        print("a shape did not improve")
-        return 1
-    print("groups identical across main, this branch, and --profile flash, "
+    print("\ngroups identical across main, this branch, and --profile flash, "
           "on every shape")
     print("HDD wall-clock unvalidated: no rotational drive is available here.")
     return 0
