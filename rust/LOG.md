@@ -2408,8 +2408,15 @@ Windows doubling took four steps to reach the ceiling, and a 256 MiB file cost
 five windows. Growing by four costs three, and the waste on a class that falls
 apart is still bounded — a window is at most N times the bytes the class had
 already agreed on, so the growth factor IS the price cap on being wrong.
-Measured over `pivot_seeks.py`'s corpora the change is worth 1.5-2.7x fewer
-seeks at two against 1.0-5.8x at four.
+
+I wrote that ruling down as a measured seek ratio and it was not one: what I
+had measured was the whole feature against `main` at two different settings of
+the constant, which is not the same question, and the two places I wrote it
+down did not even agree with each other. REVIEW-M7 caught it. `pivot_growth.py`
+is the measurement the ruling always needed — a growth-two build of this branch
+against the tip, same corpora, cold, one reader: 1.25x-1.40x fewer head
+movements at four, bytes and groups identical. The decision was right and the
+record was wrong, which is its own kind of defect.
 
 ### What I did not do
 
@@ -2431,3 +2438,71 @@ test, whose operands became const-foldable at the round-2 merge). The maintainer
 fixed that on main and I cherry-picked it; the side-by-side capture in
 `m7-standards.txt` stays, because a claim that says "clippy is green" should be
 able to show what it was before.
+
+## 2026-08-24 — REVIEW-M7, the fix round
+
+CHANGES on three binding items, no design objection. The reviewer derived the
+never-read-again inference independently and could not break it, so the sweep
+stands; all three items were the record. The release binary's SHA-256 is
+unchanged across this whole round, which is the shortest way to say what it did
+and did not touch.
+
+### The pattern worth killing
+
+Binding 1 was "bytes are equal or lower on every shape", a universal induced
+from seven shapes, in the same claim where I had correctly hedged the seeks
+range two paragraphs below it. So I knew the move. I hedged the number I had
+thought hard about and stated the other one as a law, because it was the one
+that flattered the work. REVIEW-M6 raised the same thing as a note and it came
+back binding.
+
+Prose was the cheap fix and not the real one: the corpus was the defect. Seven
+shapes, all chosen from the set the feature is good at. `pivot_seeks.py` now
+carries `three-way-in-one-run` (1.01x main's bytes) and `strangers-of-one-size`
+(1.05x the bytes and 51 head movements against main's 24) — written from the
+reviewer's findings and measured here independently, landing on the reviewer's
+24 → 51 exactly. The script's gate changed too: it used to fail if any shape
+failed to improve, which is a gate only a friendly corpus can satisfy.
+
+**The rule I am taking from this:** a benchmark corpus that contains no shape
+the change is bad at is not a measurement, it is an argument. Put the bad shape
+in before quoting the range.
+
+### The one that could have cost data
+
+Binding 3. When I changed `PIVOT_GROWTH` from 2 to 4 I updated the arithmetic
+in the seek test two lines below the comment and never looked at the test named
+`a_divergence_on_a_window_boundary_splits_the_group`. It kept passing, because
+correctness does not depend on where the window boundaries are — so it walked
+`3C`, `7C` and `15C`, which had stopped being boundaries, and never touched
+`5C`, which had become one. A green test that guards nothing, on the surface
+where a false merge deletes a file.
+
+Boundaries are derived from the constants now, and the geometry is *measured*
+(a pair of identical files costs one head movement per member per window, so
+the seek count says how many windows there really were) and held against the
+derivation. And because a derivation alone would have silently retargeted
+itself the same way, the test also pins `PIVOT_GROWTH == 4` and the resulting
+offsets outright, so changing the factor fails there with a reader's attention
+on it. `pivot_growth.py` builds a growth-2 tree and requires that failure.
+
+**The rule:** when a constant moves, grep for every test whose *name* describes
+a consequence of it, not just the ones that fail.
+
+### And the record that was not reproducible
+
+Binding 2: `PIVOT_GROWTH = 4`'s justification was written as a measured seek
+ratio in two places that disagreed with each other, and no committed script
+varied the constant — I had measured the whole feature against `main` at two
+settings, which is a different question. `pivot_growth.py` is the measurement
+the ruling always needed: 1.25x-1.40x fewer head movements at four, identical
+bytes and groups. Same figure the reviewer got separately.
+
+### Also
+
+`claim_audit.py` exists now (the reviewer's non-binding note 2) and caught a
+stale quote of mine within a minute — I had re-run `pivot_seeks.py` and not
+re-synced the claim, which is REVIEW-M5_2's note 1 happening to me while I was
+writing about REVIEW-M5_2's note 1. It reports four unbacked blocks in older
+claims, which are other milestones' and left alone. `m7_gate.sh` now diffs its
+two `/Volumes` listings instead of narrating them.
