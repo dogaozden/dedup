@@ -673,3 +673,32 @@ completion and `m5_end_to_end.py` against both builds, take or decline the
 non-binding notes in writing, and re-claim M5.2. The milestone needs nothing
 else — the grammar, the humaniser split, the pulse and its inertness are all
 sound, and I could not break any of them.
+
+---
+
+## Re-review closure — 2026-08-24, maintainer
+
+The fix round landed as `285d381`: both binding items implemented with the
+recipes above, notes 2–4 taken in writing, note 6 left alone as instructed,
+and the builder's self-audit converted fifteen unbacked evidence lines into
+`m5_2_signals.py`, now a gate.
+
+The reviewer began the re-review and confirmed both fixes match its own
+recipes verbatim, then was terminated mid-verification by a server-side API
+error before it could run its independent sabotage pass. Rather than
+restart the review, the maintainer completed the remaining verification on
+the MERGED tree (`c3a8750`, main):
+
+- `cargo test`: 182 passed, 0 failed. clippy `-D warnings` clean,
+  `fmt --check` clean.
+- `menu_mutants.py`: every mutant was caught, 8 of 8 — including both
+  whole-program terminal-death mutants (hangup/menu SPINNING, exit-101).
+- `m5_end_to_end.py`: 0 checks differing, browser reached in every case.
+- `conformance --gate all` (templated `{stage}` form): 33 checks, 0 failed,
+  green.
+
+**M5.2 is APPROVED and merged.** The re-review's one unfinished step — the
+reviewer re-running its own suppressed-Enter sabotage rather than trusting
+the builder's capture — is recorded here as completed only in the builder's
+captured form (26 differing, 9 NOT REACHED); the maintainer judged the
+mutant battery and live e2e re-runs above sufficient corroboration.
