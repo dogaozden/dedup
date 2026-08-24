@@ -32,8 +32,8 @@ NFILES=$(wc -l < "$FLIST" | tr -d ' ')
 rm -f "$FLIST"
 log "$NFILES files"
 if [[ "$NFILES" -lt 100 ]]; then
-  log "WARNING: only $NFILES files in this tree — too small to measure anything."
-  log "Pick a subtree with thousands of files (2-10 GB) and rerun."
+  log "NOTE: only $NFILES files — walk numbers won't mean much here."
+  log "(Fine for a compare-heavy corpus of few large files; otherwise pick a bigger subtree.)"
 fi
 
 run_scan() {  # run_scan <label> <extra flags...>

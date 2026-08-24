@@ -51,9 +51,33 @@ flattery, recorded here so nobody quotes it.
    whether a small queue depth (2–8 readers) beats one reader on real
    rust even for the seek-averse strategy.
 
-## Still owed
+## Round 2 — the compare-heavy test (dupetest, 20:20 / 20:23)
 
-- A duplicate-heavy subtree (many same-size candidates — the workload
-  that originally sat at "95%, comparing") to give the compare-stage
-  profile a real test.
-- The whole-drive overnight run (spinning profile, caffeinate).
+tools/passport-make-dupes.sh wrote 6 same-size groups of 4×96 MB to the
+drive (three identical + a near-miss differing only in the final MiB),
+so byte-exact proving must read ~2.25 GB. Drive ejected and re-attached
+before each half.
+
+| run | scan |
+|---|---|
+| spinning, cold | 39.22 s |
+| flash, cold | 40.95 s |
+| first cache-on scan (populates cache) | 41.86 s |
+| second cache-on scan | **0.010 s** |
+
+**Verdict: the profiles tie (4%) even on the workload the spinning
+profile was designed for.** Both move ~57 MB/s effective — lockstep
+compare across four same-size streams seeks between them regardless of
+scheduling, and flash's eight parallel readers give the drive's own
+queue as much reordering freedom as spinning's one careful reader. M6
+status: counters and profile machinery validated, wall-clock advantage
+DOES NOT EXIST on this hardware. The cache is the HDD product: first
+scan ≈ physics, every later scan ≈ free (4,000×).
+
+Follow-ups this creates:
+- Soften the unknown-media hint: it promises "far fewer seeks", which
+  users read as faster; measurement says the wall-clock is the same.
+- The whole-drive overnight run remains open (either profile — they
+  cost the same).
+- Cleanup owed on the drive: `rm -rf "/Volumes/My New
+  Passport/dedup-dupetest"` (user-run).

@@ -1,0 +1,32 @@
+== passport measurement Sun Aug 23 20:20:28 EDT 2026 ==
+tree: /Volumes/My New Passport/dedup-dupetest
+binary: /Users/dogaozden/.local/bin/dedup (dedup-rs — find byte-exact duplicate files.)
+
+== drive info (read-only) ==
+   Device Node:               /dev/disk5s1
+   Volume Name:               My New Passport
+   File System Personality:   APFS
+   Protocol:                  USB
+   SMART Status:              Not Supported
+   Disk Size:                 5.0 TB (5000946233344 Bytes) (exactly 9767473112 512-Byte-Units)
+   Solid State:               Info not available
+
+== walk only (metadata seeks) ==
+-- find, cold-ish:
+find "$TREE" -type f 2> /dev/null > "$FLIST"  0.00s user 0.00s system 1% cpu 0.150 total
+24 files
+WARNING: only 24 files in this tree — too small to measure anything.
+Pick a subtree with thousands of files (2-10 GB) and rerun.
+
+== spinning profile ==
+$ dedup <tree> --list --no-cache --profile spinning --min-size 1048576
+  0.09s user 0.36s system 1% cpu 39.215 total
+
+== warm re-scan (cache on) ==
+$ dedup <tree> --list   (twice; second one shows the cache)
+dedup-rs: this volume does not say whether it spins, so the scan is reading it as flash. If it is a USB hard disk, --profile spinning will read it in far fewer seeks.
+"$BIN" "$TREE" --list --min-size 1048576 > /dev/null  3.76s user 0.40s system 9% cpu 41.862 total
+dedup-rs: this volume does not say whether it spins, so the scan is reading it as flash. If it is a USB hard disk, --profile spinning will read it in far fewer seeks.
+"$BIN" "$TREE" --list --min-size 1048576 > /dev/null  0.00s user 0.00s system 72% cpu 0.010 total
+
+== done — results in passport-measure-20260823-2020.txt ==
