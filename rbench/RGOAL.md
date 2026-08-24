@@ -391,6 +391,7 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 9 | parallel opens + no copies in the compare setup | `5dbe9d6` | −6.2% A/B; **0.5717** refereed |
 | 10 | hash the small-file keys on the readers | `b0c3b72` | −2.1% A/B; **0.5529** refereed |
 | 11 | page probes on four readers, deep probes on eight | `cf77d35` | −3.3% A/B; **0.5538** refereed |
+| 12 | IOKit and CoreFoundation `dlopen`ed, not linked | `26f501b` | −1.7% A/B; **0.5405** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -2190,6 +2191,75 @@ read is **not** rayon, **not** the per-slot lock, **not** the seek mutex and
 **not** the allocator. Four candidates eliminated with numbers. Whatever the
 2x against the C probe is, it is inside `read(2)` on this filesystem, and I did
 not find it.
+
+## 2026-08-23 — two frameworks that loaded before every scan and were wanted by none of it
+
+**Change:** `rust/src/sys.rs`. IOKit and CoreFoundation are `dlopen`ed on first
+use instead of linked.
+
+Round two's second win replaced a `diskutil` subprocess with the IOKit
+registry, and paid for it in linkage nobody noticed. dyld maps and initialises
+both frameworks before `main` runs, every scan, wanted or not:
+
+```
+  a C program that does nothing              1.349 ms
+  the same program +IOKit +CoreFoundation    2.136 ms
+```
+
+0.787 ms on every run. `samesize` had reached the point where that mattered:
+its stages are all within a millisecond of their measured floors — `hash_ends`
+6.90 ms against 5.9, `walk` 1.35, `compare` 2.67 — and **process start is
+4.9 ms of its 17.5 ms wall**. There was nothing else left to take there.
+
+Nothing needs the device's answer until the pools are sized, and `VolumeProbe`
+already asks from a thread, so the load belongs on that thread where it
+overlaps the walk. The thirteen entry points are `dlsym`ed once behind a
+`OnceLock` and wrapped in functions keeping the exact names and signatures they
+had as `extern` declarations, so **not one call site changed**. When a
+framework will not load the table stays `None` and each wrapper returns what
+the real call returns on failure — which the callers already handle, since a
+volume that will not report is a case this has always had.
+
+`-Wl,-lazy_framework` is the free version and this linker refuses it — "lazy-
+load will be ignored ... because deployment target version is too low", at
+every deployment target tried.
+
+```
+  otool -L before:  IOKit, CoreFoundation, libiconv, libSystem
+  otool -L after:   libiconv, libSystem
+
+  dedup-rs --help       2.795 ms -> 1.865 ms
+  dedup-rs, empty tree  2.670 ms -> 1.771 ms
+```
+
+0.899 ms, more than the 0.787 the frameworks cost on their own.
+
+**Numbers.** A/B/A at 21 rounds, **-1.7%**, and the two controls landed 0.06%
+apart — the tightest pair of the round:
+
+```
+  scenario      A         B         A2       B vs mean
+  needle      0.7156    0.7017    0.6778      +0.7%
+  typical     0.4915    0.5121    0.5136      +1.9%
+  samesize    0.7470    0.7195    0.7287      -2.5%
+  widegroup   0.4717    0.4920    0.4954      +1.7%
+  photos      0.4497    0.4371    0.4609      -4.0%
+  bigheader   0.6274    0.5957    0.5948      -2.5%
+  rescan      0.3805    0.3566    0.3848      -6.8%
+  SCORE       0.5395    0.5304    0.5392      -1.7%
+```
+
+The signature is exactly what a fixed cost coming off the front should look
+like: `rescan`, `photos`, `bigheader` and `samesize` — the four scenarios where
+start is a fifth to a third of the wall — all move, and the long ones do not.
+
+Confirmed at `--seed 2`: **0.5282**. Refereed at 21 rounds: **0.5405**, every
+gate green.
+
+The test that mattered was already in the tree: `sys::agreement` checks the
+registry's answer against what `diskutil info` prints, and it passes unchanged.
+That is the thing to verify when you move an FFI boundary — not that it
+compiles, but that it still answers the same.
 
 ---
 
