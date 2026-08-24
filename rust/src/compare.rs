@@ -88,16 +88,45 @@ pub fn compare_chunk(profile: Profile, members: usize, solid: bool) -> usize {
 ///
 /// That stays byte-exact. A digest only picks which slot to look in — equality
 /// still decides, because each slot is re-partitioned by the same pivot loop.
-fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> {
-    let mut runs: Vec<Vec<(usize, Vec<u8>)>> = Vec::new();
+/// Below this many bytes in a pass, the pivot comparison is done on one
+/// thread: splitting it costs more than the `memcmp` saves. Above it, on a
+/// wide group of large blocks, this is the whole cost of the stage.
+const PARTITION_SPREAD: usize = 256 * 1024;
+
+fn partition_blocks<B: AsRef<[u8]> + Send + Sync>(items: Vec<(usize, B)>) -> Vec<Vec<(usize, B)>> {
+    let mut runs: Vec<Vec<(usize, B)>> = Vec::new();
     let mut pending = items;
     while !pending.is_empty() {
-        let mut rest = Vec::new();
         let mut iter = pending.into_iter();
-        let mut same = vec![iter.next().expect("pending is not empty")];
-        for item in iter {
-            let equal = item.1 == same[0].1;
-            if equal {
+        let pivot = iter.next().expect("pending is not empty");
+        let others: Vec<(usize, B)> = iter.collect();
+
+        // Every block is compared against the pivot and against nothing else,
+        // so the comparisons are independent — and on a wide group of large
+        // blocks they are the whole of what this stage does: `widegroup` puts
+        // 227 blocks of a quarter of a megabyte through here, per group, and
+        // used to do it on one thread.
+        //
+        // The verdicts are collected in order and the split is done after, so
+        // a run holds its members in the same order it always did. Nothing but
+        // the `memcmp` moves.
+        let bytes = others.len().saturating_mul(pivot.1.as_ref().len());
+        let equal: Vec<bool> = if bytes >= PARTITION_SPREAD {
+            others
+                .par_iter()
+                .map(|item| item.1.as_ref() == pivot.1.as_ref())
+                .collect()
+        } else {
+            others
+                .iter()
+                .map(|item| item.1.as_ref() == pivot.1.as_ref())
+                .collect()
+        };
+
+        let mut same = vec![pivot];
+        let mut rest = Vec::new();
+        for (item, alike) in others.into_iter().zip(equal) {
+            if alike {
                 same.push(item);
             } else {
                 rest.push(item);
@@ -106,9 +135,9 @@ fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> 
         let lone = same.len() == 1;
         runs.push(same);
         if lone && rest.len() > PARTITION_FANOUT {
-            let mut by_digest: Ordered<Digest, (usize, Vec<u8>)> = Ordered::new();
+            let mut by_digest: Ordered<Digest, (usize, B)> = Ordered::new();
             for item in rest {
-                by_digest.push(sha256(&item.1), item);
+                by_digest.push(sha256(item.1.as_ref()), item);
             }
             for slot in by_digest.into_values() {
                 runs.extend(partition_blocks(slot));
@@ -120,7 +149,7 @@ fn partition_blocks(items: Vec<(usize, Vec<u8>)>) -> Vec<Vec<(usize, Vec<u8>)>> 
     runs
 }
 
-fn tags(run: Vec<(usize, Vec<u8>)>) -> Vec<usize> {
+fn tags<B>(run: Vec<(usize, B)>) -> Vec<usize> {
     run.into_iter().map(|(tag, _)| tag).collect()
 }
 
@@ -133,6 +162,10 @@ pub fn split_identical(
     chunk: usize,
     unreadable: &mut Vec<String>,
     pool: Option<&ThreadPool>,
+    // One slot per member, in `members` order: the descriptor the staged
+    // probes left open on that file, or `None` to open it here. Empty when
+    // the pipeline is holding none.
+    carried: Vec<Option<File>>,
 ) -> Settled {
     let mut settled = Settled::default();
 
@@ -150,7 +183,7 @@ pub fn split_identical(
             .iter()
             .map(|&index| {
                 let record = &records[index];
-                (index, record.head()[..record.size as usize].to_vec())
+                (index, &record.head()[..record.size as usize])
             })
             .collect();
         for run in partition_blocks(blocks) {
@@ -160,7 +193,7 @@ pub fn split_identical(
             if context.learn {
                 // The whole file is in hand and it matched, so this is the
                 // same proof the reading path produces, learned for free.
-                let digest = sha256(&run[0].1);
+                let digest = sha256(run[0].1);
                 settled
                     .learned
                     .extend(run.iter().map(|&(index, _)| (index, digest)));
@@ -170,18 +203,39 @@ pub fn split_identical(
         return settled;
     }
 
+    // Every other stage opens in parallel and this one did not: a wide group
+    // is a thousand-odd opens on one thread while eight readers wait for it.
+    // Collected in `members` order, so which file lands in which slot — and
+    // the order `unreadable` is appended in — is what it always was.
+    let files: Vec<Option<File>> = {
+        // A descriptor the probes already opened is reused; the rest are
+        // opened here, in parallel, as they were.
+        let paired: Vec<(usize, Option<File>)> = if carried.len() == members.len() {
+            members.iter().copied().zip(carried).collect()
+        } else {
+            members.iter().copied().map(|index| (index, None)).collect()
+        };
+        let open = |(index, file): (usize, Option<File>)| match file {
+            Some(file) => Some(file),
+            None => context
+                .effort
+                .open(&context.root.join(records[index].path()))
+                .ok(),
+        };
+        match pool {
+            Some(pool) => pool.install(|| paired.into_par_iter().map(open).collect()),
+            None => paired.into_iter().map(open).collect(),
+        }
+    };
     let mut opened: Vec<usize> = Vec::new();
     let mut handles: Vec<Mutex<File>> = Vec::new();
-    for &index in members {
-        match context
-            .effort
-            .open(&context.root.join(records[index].path()))
-        {
-            Ok(file) => {
+    for (&index, file) in members.iter().zip(files) {
+        match file {
+            Some(file) => {
                 opened.push(index);
                 handles.push(Mutex::new(file));
             }
-            Err(_) => unreadable.push(records[index].path().to_string()),
+            None => unreadable.push(records[index].path().to_string()),
         }
     }
 
@@ -217,12 +271,22 @@ pub fn split_identical(
             }
         }
     }
-    if prefix > 0 {
+    // Always positioned explicitly: a descriptor handed over by the probes is
+    // wherever that probe left it, not at zero.
+    {
+        let mut failed = false;
         for handle in &handles {
             let mut file = handle.lock().expect("no reader panics");
             if file.seek(SeekFrom::Start(prefix as u64)).is_err() {
-                prefix = 0;
+                failed = true;
                 break;
+            }
+        }
+        if failed {
+            prefix = 0;
+            for handle in &handles {
+                let mut file = handle.lock().expect("no reader panics");
+                let _ = file.seek(SeekFrom::Start(0));
             }
         }
     }
@@ -263,7 +327,7 @@ pub fn split_identical(
             opened
                 .iter()
                 .enumerate()
-                .map(|(slot, &index)| (slot, records[index].head()[..prefix].to_vec()))
+                .map(|(slot, &index)| (slot, &records[index].head()[..prefix]))
                 .collect(),
         )
         .into_iter()
@@ -359,7 +423,7 @@ pub fn split_identical(
             .into_iter()
             .map(|slot| {
                 let kept = records[opened[slot]].tail();
-                (slot, kept[kept.len() - tail..].to_vec())
+                (slot, &kept[kept.len() - tail..])
             })
             .collect();
         for run in partition_blocks(blocks) {
@@ -368,7 +432,7 @@ pub fn split_identical(
             }
             if context.learn {
                 for (slot, block) in &run {
-                    hashers[*slot].update(block);
+                    hashers[*slot].update(*block);
                     settled
                         .learned
                         .push((opened[*slot], hashers[*slot].clone().finalize().into()));
@@ -404,7 +468,15 @@ fn compare_cohort(
     unreadable: &mut Vec<String>,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
     let mut reported: Vec<String> = Vec::new();
-    let outcome = split_identical(context, records, cohort, chunk, &mut reported, None);
+    let outcome = split_identical(
+        context,
+        records,
+        cohort,
+        chunk,
+        &mut reported,
+        None,
+        Vec::new(),
+    );
     settled.learned.extend(outcome.learned);
     let mut runs = outcome.matched;
     let accounted: std::collections::HashSet<usize> = runs.iter().flatten().copied().collect();
@@ -467,7 +539,15 @@ pub fn split_identical_capped(
     if members.len() <= SPIN_INTERLEAVE {
         // Narrow enough to compare in one pass, which is the ordinary
         // comparison exactly.
-        return split_identical(context, records, members, chunk, unreadable, None);
+        return split_identical(
+            context,
+            records,
+            members,
+            chunk,
+            unreadable,
+            None,
+            Vec::new(),
+        );
     }
 
     let mut clusters: Vec<Vec<usize>> = members.iter().map(|&index| vec![index]).collect();
@@ -596,6 +676,7 @@ impl Round {
 /// `pulse` is told a group at a time rather than a file at a time: a group is
 /// where this stage's work is indivisible anyway, and counting there keeps the
 /// reading loops — the hottest code in the program — exactly as they were.
+#[allow(clippy::too_many_arguments)]
 pub fn compare_stage(
     context: &Compare,
     records: &[FileRec],
@@ -604,7 +685,17 @@ pub fn compare_stage(
     pool: &ThreadPool,
     unreadable: &mut Vec<String>,
     pulse: &crate::pulse::Pulse,
+    mut held: Option<&mut [Option<File>]>,
 ) -> Settled {
+    // Every descriptor a group needs is lifted out of the table here, on this
+    // thread, before anything fans out — a wave's members run as parallel
+    // tasks and cannot share `&mut` access to it.
+    fn lift(held: &mut Option<&mut [Option<File>]>, members: &[usize]) -> Vec<Option<File>> {
+        match held.as_deref_mut() {
+            Some(table) => members.iter().map(|&index| table[index].take()).collect(),
+            None => Vec::new(),
+        }
+    }
     // One disk, one queue, one group at a time, in the order the buckets were
     // sorted into — which is inode order, so the whole stage walks the platter
     // forwards. Waves exist to keep several readers busy and there is only one.
@@ -631,6 +722,7 @@ pub fn compare_stage(
     while index < buckets.len() {
         if buckets[index].len() >= wave_members {
             let chunk = compare_chunk(context.profile, buckets[index].len(), context.solid);
+            let carried = lift(&mut held, &buckets[index]);
             out.absorb(split_identical(
                 context,
                 records,
@@ -638,6 +730,7 @@ pub fn compare_stage(
                 chunk,
                 unreadable,
                 spread,
+                carried,
             ));
             pulse.files(buckets[index].len() as u64);
             index += 1;
@@ -657,22 +750,27 @@ pub fn compare_stage(
             // Nothing left to pack it with, and it never reached the threshold
             // alone either.
             let chunk = compare_chunk(context.profile, wave[0].len(), context.solid);
+            let carried = lift(&mut held, &wave[0]);
             out.absorb(split_identical(
-                context, records, &wave[0], chunk, unreadable, spread,
+                context, records, &wave[0], chunk, unreadable, spread, carried,
             ));
             pulse.files(wave[0].len() as u64);
             continue;
         }
 
         let wave_chunk = compare_chunk(context.profile, total, context.solid);
+        let lifted: Vec<Vec<Option<File>>> =
+            wave.iter().map(|group| lift(&mut held, group)).collect();
         let results: Vec<(Settled, Vec<String>)> = pool.install(|| {
             wave.par_iter()
-                .map(|group| {
+                .zip(lifted.into_par_iter())
+                .map(|(group, carried)| {
                     let mut local = Vec::new();
                     // pool = None: nothing here submits pool work from inside
                     // pool work, so each task reads its own members serially.
-                    let settled =
-                        split_identical(context, records, group, wave_chunk, &mut local, None);
+                    let settled = split_identical(
+                        context, records, group, wave_chunk, &mut local, None, carried,
+                    );
                     // Inside the wave, not after it: a whole wave is often the
                     // whole stage, and progress counted there would arrive
                     // only once it had stopped being progress.
@@ -724,6 +822,7 @@ pub fn verify_attested(
                 chunk,
                 &mut unreadable,
                 None,
+                Vec::new(),
             )
         };
         if settled.matched.len() == 1
@@ -792,7 +891,11 @@ mod tests {
         let flash = Profile::Flash;
         assert_eq!(compare_chunk(flash, 2, true), CHUNK);
         assert_eq!(compare_chunk(flash, 2, false), SLOW_CHUNK);
-        assert_eq!(compare_chunk(flash, 64, true), COMPARE_BUDGET / 64);
+        // The budget only starts biting past COMPARE_BUDGET / CHUNK members;
+        // below that the chunk is what flash prefers.
+        assert_eq!(compare_chunk(flash, 64, true), CHUNK);
+        assert_eq!(compare_chunk(flash, 512, true), COMPARE_BUDGET / 512);
+        assert!(COMPARE_BUDGET / 512 < CHUNK, "512 members must shrink it");
         assert_eq!(compare_chunk(flash, 100_000, true), MIN_CHUNK);
     }
 
@@ -891,6 +994,7 @@ mod tests {
                 chunk,
                 &mut sink,
                 None,
+                Vec::new(),
             );
             let mut sink = Vec::new();
             let capped = split_identical_capped(

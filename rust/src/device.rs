@@ -170,6 +170,24 @@ impl Device {
         }
     }
 
+    /// Readers for the stage that settles small files in one pass.
+    ///
+    /// That stage opens a file, reads the whole of it and moves on, so it is
+    /// waiting on the filesystem rather than computing, and every reader is
+    /// asking the same catalog. Past a reader per performance core the extra
+    /// ones queue rather than add throughput, and an efficiency core waits at
+    /// a lower clock. The probes below read a page out of a much larger file
+    /// and do not behave this way, which is why this is its own number and
+    /// not a narrowing of `random_jobs`.
+    pub fn small_file_jobs(&self, profile: Profile) -> usize {
+        match self.requested {
+            Some(n) => n.max(1),
+            None if profile == Profile::Spinning => 1,
+            None if self.solid == Some(false) => 2,
+            None => fast_bound(8),
+        }
+    }
+
     /// Readers for the stage that streams whole files in step.
     pub fn sequential_jobs(&self, profile: Profile) -> usize {
         match self.requested {
@@ -185,6 +203,32 @@ impl Device {
 
 fn cpu_bound(ceiling: usize) -> usize {
     ceiling.min(std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get))
+}
+
+/// The bound for the stages that open a file, read a page of it and move on.
+///
+/// Three stages have that shape: the small-file stage, stage 3's one-page
+/// probe, and stage 3's ends probe. What separates them from the deep-head
+/// and sample probes is not the reading but the *hashing* — a page is 4 KiB
+/// to digest and a deep head is sixty, so the deep probes have enough CPU
+/// work per file to want every core while these are still waiting on the
+/// catalog. Measured over `widegroup`'s 1,827 files, four readers against
+/// eight: the page probes win by 3.2 ms and the deep probe loses by 1.7.
+///
+/// Those stages are waiting on the filesystem, not computing, and past a
+/// point more readers only queue deeper: the catalog they are all asking is
+/// one structure. Measured on this machine, the small-file stage is fastest
+/// with a reader per performance core and gets steadily slower with more —
+/// an efficiency core waits for the same catalog at a lower clock, and the
+/// extra readers are contention rather than throughput. The stage that
+/// streams whole files wants the opposite and keeps `cpu_bound`.
+///
+/// Where the cores are all alike this is exactly `cpu_bound`.
+pub fn fast_bound(ceiling: usize) -> usize {
+    let cores = crate::sys::performance_cores().unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+    });
+    ceiling.min(cores.max(1))
 }
 
 /// The volume root `path` sits on — the only thing diskutil accepts.
@@ -207,7 +251,25 @@ fn is_solid_state(path: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    crate::sys::solid_state(path)
+    // The device itself first: two ioctls on the raw node, and either answer
+    // settles the question without loading a framework. A volume whose raw
+    // node will not open — a system disk, whose node is root-owned — falls
+    // through to the registry exactly as it did before.
+    if let Some(media) = crate::sys::media_flags(path) {
+        if media.solid || media.virtual_media {
+            return Some(true);
+        }
+    }
+    if let Some(solid) = crate::sys::solid_state(path) {
+        return Some(solid);
+    }
+    // The registry will not call a disk image flash, because it is not flash.
+    // But every caller of this is asking one question — does this volume
+    // charge for a seek — and a disk image does not: it has no heads, and
+    // what it sits on is somebody else's problem. Answering `None` here lumps
+    // it in with the USB enclosure that did not report, which is a device that
+    // may genuinely spin, and costs it the parallel reader for nothing.
+    crate::sys::disk_image(path).then_some(true)
 }
 
 /// A stable filename for the cache belonging to the volume `path` is on.
@@ -311,5 +373,54 @@ mod tests {
     #[test]
     fn the_mount_point_of_the_root_is_the_root() {
         assert_eq!(mount_point(Path::new("/")), PathBuf::from("/"));
+    }
+}
+
+#[cfg(test)]
+mod pools {
+    use super::*;
+
+    /// The small-file stage gets a reader per performance core; the probes
+    /// and the streaming compare get the wider pool. On a machine whose cores
+    /// are all alike the two are the same number, which is why this compares
+    /// them to the bounds rather than to a constant.
+    #[test]
+    fn the_small_file_pool_is_sized_from_a_different_count() {
+        let device = Device {
+            solid: Some(true),
+            requested: None,
+        };
+        assert_eq!(device.small_file_jobs(Profile::Flash), fast_bound(8));
+        assert_eq!(device.random_jobs(Profile::Flash), cpu_bound(8));
+        assert_eq!(device.sequential_jobs(Profile::Flash), cpu_bound(8));
+        assert!(device.small_file_jobs(Profile::Flash) <= device.random_jobs(Profile::Flash));
+    }
+
+    /// An explicit -j still overrides every pool, the new one included.
+    #[test]
+    fn an_explicit_j_overrides_the_small_file_pool_too() {
+        let device = Device {
+            solid: None,
+            requested: Some(3),
+        };
+        assert_eq!(device.small_file_jobs(Profile::Flash), 3);
+        assert_eq!(device.small_file_jobs(Profile::Spinning), 3);
+    }
+
+    /// A disk that says it spins gets one reader there as everywhere else.
+    #[test]
+    fn a_spinning_disk_settles_small_files_with_one_reader() {
+        let device = Device {
+            solid: Some(false),
+            requested: None,
+        };
+        assert_eq!(device.small_file_jobs(Profile::Spinning), 1);
+    }
+
+    /// Neither bound may ever hand back a pool of nothing.
+    #[test]
+    fn every_pool_has_at_least_one_reader() {
+        assert!(fast_bound(8) >= 1);
+        assert!(cpu_bound(8) >= 1);
     }
 }

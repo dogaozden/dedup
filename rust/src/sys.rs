@@ -50,37 +50,355 @@ const K_IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
 const K_IO_REGISTRY_ITERATE_PARENTS: u32 = 2;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
-#[link(name = "IOKit", kind = "framework")]
-extern "C" {
-    fn IOBSDNameMatching(
-        main_port: IoObject,
+// IOKit and CoreFoundation are loaded on first use rather than linked, and
+// the reason is startup. `otool -L` on a build that links them shows both
+// frameworks plus `libiconv`, and dyld maps and initialises all three before
+// `main` runs: measured on this machine, a C program that does nothing costs
+// 1.349 ms and the same program linked against the two costs 2.136 ms. That
+// 0.787 ms is paid by every scan, and on the short scenarios it is a fifth of
+// process start. Nothing needs the answer until the pools are sized, and
+// `VolumeProbe` already asks for it from a thread, so the load can happen
+// there and overlap the walk instead of preceding it.
+//
+// `-Wl,-lazy_framework` would have been the free version of this and the
+// linker on this machine refuses it: "lazy-load will be ignored ... because
+// deployment target version is too low", at every deployment target tried.
+//
+// Every entry point below keeps the name and signature it had as an `extern`
+// declaration, so no call site knows the difference. A framework that will not
+// load, or a symbol that is not there, leaves `frameworks()` at `None` and
+// each wrapper returns what the real call returns when it fails — which the
+// callers already handle, because a volume that will not answer is a volume
+// this has always had to cope with.
+#[allow(non_snake_case)]
+struct Frameworks {
+    IOBSDNameMatching: unsafe extern "C" fn(IoObject, u32, *const c_char) -> *const c_void,
+    IOServiceGetMatchingService: unsafe extern "C" fn(IoObject, *const c_void) -> IoObject,
+    IORegistryEntrySearchCFProperty:
+        unsafe extern "C" fn(IoObject, *const c_char, CfTypeRef, CfTypeRef, u32) -> CfTypeRef,
+    IOObjectRelease: unsafe extern "C" fn(IoObject) -> c_int,
+    IOObjectConformsTo: unsafe extern "C" fn(IoObject, *const c_char) -> u8,
+    IORegistryEntryGetParentEntry:
+        unsafe extern "C" fn(IoObject, *const c_char, *mut IoObject) -> c_int,
+    CFStringCreateWithCString: unsafe extern "C" fn(CfTypeRef, *const c_char, u32) -> CfTypeRef,
+    CFGetTypeID: unsafe extern "C" fn(CfTypeRef) -> usize,
+    CFDictionaryGetTypeID: unsafe extern "C" fn() -> usize,
+    CFStringGetTypeID: unsafe extern "C" fn() -> usize,
+    CFDictionaryGetValue: unsafe extern "C" fn(CfTypeRef, CfTypeRef) -> CfTypeRef,
+    CFStringGetCString: unsafe extern "C" fn(CfTypeRef, *mut c_char, isize, u32) -> u8,
+    CFRelease: unsafe extern "C" fn(CfTypeRef),
+}
+
+static FRAMEWORKS: std::sync::OnceLock<Option<Frameworks>> = std::sync::OnceLock::new();
+
+fn frameworks() -> Option<&'static Frameworks> {
+    FRAMEWORKS
+        .get_or_init(|| unsafe { load_frameworks() })
+        .as_ref()
+}
+
+/// The handles are deliberately never closed: the process needs them for as
+/// long as it runs, and `dlclose` on a system framework is not something to do
+/// on the way out.
+// The destination types are the `Frameworks` fields themselves — annotating
+// each transmute would spell every signature twice.
+#[allow(clippy::missing_transmute_annotations)]
+unsafe fn load_frameworks() -> Option<Frameworks> {
+    unsafe fn open(path: &[u8]) -> *mut c_void {
+        libc::dlopen(path.as_ptr().cast(), libc::RTLD_LAZY)
+    }
+    let iokit = open(b"/System/Library/Frameworks/IOKit.framework/IOKit\0");
+    if iokit.is_null() {
+        return None;
+    }
+    let cf = open(b"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation\0");
+    if cf.is_null() {
+        return None;
+    }
+    macro_rules! sym {
+        ($handle:expr, $name:literal) => {{
+            let found = libc::dlsym($handle, concat!($name, "\0").as_ptr().cast());
+            if found.is_null() {
+                return None;
+            }
+            std::mem::transmute(found)
+        }};
+    }
+    Some(Frameworks {
+        IOBSDNameMatching: sym!(iokit, "IOBSDNameMatching"),
+        IOServiceGetMatchingService: sym!(iokit, "IOServiceGetMatchingService"),
+        IORegistryEntrySearchCFProperty: sym!(iokit, "IORegistryEntrySearchCFProperty"),
+        IOObjectRelease: sym!(iokit, "IOObjectRelease"),
+        IOObjectConformsTo: sym!(iokit, "IOObjectConformsTo"),
+        IORegistryEntryGetParentEntry: sym!(iokit, "IORegistryEntryGetParentEntry"),
+        CFStringCreateWithCString: sym!(cf, "CFStringCreateWithCString"),
+        CFGetTypeID: sym!(cf, "CFGetTypeID"),
+        CFDictionaryGetTypeID: sym!(cf, "CFDictionaryGetTypeID"),
+        CFStringGetTypeID: sym!(cf, "CFStringGetTypeID"),
+        CFDictionaryGetValue: sym!(cf, "CFDictionaryGetValue"),
+        CFStringGetCString: sym!(cf, "CFStringGetCString"),
+        CFRelease: sym!(cf, "CFRelease"),
+    })
+}
+
+// The wrappers. Each one is the call it replaced, or that call's own failure
+// answer when the frameworks are not there.
+#[allow(non_snake_case)]
+mod shim {
+    use super::*;
+
+    pub unsafe fn IOBSDNameMatching(
+        port: IoObject,
         options: u32,
-        bsd_name: *const c_char,
-    ) -> *const c_void;
-    fn IOServiceGetMatchingService(main_port: IoObject, matching: *const c_void) -> IoObject;
-    fn IORegistryEntrySearchCFProperty(
+        name: *const c_char,
+    ) -> *const c_void {
+        match frameworks() {
+            Some(f) => (f.IOBSDNameMatching)(port, options, name),
+            None => std::ptr::null(),
+        }
+    }
+    pub unsafe fn IOServiceGetMatchingService(port: IoObject, matching: *const c_void) -> IoObject {
+        match frameworks() {
+            Some(f) => (f.IOServiceGetMatchingService)(port, matching),
+            None => 0,
+        }
+    }
+    pub unsafe fn IORegistryEntrySearchCFProperty(
         entry: IoObject,
         plane: *const c_char,
         key: CfTypeRef,
         allocator: CfTypeRef,
         options: u32,
-    ) -> CfTypeRef;
-    fn IOObjectRelease(object: IoObject) -> c_int;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    fn CFStringCreateWithCString(
+    ) -> CfTypeRef {
+        match frameworks() {
+            Some(f) => (f.IORegistryEntrySearchCFProperty)(entry, plane, key, allocator, options),
+            None => std::ptr::null(),
+        }
+    }
+    pub unsafe fn IOObjectRelease(object: IoObject) -> c_int {
+        match frameworks() {
+            Some(f) => (f.IOObjectRelease)(object),
+            None => 0,
+        }
+    }
+    pub unsafe fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> u8 {
+        match frameworks() {
+            Some(f) => (f.IOObjectConformsTo)(object, class_name),
+            None => 0,
+        }
+    }
+    pub unsafe fn IORegistryEntryGetParentEntry(
+        entry: IoObject,
+        plane: *const c_char,
+        parent: *mut IoObject,
+    ) -> c_int {
+        match frameworks() {
+            Some(f) => (f.IORegistryEntryGetParentEntry)(entry, plane, parent),
+            None => -1,
+        }
+    }
+    pub unsafe fn CFStringCreateWithCString(
         allocator: CfTypeRef,
         c_string: *const c_char,
         encoding: u32,
-    ) -> CfTypeRef;
-    fn CFGetTypeID(value: CfTypeRef) -> usize;
-    fn CFDictionaryGetTypeID() -> usize;
-    fn CFStringGetTypeID() -> usize;
-    fn CFDictionaryGetValue(dictionary: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
-    fn CFStringGetCString(value: CfTypeRef, buffer: *mut c_char, size: isize, encoding: u32) -> u8;
-    fn CFRelease(value: CfTypeRef);
+    ) -> CfTypeRef {
+        match frameworks() {
+            Some(f) => (f.CFStringCreateWithCString)(allocator, c_string, encoding),
+            None => std::ptr::null(),
+        }
+    }
+    // The three type-id calls answer distinct nonsense when there is no
+    // CoreFoundation, so that a comparison between them is false rather than
+    // accidentally true.
+    pub unsafe fn CFGetTypeID(value: CfTypeRef) -> usize {
+        match frameworks() {
+            Some(f) => (f.CFGetTypeID)(value),
+            None => 0,
+        }
+    }
+    pub unsafe fn CFDictionaryGetTypeID() -> usize {
+        match frameworks() {
+            Some(f) => (f.CFDictionaryGetTypeID)(),
+            None => 1,
+        }
+    }
+    pub unsafe fn CFStringGetTypeID() -> usize {
+        match frameworks() {
+            Some(f) => (f.CFStringGetTypeID)(),
+            None => 2,
+        }
+    }
+    pub unsafe fn CFDictionaryGetValue(dictionary: CfTypeRef, key: CfTypeRef) -> CfTypeRef {
+        match frameworks() {
+            Some(f) => (f.CFDictionaryGetValue)(dictionary, key),
+            None => std::ptr::null(),
+        }
+    }
+    pub unsafe fn CFStringGetCString(
+        value: CfTypeRef,
+        buffer: *mut c_char,
+        size: isize,
+        encoding: u32,
+    ) -> u8 {
+        match frameworks() {
+            Some(f) => (f.CFStringGetCString)(value, buffer, size, encoding),
+            None => 0,
+        }
+    }
+    pub unsafe fn CFRelease(value: CfTypeRef) {
+        if let Some(f) = frameworks() {
+            (f.CFRelease)(value);
+        }
+    }
+}
+use shim::*;
+
+/// How many cores of the fastest kind this machine has, on a machine whose
+/// cores are not all alike.
+///
+/// Apple silicon numbers its performance levels fastest first, so
+/// `perflevel0` is the performance cores and `perflevel1` the efficiency
+/// ones. A machine with a single performance level answers with all of its
+/// cores, which is the same answer as not distinguishing, and one that does
+/// not carry the key at all says `None`.
+pub fn performance_cores() -> Option<usize> {
+    let name = CString::new("hw.perflevel0.logicalcpu").expect("no interior NUL");
+    let mut cores: u32 = 0;
+    let mut size = std::mem::size_of::<u32>();
+    // SAFETY: `name` is NUL-terminated and outlives the call; `cores` is
+    // writable storage of exactly `size` bytes, which is what a sysctl of
+    // this integer type writes. A nonzero return means it wrote nothing.
+    let answered = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!(cores).cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if answered != 0 || size != std::mem::size_of::<u32>() || cores == 0 {
+        return None;
+    }
+    Some(cores as usize)
+}
+
+/// Whether the volume `path` sits on is backed by a disk image rather than by
+/// a physical device — a RAM disk, a `.dmg`, a sparsebundle, a VM volume.
+///
+/// This is a different question from `solid_state`, and it is asked because
+/// the thing the tool actually wants to know is whether the volume charges
+/// for a seek. `solid_state` answers `None` for every disk image, since the
+/// registry carries no `Medium Type` for one — the same answer it gives for a
+/// USB enclosure that simply does not report, which is a device that may very
+/// well spin. Treating those two alike costs a disk image the parallel
+/// reader, and treating them alike in the other direction would cost a real
+/// spinning disk a seek storm. The registry separates them: a disk image is
+/// provided by `IODiskImageBlockStorageDeviceOutKernel`, and nothing with
+/// heads is.
+///
+/// `false` for anything the registry will not describe, which leaves the
+/// caller exactly where it was.
+/// What the device under a volume says about itself, in two ioctls.
+///
+/// `diskutil info` prints these as `SolidState` and `VirtualOrPhysical`, and
+/// gets them the same way this does: one open of the raw node and one ioctl
+/// each. That costs about forty microseconds. The registry below answers the
+/// same two questions and costs two to four milliseconds, almost all of it
+/// loading IOKit and CoreFoundation — a fixed price paid once per scan, which
+/// the scenarios that finish in ten milliseconds feel as a fifth of their run.
+///
+/// `None` means the device would not answer. The raw node for a system volume
+/// is `root:operator` and an ordinary user cannot open it, so this settles the
+/// question for a volume the user attached and leaves the rest to the
+/// registry, which is what ran here before and still runs when this declines.
+pub struct MediaFlags {
+    /// The disk is flash. `false` is "the device said no", not "did not say" —
+    /// which is why this cannot stand in for the registry's tri-state: a RAM
+    /// disk answers no here and "no such key" there.
+    pub solid: bool,
+    /// The block device is synthesized rather than physical — a disk image.
+    /// This is the same population `disk_image` identifies by conformance.
+    pub virtual_media: bool,
+}
+
+/// `_IOR('d', 79, uint32_t)` and `_IOR('d', 72, uint32_t)` from `<sys/disk.h>`,
+/// spelled out because there is no macro on this side to expand them.
+const DKIOCISSOLIDSTATE: libc::c_ulong = 0x4004_644f;
+const DKIOCISVIRTUAL: libc::c_ulong = 0x4004_6448;
+
+pub fn media_flags(path: &Path) -> Option<MediaFlags> {
+    let device = backing_device(path)?;
+    // The raw node, not the block node: the block one is busy while the
+    // volume is mounted and would refuse the open.
+    let mut node = Vec::with_capacity(6 + device.as_bytes().len());
+    node.extend_from_slice(b"/dev/r");
+    node.extend_from_slice(device.as_bytes());
+    let node = CString::new(node).ok()?;
+
+    // SAFETY: `node` is NUL-terminated and outlives the call.
+    let fd = unsafe { libc::open(node.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut solid: u32 = 0;
+    let mut synthesized: u32 = 0;
+    // SAFETY: both requests are `_IOR`s of one `uint32_t` and each is handed a
+    // writable `u32` of exactly that size. `fd` came from a successful open.
+    let (asked_solid, asked_virtual) = unsafe {
+        (
+            libc::ioctl(fd, DKIOCISSOLIDSTATE, &mut solid) == 0,
+            libc::ioctl(fd, DKIOCISVIRTUAL, &mut synthesized) == 0,
+        )
+    };
+    // SAFETY: `fd` came from a successful `open` and is closed once.
+    unsafe { libc::close(fd) };
+
+    (asked_solid || asked_virtual).then_some(MediaFlags {
+        solid: asked_solid && solid != 0,
+        virtual_media: asked_virtual && synthesized != 0,
+    })
+}
+
+pub fn disk_image(path: &Path) -> bool {
+    let Some(device) = backing_device(path) else {
+        return false;
+    };
+    let plane = CString::new("IOService").expect("no interior NUL");
+    let class = CString::new("IODiskImageBlockStorageDeviceOutKernel").expect("no interior NUL");
+
+    // SAFETY: `IOServiceGetMatchingService` consumes the matching dictionary,
+    // so it is not released here. Every entry this loop holds is released
+    // exactly once: `entry` is replaced only after the old value is released,
+    // and whatever it holds on the way out is released after the loop. A zero
+    // `io_object_t` is not an object and is not released.
+    unsafe {
+        let matching = IOBSDNameMatching(K_IO_MAIN_PORT_DEFAULT, 0, device.as_ptr());
+        if matching.is_null() {
+            return false;
+        }
+        let mut entry = IOServiceGetMatchingService(K_IO_MAIN_PORT_DEFAULT, matching);
+        if entry == 0 {
+            return false;
+        }
+        // The stack over a disk image is three or four deep; the bound is
+        // there so a registry that somehow loops cannot hang a scan.
+        let mut virtual_media = false;
+        for _ in 0..16 {
+            if IOObjectConformsTo(entry, class.as_ptr()) != 0 {
+                virtual_media = true;
+                break;
+            }
+            let mut parent: IoObject = 0;
+            if IORegistryEntryGetParentEntry(entry, plane.as_ptr(), &mut parent) != 0 {
+                break;
+            }
+            IOObjectRelease(entry);
+            entry = parent;
+        }
+        IOObjectRelease(entry);
+        virtual_media
+    }
 }
 
 /// Whether the volume `path` sits on is flash, as the IO registry has it.
@@ -251,6 +569,54 @@ mod agreement {
             println!("{mount}: getattrlist={ours:?} diskutil={theirs:?}");
             if theirs.is_some() {
                 assert_eq!(ours, theirs, "{mount}: disagreed with diskutil");
+            }
+        }
+    }
+
+    /// The ioctls have to say what the registry says, or the fast path is a
+    /// different tool rather than a faster one.
+    ///
+    /// On a machine whose only user-openable volume is the bench RAM disk this
+    /// asserts about one volume and skips the boot disk, which is honest: the
+    /// boot disk is precisely the case that still goes to the registry, and
+    /// `the_registry_agrees_with_diskutil` is what covers it.
+    #[test]
+    fn the_device_agrees_with_diskutil() {
+        for mount in ["/", "/Volumes/dedupbench"] {
+            let path = Path::new(mount);
+            if !path.exists() {
+                continue;
+            }
+            let Some(media) = media_flags(path) else {
+                println!("{mount}: raw node would not open — the registry answers");
+                continue;
+            };
+            let virtual_media = diskutil_string(mount, "VirtualOrPhysical");
+            println!(
+                "{mount}: solid={} virtual={} diskutil={:?}/{:?}",
+                media.solid,
+                media.virtual_media,
+                diskutil_says(mount),
+                virtual_media,
+            );
+            assert_eq!(
+                media.virtual_media,
+                virtual_media.as_deref() == Some("Virtual"),
+                "{mount}: disagreed with diskutil about being a disk image",
+            );
+            // Only where diskutil has an opinion. "Info not available" is the
+            // registry declining, and the device answering `no` to a question
+            // the registry would not answer at all is not a disagreement.
+            if let Some(theirs) = diskutil_says(mount) {
+                assert_eq!(media.solid, theirs, "{mount}: disagreed about flash");
+            }
+            // The one direction that would be a real conflict.
+            if media.solid {
+                assert_ne!(
+                    solid_state(path),
+                    Some(false),
+                    "{mount}: the device says flash and the registry says it spins",
+                );
             }
         }
     }
@@ -513,5 +879,311 @@ mod terminal {
         assert_eq!(wait_on(follower, Duration::from_millis(50)), Input::Waited);
         close(follower);
         close(main);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk directory reads
+//
+// REWRITE.md §4 wants the walk to stop paying for one `lstat` per file. The
+// kernel will hand over a whole directory's names *and* their attributes in
+// one call, which is what `getattrlistbulk(2)` is for, and on HFS+ and APFS
+// that is one pass over the catalog instead of a lookup per entry.
+//
+// Unlike the rest of this module this path *is* load-bearing: it produces the
+// file list. It keeps the module's contract anyway — `BulkDir::read` answers
+// `false` for anything the platform will not describe completely, and the
+// walk falls back to `read_dir` for that directory. It never answers `true`
+// having seen only part of a directory, so a caller can fall back without
+// risking a double count.
+// ---------------------------------------------------------------------------
+
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+const ATTR_CMN_NAME: u32 = 0x0000_0001;
+const ATTR_CMN_DEVID: u32 = 0x0000_0002;
+const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+const ATTR_CMN_FILEID: u32 = 0x0200_0000;
+const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
+const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+
+/// `enum vtype` — the three this walk distinguishes. Everything else is
+/// neither a file nor a directory and is skipped exactly as `read_dir`'s
+/// `is_file`/`is_dir` pair skips it.
+pub const VREG: u32 = 1;
+pub const VDIR: u32 = 2;
+pub const VLNK: u32 = 5;
+
+/// What every entry must carry before the walk will trust the batch.
+const WANT_COMMON: u32 = ATTR_CMN_RETURNED_ATTRS
+    | ATTR_CMN_NAME
+    | ATTR_CMN_DEVID
+    | ATTR_CMN_OBJTYPE
+    | ATTR_CMN_MODTIME
+    | ATTR_CMN_FILEID;
+const WANT_FILE: u32 = ATTR_FILE_LINKCOUNT | ATTR_FILE_DATALENGTH;
+
+/// One directory's worth of buffer, sized so an ordinary directory comes back
+/// in a single call and a large one in a handful.
+const BULK_BUFFER: usize = 128 * 1024;
+
+#[repr(C)]
+struct AttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+extern "C" {
+    fn getattrlistbulk(
+        dirfd: c_int,
+        attrlist: *mut c_void,
+        buffer: *mut c_void,
+        buffersize: usize,
+        options: u64,
+    ) -> c_int;
+}
+
+/// One directory entry, as the kernel described it. `name` is an offset into
+/// the arena rather than a `String` so that a directory of 50,000 entries
+/// costs one allocation rather than 50,000.
+pub struct BulkEntry {
+    name_at: u32,
+    name_len: u32,
+    pub objtype: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+/// Scratch reused across every directory of a walk: the kernel's buffer, the
+/// name arena, and the parsed entries.
+#[derive(Default)]
+pub struct BulkDir {
+    buffer: Vec<u8>,
+    names: Vec<u8>,
+    entries: Vec<BulkEntry>,
+}
+
+/// Read `offset` bytes into `buffer` as a `T`. The kernel packs these fields
+/// end to end with no padding, so almost none of them are aligned and every
+/// read has to say so.
+///
+/// SAFETY: the caller has checked that `offset + size_of::<T>()` is within
+/// `buffer`, and every `T` used here is a plain integer with no invalid bit
+/// patterns.
+unsafe fn unpack<T: Copy>(buffer: &[u8], offset: usize) -> T {
+    std::ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<T>())
+}
+
+impl BulkDir {
+    /// Fill this scratch with `directory`'s entries.
+    ///
+    /// `false` means the platform did not describe the directory completely
+    /// and the caller must fall back; nothing read here is then usable, and
+    /// no caller has been told about any of it yet.
+    pub fn read(&mut self, directory: &Path) -> bool {
+        self.names.clear();
+        self.entries.clear();
+        if self.buffer.len() != BULK_BUFFER {
+            self.buffer.resize(BULK_BUFFER, 0);
+        }
+
+        let Ok(c_path) = CString::new(directory.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is NUL-terminated and outlives the call.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return false;
+        }
+
+        let mut request = AttrList {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: WANT_COMMON,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: WANT_FILE,
+            forkattr: 0,
+        };
+
+        let complete = loop {
+            // SAFETY: `request` is a well-formed attrlist that outlives the
+            // call, and the kernel writes at most `BULK_BUFFER` bytes into a
+            // buffer of exactly that size.
+            let count = unsafe {
+                getattrlistbulk(
+                    fd,
+                    std::ptr::addr_of_mut!(request).cast::<c_void>(),
+                    self.buffer.as_mut_ptr().cast::<c_void>(),
+                    BULK_BUFFER,
+                    0,
+                )
+            };
+            if count < 0 {
+                break false;
+            }
+            if count == 0 {
+                break true;
+            }
+            if !self.parse(count as usize) {
+                break false;
+            }
+        };
+
+        // SAFETY: `fd` came from a successful `open` and is closed once.
+        unsafe { libc::close(fd) };
+        complete
+    }
+
+    /// Split one batch of `count` entries out of the buffer.
+    fn parse(&mut self, count: usize) -> bool {
+        let mut base = 0_usize;
+        for _ in 0..count {
+            if base + 4 > self.buffer.len() {
+                return false;
+            }
+            // SAFETY: bounds checked immediately above and below; every read
+            // below stays inside `base .. base + length`.
+            let length = unsafe { unpack::<u32>(&self.buffer, base) } as usize;
+            if length < 24 || base + length > self.buffer.len() {
+                return false;
+            }
+            if !self.parse_entry(base, length) {
+                return false;
+            }
+            base += length;
+        }
+        true
+    }
+
+    fn parse_entry(&mut self, base: usize, length: usize) -> bool {
+        let end = base + length;
+        let mut at = base + 4;
+
+        // SAFETY: `at + 20 <= end <= buffer.len()`, checked by the caller's
+        // `length < 24` guard.
+        let returned_common = unsafe { unpack::<u32>(&self.buffer, at) };
+        let returned_file = unsafe { unpack::<u32>(&self.buffer, at + 12) };
+        at += 20;
+
+        // Anything the kernel declined to describe sends the whole directory
+        // down the portable path rather than being guessed at.
+        if returned_common & WANT_COMMON != WANT_COMMON {
+            return false;
+        }
+
+        macro_rules! take {
+            ($ty:ty) => {{
+                let size = std::mem::size_of::<$ty>();
+                if at + size > end {
+                    return false;
+                }
+                // SAFETY: bounds checked on the line above.
+                let value = unsafe { unpack::<$ty>(&self.buffer, at) };
+                at += size;
+                value
+            }};
+        }
+
+        // The order is the order of the bits in `struct attrlist`: common
+        // attributes low bit first, then the file group.
+        //
+        // `attr_dataoffset` counts from the reference itself, so where that
+        // reference sits has to be remembered before the cursor moves on.
+        let name_reference = at;
+        let name_offset = take!(i32);
+        let name_length = take!(u32) as usize;
+        let dev = take!(i32) as u64;
+        let objtype = take!(u32);
+        let mtime_sec = take!(i64);
+        let mtime_nsec = take!(i64);
+        let ino = take!(u64);
+
+        let name_start = name_reference as i64 + name_offset as i64;
+        if name_start < base as i64 || name_length == 0 {
+            return false;
+        }
+        let name_start = name_start as usize;
+        // The length the kernel reports includes the trailing NUL.
+        let name_end = name_start + name_length - 1;
+        if name_end > end {
+            return false;
+        }
+
+        let (nlink, size) = if objtype == VREG {
+            if returned_file & WANT_FILE != WANT_FILE {
+                return false;
+            }
+            let nlink = take!(u32) as u64;
+            let size = take!(i64) as u64;
+            (nlink, size)
+        } else {
+            (0, 0)
+        };
+
+        // Every field the kernel said it returned has now been accounted for,
+        // and none of them ran past the entry it belongs to.
+        debug_assert!(at <= end);
+
+        let name_at = self.names.len() as u32;
+        self.names
+            .extend_from_slice(&self.buffer[name_start..name_end]);
+        self.entries.push(BulkEntry {
+            name_at,
+            name_len: (name_end - name_start) as u32,
+            objtype,
+            dev,
+            ino,
+            nlink,
+            size,
+            mtime_ns: mtime_sec * 1_000_000_000 + mtime_nsec,
+        });
+        true
+    }
+
+    /// The entries of the directory last read, each with its raw name.
+    pub fn entries(&self) -> impl Iterator<Item = (&[u8], &BulkEntry)> {
+        self.entries.iter().map(|entry| {
+            let at = entry.name_at as usize;
+            (&self.names[at..at + entry.name_len as usize], entry)
+        })
+    }
+}
+
+#[cfg(test)]
+mod virtual_media {
+    use super::*;
+
+    /// The boot volume is a real device, and nothing about it is an image.
+    #[test]
+    fn a_physical_volume_is_not_a_disk_image() {
+        assert!(!disk_image(Path::new("/")));
+    }
+
+    /// The bench volume is a RAM disk, which is a disk image with memory
+    /// behind it. Skipped where it is not mounted, because this is the only
+    /// virtual volume this machine is guaranteed to have when it is.
+    #[test]
+    fn a_ram_disk_is_a_disk_image() {
+        let bench = Path::new("/Volumes/dedupbench");
+        if !bench.exists() {
+            return;
+        }
+        assert!(disk_image(bench), "the bench RAM disk reads as physical");
+    }
+
+    /// Asking about a path that is not there says no, rather than guessing.
+    #[test]
+    fn a_path_that_is_not_there_is_not_a_disk_image() {
+        assert!(!disk_image(Path::new("/no/such/place")));
     }
 }

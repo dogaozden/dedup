@@ -19,13 +19,37 @@ pub const SAMPLE_POINTS: usize = 8;
 /// own and saves less than that open is worth.
 pub const SAMPLE_SPAN: u64 = 8 * 1024 * 1024;
 /// Comparison chunk on flash.
-pub const CHUNK: usize = 4 * 1024 * 1024;
+///
+/// Four megabytes was the obvious size and it is not the fast one. A narrow
+/// group takes the whole of this — eight members of `bigheader` get 4 MB each,
+/// 32 MB in flight — and neither the read nor the compare that follows it can
+/// keep that in cache, so both go to DRAM. Measured in C at the comparison's
+/// own shape, eight files read in lockstep and compared against a pivot:
+/// 23.82 ms at 4 MB, 18.02 at 1 MB, **17.76 at 512 KB**, 18.60 at 256 KB.
+/// Wide groups are unaffected — `COMPARE_BUDGET / members` already puts a
+/// 227-member group at 564 KB, which is why this was invisible there.
+pub const CHUNK: usize = 512 * 1024;
 /// ...and on a spinning disk, where every extra file in a group costs a seek.
 pub const SLOW_CHUNK: usize = 16 * 1024 * 1024;
 /// Ceiling on bytes held for one group (or one wave) of the comparison.
 pub const COMPARE_BUDGET: usize = 128 * 1024 * 1024;
 /// ...which the chunk shrinks towards, but not below.
 pub const MIN_CHUNK: usize = 128 * 1024;
+/// How many file descriptors the staged pipeline will hold open between its
+/// stages rather than reopening.
+///
+/// `widegroup` opens 5,442 times for 1,827 files — once in the ends probe,
+/// once in the deep-head probe, once in the comparison — and an open is not
+/// free: bare open-and-close over those files measures 5.54 ms on four
+/// readers. Holding the descriptor across the stages pays that once.
+///
+/// The bound exists because a tree can be much larger than this one. macOS
+/// here allows 61,440 descriptors per process and the soft limit the tool
+/// inherits is 1,048,576, so 4,096 is nowhere near the ceiling; it is small
+/// enough to be polite on a machine whose limits are lower, and past it the
+/// stages reopen exactly as they did before.
+pub const HANDLE_BUDGET: usize = 4096;
+
 /// Files handed to a reader task at a time — one task per file spends more
 /// time in the queue than in the read.
 pub const HASH_BATCH: usize = 64;

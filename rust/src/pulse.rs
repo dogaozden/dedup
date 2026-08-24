@@ -155,15 +155,21 @@ impl Pulse {
     /// with one stage's progress against another's size.
     pub fn stage(&self, label: &'static str, total: u64) {
         if let Some(live) = &self.0 {
-            let mut stage = live.shared.stage();
-            live.shared.files.store(0, Ordering::Relaxed);
-            live.shared.bytes.store(0, Ordering::Relaxed);
-            *stage = Stage {
-                label,
-                total,
-                started: Instant::now(),
-                bytes_at_start: live.effort.bytes_read(),
-            };
+            {
+                let mut stage = live.shared.stage();
+                live.shared.files.store(0, Ordering::Relaxed);
+                live.shared.bytes.store(0, Ordering::Relaxed);
+                *stage = Stage {
+                    label,
+                    total,
+                    started: Instant::now(),
+                    bytes_at_start: live.effort.bytes_read(),
+                };
+            }
+            // One frame at the boundary, outside the lock the painter takes:
+            // a stage that finishes inside a single beat — the parallel walk
+            // does, on any tree the page cache holds — is still seen.
+            paint(&live.shared, &live.effort);
         }
     }
 

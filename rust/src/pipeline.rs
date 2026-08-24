@@ -7,13 +7,14 @@
 //! to bytes compared in stage 5, or to whole content held in memory by the
 //! small-file stage.
 
+use std::fs::File;
 use std::path::Path;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::cache::ScanCache;
 use crate::compare::{compare_stage, Compare};
-use crate::consts::{DEEP_HEAD, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
+use crate::consts::{DEEP_HEAD, HANDLE_BUDGET, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
 use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
@@ -202,11 +203,26 @@ pub fn find_duplicates(
     let random_jobs = device.random_jobs(profile);
     let sequential_jobs = device.sequential_jobs(profile);
     let random_pool = pool_of(random_jobs);
+    // The deep reader, for the stages that hash enough per file to want every
+    // core: `DeepHead` reads 60 KiB and `Sample` half a megabyte.
     let reader = Reader {
         root,
         effort,
         pool: &random_pool,
         jobs: random_jobs,
+        pulse,
+    };
+    // The shallow reader, for the stages that read a page and hash a page.
+    // Those are waiting on the catalog, not computing, and `fast_bound` is
+    // where that bottoms out — the same pool the small-file stage wants, so
+    // where the two counts agree there is one pool and not two.
+    let shallow_jobs = device.small_file_jobs(profile);
+    let shallow_pool = (shallow_jobs != random_jobs).then(|| pool_of(shallow_jobs));
+    let shallow = Reader {
+        root,
+        effort,
+        pool: shallow_pool.as_ref().unwrap_or(&random_pool),
+        jobs: shallow_jobs,
         pulse,
     };
     let mut unreadable = std::mem::take(&mut scan.unreadable);
@@ -222,11 +238,23 @@ pub fn find_duplicates(
         .filter(|&index| records[index].size > DEEP_HEAD as u64)
         .collect();
 
+    // One descriptor per staged file, carried from the ends probe through the
+    // deep-head and sample probes. Only worth building when the staged set is
+    // small enough to hold; past that every stage reopens as before.
+    let holding = !staged.is_empty() && staged.len() <= HANDLE_BUDGET;
+    let mut held: Vec<Option<File>> = if holding {
+        (0..records.len()).map(|_| None).collect()
+    } else {
+        Vec::new()
+    };
+
     let mut remembered: Vec<Vec<usize>> = Vec::new();
     if !small.is_empty() {
         pulse.stage(pulse::SMALL, small.len() as u64);
+        // The same shallow reader stage 3's page probe uses; see
+        // `Device::small_file_jobs`.
         let (proven, attested, fallback) = small_file_stage(
-            &reader,
+            &shallow,
             &records,
             &small,
             &mut unreadable,
@@ -261,12 +289,13 @@ pub fn find_duplicates(
     };
     pulse.stage(pulse::HEAD, staged.len() as u64);
     let end_buckets = hash_stage(
-        &reader,
+        &shallow,
         &mut records,
         &staged,
         ends,
         &mut unreadable,
         cache.as_deref_mut(),
+        holding.then_some(held.as_mut_slice()),
     );
     let mut pending: Vec<Vec<usize>> = end_buckets
         .into_iter()
@@ -302,6 +331,7 @@ pub fn find_duplicates(
             Probe::DeepHead { keep: keep_rest },
             &mut unreadable,
             cache.as_deref_mut(),
+            holding.then_some(held.as_mut_slice()),
         );
         pending.extend(rest_buckets.into_iter().filter(|bucket| bucket.len() > 1));
         if keep {
@@ -338,6 +368,7 @@ pub fn find_duplicates(
             Probe::Sample,
             &mut unreadable,
             cache.as_deref_mut(),
+            holding.then_some(held.as_mut_slice()),
         );
         pending.extend(sample_buckets.into_iter().filter(|bucket| bucket.len() > 1));
     }
@@ -382,6 +413,7 @@ pub fn find_duplicates(
         &sequential_pool,
         &mut unreadable,
         pulse,
+        holding.then_some(held.as_mut_slice()),
     );
     settled.extend(compared.matched);
     // The bytes went past anyway, so a group read here is also a group learned.

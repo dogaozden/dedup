@@ -5,12 +5,20 @@
 //! counted after the name filters and before the size filter, which is the
 //! order `dedup.py`'s walkers use and the order the protocol asks for.
 
+use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 
 use crate::filters::{excluded, extension_allowed, Filters};
+use crate::sys::{BulkDir, VDIR, VLNK, VREG};
 
 /// One file. A hardlinked inode is one record wearing several names, because
 /// deleting fewer than all of them frees nothing.
@@ -119,86 +127,304 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
 /// intermediate would have to stay alive while the records were built beside
 /// it, and holding two per-file structures at once is what put the peak over
 /// REWRITE.md §6's budget.
-pub fn walk(
-    root: &Path,
-    filters: Filters,
+/// Where the directory tasks put what they found.
+///
+/// The lock is taken once per directory and never per file: a task builds its
+/// own directory's records into a local vector and appends the whole of it in
+/// one move. Directories outnumber nothing and are outnumbered by files by
+/// two or three orders of magnitude, which is what makes a plain mutex the
+/// right shape here.
+#[derive(Default)]
+struct Harvest {
+    survivors: Mutex<Vec<FileRec>>,
+    unreadable: Mutex<Vec<String>>,
+    files_seen: AtomicU64,
+    bytes_seen: AtomicU64,
+}
+
+/// The pool the walk runs in.
+///
+/// Its own, rather than rayon's global one, for two reasons. It is sized like
+/// the small-file pool and for the same reason — these are directory reads
+/// against one catalog, and past a reader per performance core the extra ones
+/// queue. And the global pool would be a third set of threads alive beside
+/// the two the read stages build, on a machine that has ten cores to give.
+///
+/// Built once per process and only when there is a tree to walk, so a run
+/// that scans nothing never pays for it.
+fn walk_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(crate::device::fast_bound(8))
+            .thread_name(|n| format!("walk-{n}"))
+            .build()
+            .expect("a thread pool of a positive size")
+    })
+}
+
+thread_local! {
+    /// One kernel buffer and name arena per worker, rather than one per
+    /// directory: `BulkDir` carries 128 KiB and a walk visits thousands of
+    /// directories. Nothing inside the borrow spawns or recurses, so it can
+    /// never be re-entered on its own thread.
+    static SCRATCH: RefCell<BulkDir> = RefCell::new(BulkDir::default());
+}
+
+pub fn walk<'a>(
+    root: &'a Path,
+    filters: Filters<'a>,
     files_seen: &mut u64,
     bytes_seen: &mut u64,
     unreadable: &mut Vec<String>,
     pulse: &crate::pulse::Pulse,
 ) -> Vec<FileRec> {
-    let mut survivors = Vec::new();
-    let mut directories = vec![root.to_path_buf()];
+    let harvest = Harvest::default();
+    // Sibling directories have nothing to say to each other, and since the
+    // bulk read landed the walk is most of what a warm rescan does at all —
+    // 87% of that scan's clock, measured. So they are read concurrently.
+    walk_pool().in_place_scope(|scope| {
+        visit(
+            scope,
+            root,
+            root.to_path_buf(),
+            String::new(),
+            filters,
+            &harvest,
+            pulse,
+        );
+    });
 
-    while let Some(directory) = directories.pop() {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
+    *files_seen += harvest.files_seen.load(Ordering::Relaxed);
+    *bytes_seen += harvest.bytes_seen.load(Ordering::Relaxed);
+    unreadable.append(&mut harvest.unreadable.into_inner().expect("no walker panics"));
+    harvest.survivors.into_inner().expect("no walker panics")
+}
+
+/// Read one directory, hand its subdirectories to the pool, and post what it
+/// held.
+///
+/// The order records come back in is now the order tasks happen to finish,
+/// which changes nothing downstream: `candidates` sorts by size then by
+/// (device, inode), and after hardlink folding that is a unique key, so the
+/// records it returns are in the same order whatever order they arrived in.
+/// `unreadable` is sorted in `main` before it is reported.
+#[allow(clippy::too_many_arguments)]
+fn visit<'scope>(
+    scope: &Scope<'scope>,
+    root: &'scope Path,
+    directory: PathBuf,
+    prefix: String,
+    filters: Filters<'scope>,
+    harvest: &'scope Harvest,
+    pulse: &'scope crate::pulse::Pulse,
+) {
+    let mut survivors = Vec::new();
+    let mut children: Vec<(PathBuf, String)> = Vec::new();
+    let mut missed: Vec<String> = Vec::new();
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+
+    SCRATCH.with(|scratch| {
+        let mut bulk = scratch.borrow_mut();
+        // One call for the whole directory, names and attributes together.
+        // Anything the kernel will not describe completely comes back `false`
+        // with nothing reported, and that directory alone takes the portable
+        // path.
+        if bulk.read(&directory) {
+            gather_bulk(
+                &bulk,
+                &directory,
+                &prefix,
+                filters,
+                &mut files,
+                &mut bytes,
+                &mut survivors,
+                &mut children,
+                pulse,
+            );
+        } else {
+            gather_portable(
+                root,
+                &directory,
+                filters,
+                &mut files,
+                &mut bytes,
+                &mut missed,
+                &mut survivors,
+                &mut children,
+                pulse,
+            );
+        }
+    });
+
+    for (child, child_prefix) in children {
+        scope.spawn(move |scope| visit(scope, root, child, child_prefix, filters, harvest, pulse));
+    }
+
+    harvest.files_seen.fetch_add(files, Ordering::Relaxed);
+    harvest.bytes_seen.fetch_add(bytes, Ordering::Relaxed);
+    if !survivors.is_empty() {
+        harvest
+            .survivors
+            .lock()
+            .expect("no walker panics")
+            .append(&mut survivors);
+    }
+    if !missed.is_empty() {
+        harvest
+            .unreadable
+            .lock()
+            .expect("no walker panics")
+            .append(&mut missed);
+    }
+}
+
+/// A directory the kernel described in bulk.
+#[allow(clippy::too_many_arguments)]
+fn gather_bulk(
+    bulk: &BulkDir,
+    directory: &Path,
+    prefix: &str,
+    filters: Filters,
+    files_seen: &mut u64,
+    bytes_seen: &mut u64,
+    survivors: &mut Vec<FileRec>,
+    directories: &mut Vec<(PathBuf, String)>,
+    pulse: &crate::pulse::Pulse,
+) {
+    for (name, entry) in bulk.entries() {
+        let relative = child_relative(prefix, name);
+        // Tested before the entry is looked at any further, so an excluded
+        // directory is never entered and nothing inside it can be tripped
+        // over on the way in.
+        if excluded(&relative, &filters) {
+            continue;
+        }
+        if entry.objtype == VLNK {
+            continue;
+        }
+        if entry.objtype == VDIR {
+            // Joined from the raw name rather than the relative one: only the
+            // relative spelling folds a backslash onto a slash, and the path
+            // we open has to stay the name the kernel gave us.
+            directories.push((directory.join(OsStr::from_bytes(name)), relative));
+            continue;
+        }
+        if entry.objtype != VREG || !extension_allowed(&relative, &filters) {
+            continue;
+        }
+
+        *files_seen += 1;
+        *bytes_seen += entry.size;
+        pulse.walked(entry.size);
+        if entry.size < filters.min_size {
+            continue;
+        }
+        survivors.push(FileRec {
+            names: vec![relative],
+            size: entry.size,
+            dev: entry.dev,
+            ino: entry.ino,
+            nlink: entry.nlink,
+            mtime_ns: entry.mtime_ns,
+            retained: None,
+        });
+    }
+}
+
+/// `prefix/name`, spelled the way `relative_path` spells it.
+fn child_relative(prefix: &str, name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
+    let mut relative = String::with_capacity(prefix.len() + 1 + name.len());
+    if !prefix.is_empty() {
+        relative.push_str(prefix);
+        relative.push('/');
+    }
+    for character in name.chars() {
+        relative.push(if character == '\\' { '/' } else { character });
+    }
+    relative
+}
+
+/// The portable walk, for a directory `getattrlistbulk` would not describe.
+#[allow(clippy::too_many_arguments)]
+fn gather_portable(
+    root: &Path,
+    directory: &Path,
+    filters: Filters,
+    files_seen: &mut u64,
+    bytes_seen: &mut u64,
+    unreadable: &mut Vec<String>,
+    survivors: &mut Vec<FileRec>,
+    directories: &mut Vec<(PathBuf, String)>,
+    pulse: &crate::pulse::Pulse,
+) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            unreadable.push(relative_path(root, directory));
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(_) => {
-                unreadable.push(relative_path(root, &directory));
+                unreadable.push(relative_path(root, directory));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let relative = relative_path(root, &path);
+        // Tested before the entry is looked at any further, so an excluded
+        // directory is never entered and nothing inside it can be tripped
+        // over on the way in.
+        if excluded(&relative, &filters) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                unreadable.push(relative);
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            directories.push((path, relative));
+            continue;
+        }
+        if !file_type.is_file() || !extension_allowed(&relative, &filters) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                unreadable.push(relative);
                 continue;
             }
         };
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    unreadable.push(relative_path(root, &directory));
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let relative = relative_path(root, &path);
-            // Tested before the entry is looked at any further, so an excluded
-            // directory is never entered and nothing inside it can be tripped
-            // over on the way in.
-            if excluded(&relative, &filters) {
-                continue;
-            }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => {
-                    unreadable.push(relative);
-                    continue;
-                }
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                directories.push(path);
-                continue;
-            }
-            if !file_type.is_file() || !extension_allowed(&relative, &filters) {
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    unreadable.push(relative);
-                    continue;
-                }
-            };
-
-            *files_seen += 1;
-            *bytes_seen += metadata.len();
-            pulse.walked(metadata.len());
-            if metadata.len() < filters.min_size {
-                continue;
-            }
-            survivors.push(FileRec {
-                names: vec![relative],
-                size: metadata.len(),
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-                nlink: metadata.nlink(),
-                mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-                retained: None,
-            });
+        *files_seen += 1;
+        *bytes_seen += metadata.len();
+        pulse.walked(metadata.len());
+        if metadata.len() < filters.min_size {
+            continue;
         }
+        survivors.push(FileRec {
+            names: vec![relative],
+            size: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            nlink: metadata.nlink(),
+            mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+            retained: None,
+        });
     }
-
-    survivors
 }
 
 /// Fold the names of one inode, whose records sit at `[..]`, onto the first.
