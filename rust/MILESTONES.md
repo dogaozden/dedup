@@ -2193,6 +2193,39 @@ than its `KeyCode`, as the browser does) and it belongs to whoever owns M5.1.
   one stale line on a terminal that is otherwise exactly as it was found. I
   left it, rather than decide that quietly.
 
+  Chasing that question one step further turned up something worse, and older.
+  A **signal from anywhere but the keyboard, while the browser holds the
+  terminal, wrecks it** — and that is M5's, not M5.2's. Ctrl-C typed at the
+  browser is safe, and safe for a reason worth stating: raw mode clears `ISIG`,
+  so no signal is raised at all and the keystroke arrives as a key event that
+  `key_for` maps to `Key::Quit`. But `kill -INT`, a supervisor, or a shell's
+  `kill %1` skips the terminal entirely, and a default signal disposition
+  terminates without unwinding — so neither the `Restore` drop guard nor the
+  panic hook runs. Driven on a pty, `(canonical, echo, ISIG)` sampled before,
+  during and after:
+
+  ```text
+  how: keyboard
+  (canonical, echo, ISIG) before/during/after: (True, True, True) (False, False, False) (True, True, True)
+  exit: 0
+  alt screen entered: 2  left: 2
+  terminal came back as it was: True
+
+  how: kill
+  (canonical, echo, ISIG) before/during/after: (True, True, True) (False, False, False) (False, False, False)
+  exit: -2
+  alt screen entered: 2  left: 1
+  terminal came back as it was: False
+  ```
+
+  Byte-for-byte the same on `main@fbc196d`, so it predates this branch. The
+  terminal is left in raw mode with the alternate screen still on — the M5.4
+  law, failed, by the one exit path M5's own drop guard and panic hook cannot
+  cover. Terminal *death* is covered and passes (`tui-terminal-death.py`, 4/4);
+  it is a signal, specifically, that goes unhandled, because the crate installs
+  no signal handler anywhere. Reported and not fixed: it is another milestone's
+  screen, and the fix is the same `libc::signal` machinery I declined above.
+
 - **Nothing here is deletion-adjacent**, and the `ProvenGroups` guard, the
   survivor guard and `verify_attested` are untouched. `--gate all` is 33/33 and
   the piped stdout is byte-identical to `main`'s.

@@ -2262,6 +2262,20 @@ tree and counted them as survivors), and start the too-small case roomy and
 shrink the pty once the browser has it, because the menu now refuses below
 54x16 before the browser is ever reached. 0 differing after, on both builds.
 
+Asking what ctrl-c does to my own progress line led somewhere older and worse.
+Ctrl-C typed at the browser is safe, and for a reason worth writing down: raw
+mode clears `ISIG`, so the keystroke raises no signal at all and arrives as a
+key event that `key_for` maps to `Key::Quit`. A signal from anywhere else —
+`kill -INT`, a supervisor, a shell's `kill %1` — skips the terminal entirely,
+and a default disposition terminates without unwinding, so neither the
+`Restore` drop guard nor the panic hook runs. The terminal is left in raw mode
+with the alternate screen still up. Byte-for-byte the same on `main@fbc196d`,
+so it predates this branch; terminal *death* is covered and passes, and it is a
+signal specifically that goes unhandled, because the crate installs no signal
+handler anywhere. That is the M5.4 law failed by the one exit path M5's two
+mechanisms cannot cover. Reported, not fixed — another milestone's screen, and
+the same `libc::signal` machinery I declined for my own line.
+
 Two scripts I did not fix, because what they turn up is not a harness bug.
 `m5_terminal_restore.py`'s ctrl-c case fails, and running it down found that
 **ctrl-c does not leave the pre-flight menu**: the browser checks
