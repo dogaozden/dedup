@@ -19,7 +19,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::cache::ScanCache;
 use crate::consts::{
-    CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, SLOW_CHUNK, SPIN_INTERLEAVE,
+    CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, PIVOT_WINDOW, SLOW_CHUNK, SPIN_INTERLEAVE,
 };
 use crate::device::Profile;
 use crate::effort::Effort;
@@ -529,6 +529,372 @@ fn lockstep(
     settled
 }
 
+// ---------------------------------------------------- the pivot-window sweep
+
+/// What one member's run against the held window came to.
+enum Verdict {
+    /// Every byte matched.
+    Same,
+    /// The run beginning at this offset disagreed.
+    Apart(usize),
+    /// The member could not be read.
+    Gone,
+}
+
+/// Why a sweep stopped.
+enum Ending {
+    /// Nobody is left matching the pivot.
+    Alone,
+    /// The pivot's file ended, and whoever is left ended with it.
+    Ended,
+    /// Reading reached the kept tail, which settles what is left.
+    AtTail,
+    /// The pivot could not be read.
+    Lost,
+}
+
+/// One pivot's sweep down its group, in the middle of being taken.
+///
+/// Separated from the reading for the reason `Round` is: the interesting case
+/// is a pivot that goes away between one window and the next, and no test can
+/// stage that with a real file. Here it is three method calls.
+struct Sweep {
+    /// Slots still equal to the pivot, in the order they were met.
+    live: Vec<usize>,
+    /// Slots that left, filed under the offset of the run they left in. Two
+    /// members filed under different offsets are already told apart — see the
+    /// law on `split_pivot_windows`.
+    apart: Ordered<usize, usize>,
+    /// How far the live slots have been proved equal to the pivot.
+    matched_to: usize,
+}
+
+impl Sweep {
+    fn over(live: Vec<usize>, from: usize) -> Sweep {
+        Sweep {
+            live,
+            apart: Ordered::new(),
+            matched_to: from,
+        }
+    }
+
+    fn left(&mut self, slot: usize, at: usize) {
+        self.apart.push(at, slot);
+    }
+
+    fn reached(&mut self, to: usize) {
+        self.matched_to = to;
+    }
+
+    /// Who is left matching the pivot, and what is still to compare: one class
+    /// per run a member left in, each already proved equal as far as that run
+    /// begins. A class of one is settled and does not come back.
+    fn residue(self) -> (Vec<usize>, Vec<(Vec<usize>, usize)>) {
+        let Sweep { live, apart, .. } = self;
+        let left = apart
+            .into_pairs()
+            .into_iter()
+            .filter(|(_, slots)| slots.len() > 1)
+            .map(|(at, slots)| (slots, at))
+            .collect();
+        (live, left)
+    }
+
+    /// The pivot went away part-way down the group.
+    ///
+    /// Everything still live agreed with it — and so with each other — as far
+    /// as `matched_to`, so it carries on together under a new pivot from
+    /// exactly there. Settling the class here instead would rest it on a pivot
+    /// the rest of the group was never measured against.
+    fn abandoned(self) -> Vec<(Vec<usize>, usize)> {
+        let at = self.matched_to;
+        let (live, mut left) = self.residue();
+        if live.len() > 1 {
+            left.insert(0, (live, at));
+        }
+        left
+    }
+}
+
+/// What one sweep may hold: the pivot's window, and the run of the one member
+/// being compared against it.
+///
+/// There is no term for the group's width. That is the law M7-PIVOT.md sets,
+/// and the reason a 1,800-member group costs the same here as a pair — where a
+/// lockstep round holds one run per member and shrinks the run to stay inside
+/// `COMPARE_BUDGET`.
+fn held_ceiling(chunk: usize) -> usize {
+    PIVOT_WINDOW.max(chunk) + chunk
+}
+
+/// Compare a group by holding one member's window in memory and streaming the
+/// rest of the group past it, a member at a time.
+///
+/// Lockstep round-robins the head between every member of a group to advance
+/// it one chunk. On a spinning disk that is a seek per member per chunk, and it
+/// is the wall M7-PIVOT.md was commissioned from: stage 5 on the maintainer's
+/// USB disk moved at ~44 MB/s against a ~110-130 MB/s sequential ceiling. Here
+/// a group of N members costs N+1 head movements per WINDOW instead, and a
+/// window grows to sixteen chunks.
+///
+/// **Why the answer is the same answer.** A *run* is one read the pivot asked
+/// for; every member is asked for the same lengths at the same offsets, so the
+/// runs are the same runs for everybody, and comparing a run against the
+/// pivot's is the same `memcmp` on the same boundaries lockstep does.
+///
+/// - A member kept in the pivot's class matched every run to the end of the
+///   pivot's file, so the class the sweep settles is exactly the members equal
+///   to the pivot.
+/// - Two members that left in DIFFERENT runs cannot be equal, and are never
+///   read again to find out: the one that left in the earlier run differs from
+///   the pivot somewhere inside it, and the one that left later matched the
+///   pivot through the whole of that run.
+/// - Two members that left in the SAME run agree with the pivot — and so with
+///   each other — everywhere before it, and are compared among themselves from
+///   exactly there, the first of them becoming the next pivot. Recursively, so
+///   every pair either meets or is told apart by the rule above.
+///
+/// Every member therefore ends in exactly one class, and the classes are the
+/// byte-equality classes — the same partition lockstep reaches, which
+/// `the_two_comparisons_are_the_same_function` holds it to on random shapes.
+///
+/// **What it holds.** One window and one member's run, `PIVOT_WINDOW +
+/// chunk`, however wide the group: the pivot's bytes are held, the members'
+/// stream past. A window starts at `chunk` and doubles, so a member that parts
+/// early costs what the lockstep round it replaces cost.
+fn split_pivot_windows(
+    context: &Compare,
+    records: &[FileRec],
+    members: &[usize],
+    chunk: usize,
+    unreadable: &mut Vec<String>,
+    carried: Vec<Option<File>>,
+) -> Settled {
+    // No pool: one disk, one queue, which is what the profile is for.
+    let reading = match prepare(context, records, members, unreadable, None, carried) {
+        Prepared::Answered(settled) => return settled,
+        Prepared::Reading(reading) => reading,
+    };
+    let Reading {
+        opened,
+        handles,
+        prefix,
+        tail,
+        limit,
+        mut hashers,
+        live,
+    } = reading;
+    let mut settled = Settled::default();
+    let mut matched: Vec<Vec<usize>> = Vec::new();
+    let mut at_tail: Vec<Vec<usize>> = Vec::new();
+    let mut positions: Vec<u64> = vec![prefix as u64; opened.len()];
+    let ceiling = PIVOT_WINDOW.max(chunk);
+
+    // Classes still to settle, each already proved equal as far as the offset
+    // beside it. Taken from the back, so the first class is swept first.
+    let mut pending: Vec<(Vec<usize>, usize)> =
+        live.into_iter().map(|class| (class, prefix)).collect();
+    pending.reverse();
+
+    while let Some((class, from)) = pending.pop() {
+        // A class arrives proved equal as far as `from`, but its members
+        // stopped wherever they last differed, so the handles have to be put
+        // back. One that will not move is one that cannot be compared.
+        let mut ready: Vec<usize> = Vec::with_capacity(class.len());
+        for slot in class {
+            if positions[slot] != from as u64 {
+                let moved = handles[slot]
+                    .lock()
+                    .expect("no reader panics")
+                    .seek(SeekFrom::Start(from as u64))
+                    .is_ok();
+                if !moved {
+                    unreadable.push(records[opened[slot]].path().to_string());
+                    continue;
+                }
+                positions[slot] = from as u64;
+            }
+            ready.push(slot);
+        }
+        if ready.len() < 2 {
+            continue; // a class of one is settled
+        }
+
+        let pivot = ready[0];
+        let mut sweep = Sweep::over(ready[1..].to_vec(), from);
+        let mut offset = from;
+        let mut window = chunk;
+        let mut ending = Ending::Alone;
+        while !sweep.live.is_empty() {
+            let span = match limit {
+                None => window,
+                Some(limit) => window.min(limit.saturating_sub(offset)),
+            };
+            if span == 0 {
+                ending = Ending::AtTail; // everything before the kept tail agrees
+                break;
+            }
+
+            // The pivot's window, read in runs that each carry straight on from
+            // the last, so the whole of it costs one head movement.
+            let mut held: Vec<(usize, Vec<u8>)> = Vec::new();
+            let mut filled = 0;
+            let mut at_end = false;
+            let mut lost = false;
+            while filled < span {
+                let want = chunk.min(span - filled);
+                let block = {
+                    let mut file = handles[pivot].lock().expect("no reader panics");
+                    let where_from = records[opened[pivot]].at(positions[pivot]);
+                    context.effort.read_block(&mut file, want, where_from)
+                };
+                match block {
+                    Ok(block) => {
+                        positions[pivot] += block.len() as u64;
+                        filled += block.len();
+                        at_end = block.len() < want;
+                        held.push((want, block));
+                        if at_end {
+                            break; // short of what it asked for: the file ends here
+                        }
+                    }
+                    Err(_) => {
+                        lost = true;
+                        break;
+                    }
+                }
+            }
+            if lost {
+                ending = Ending::Lost;
+                break;
+            }
+            debug_assert!(
+                held.iter().map(|(_, block)| block.len()).sum::<usize>() + chunk
+                    <= held_ceiling(chunk),
+                "the window budget is the cap"
+            );
+            if context.learn {
+                for (_, block) in &held {
+                    hashers[pivot].update(block);
+                }
+            }
+
+            // Every other member reads the same range, each in one run of its
+            // own, and stops at the first read that disagrees. Asking for the
+            // lengths the pivot asked for is what makes a file that ended
+            // early a member that DIFFERS rather than one that agrees.
+            let mut still: Vec<usize> = Vec::with_capacity(sweep.live.len());
+            for slot in std::mem::take(&mut sweep.live) {
+                let mut done = 0;
+                let mut verdict = Verdict::Same;
+                for (want, theirs) in &held {
+                    let block = {
+                        let mut file = handles[slot].lock().expect("no reader panics");
+                        let where_from = records[opened[slot]].at(positions[slot]);
+                        context.effort.read_block(&mut file, *want, where_from)
+                    };
+                    let Ok(block) = block else {
+                        verdict = Verdict::Gone;
+                        break;
+                    };
+                    positions[slot] += block.len() as u64;
+                    if block != *theirs {
+                        verdict = Verdict::Apart(offset + done);
+                        break;
+                    }
+                    // Only a run that matched goes into the digest: a member
+                    // that leaves is read again from the start of the run it
+                    // left in, and a hasher cannot be wound back.
+                    if context.learn {
+                        hashers[slot].update(&block);
+                    }
+                    done += block.len();
+                }
+                match verdict {
+                    Verdict::Same => still.push(slot),
+                    Verdict::Apart(at) => sweep.left(slot, at),
+                    Verdict::Gone => unreadable.push(records[opened[slot]].path().to_string()),
+                }
+            }
+            sweep.live = still;
+            offset += filled;
+            sweep.reached(offset);
+            if at_end {
+                ending = Ending::Ended;
+                break;
+            }
+            window = window.saturating_mul(2).min(ceiling);
+        }
+
+        let left = match ending {
+            Ending::Lost => {
+                unreadable.push(records[opened[pivot]].path().to_string());
+                sweep.abandoned()
+            }
+            _ => {
+                let (live, left) = sweep.residue();
+                if !live.is_empty() {
+                    let mut class = Vec::with_capacity(live.len() + 1);
+                    class.push(pivot);
+                    class.extend(live);
+                    if matches!(ending, Ending::AtTail) {
+                        at_tail.push(class);
+                    } else {
+                        // Reaching the end of the pivot's file with the class
+                        // still together means everything after the kept head
+                        // agreed. With a kept tail in hand the sweep stops
+                        // short of EOF instead and is learned below, once that
+                        // tail has gone into the digest.
+                        if context.learn && tail == 0 {
+                            for &slot in &class {
+                                settled
+                                    .learned
+                                    .push((opened[slot], hashers[slot].clone().finalize().into()));
+                            }
+                        }
+                        matched.push(class);
+                    }
+                }
+                left
+            }
+        };
+        pending.extend(left.into_iter().rev());
+    }
+
+    // Only reached with a kept tail in hand: the sweeps above stopped short of
+    // EOF and these bytes are what is left of the file.
+    for group in at_tail {
+        let blocks = group
+            .into_iter()
+            .map(|slot| {
+                let kept = records[opened[slot]].tail();
+                (slot, &kept[kept.len() - tail..])
+            })
+            .collect();
+        for run in partition_blocks(blocks) {
+            if run.len() < 2 {
+                continue;
+            }
+            if context.learn {
+                for (slot, block) in &run {
+                    hashers[*slot].update(*block);
+                    settled
+                        .learned
+                        .push((opened[*slot], hashers[*slot].clone().finalize().into()));
+                }
+            }
+            matched.push(tags(run));
+        }
+    }
+
+    settled.matched.extend(
+        matched
+            .into_iter()
+            .map(|run| run.into_iter().map(|slot| opened[slot]).collect()),
+    );
+    settled
+}
+
 /// The exact partition of one cohort, and which of its members could not be
 /// read.
 ///
@@ -778,12 +1144,21 @@ pub fn compare_stage(
     // One disk, one queue, one group at a time, in the order the buckets were
     // sorted into — which is inode order, so the whole stage walks the platter
     // forwards. Waves exist to keep several readers busy and there is only one.
+    //
+    // The descriptors the probes left open are lifted here as they are for
+    // every other group: the sweep opens each member once and keeps it, so a
+    // carried descriptor saves exactly the open the flash path saves. What the
+    // sweep does not carry over from the capped comparison is its width cap —
+    // holding a descriptor costs nothing on a disk that is only ever asked to
+    // read from one of them at a time, and SPIN_INTERLEAVE existed to bound
+    // the round-robin this replaces.
     if context.profile == Profile::Spinning {
         let mut out = Settled::default();
         for bucket in buckets {
             let chunk = compare_chunk(context.profile, bucket.len(), context.solid);
-            out.absorb(split_identical_capped(
-                context, records, bucket, chunk, unreadable,
+            let carried = lift(&mut held, bucket);
+            out.absorb(split_pivot_windows(
+                context, records, bucket, chunk, unreadable, carried,
             ));
             pulse.files(bucket.len() as u64);
         }
@@ -1009,11 +1384,63 @@ mod tests {
         }
     }
 
+    /// What the three comparisons made of one bench: lockstep, the capped
+    /// cohort sweep, and the pivot-window sweep, each normalised.
+    type Answers = (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<Vec<usize>>);
+
+    /// The reading context every comparison in these tests is given.
+    fn reading<'a>(root: &'a std::path::Path, effort: &'a Effort, profile: Profile) -> Compare<'a> {
+        Compare {
+            root,
+            effort,
+            profile,
+            solid: true,
+            learn: false,
+        }
+    }
+
     impl Bench {
         /// One file per letter, every file the same length, files sharing a
         /// letter sharing their bytes. `chunk` says how long, so a caller can
         /// choose whether the comparison takes one round or several.
         fn new(name: &str, classes: &[u8], size: usize) -> Bench {
+            Bench::of(
+                name,
+                classes
+                    .iter()
+                    .map(|&letter| {
+                        // Same bytes everywhere but the last kilobyte, so
+                        // nothing can separate two files without reading them
+                        // to the end.
+                        let mut content = vec![0x5A_u8; size];
+                        let tail = content.len() - 1024;
+                        content[tail..].fill(letter);
+                        content
+                    })
+                    .collect(),
+            )
+        }
+
+        /// Files that agree everywhere except at the offsets named for each of
+        /// them. Two files given the same plan are byte-identical, which is
+        /// how a class is built that parts from the pivot at a chosen depth.
+        fn sculpt(name: &str, size: usize, plans: &[&[(usize, u8)]]) -> Bench {
+            Bench::of(
+                name,
+                plans
+                    .iter()
+                    .map(|plan| {
+                        let mut content = vec![0x5A_u8; size];
+                        for &(at, byte) in plan.iter() {
+                            content[at] = byte;
+                        }
+                        content
+                    })
+                    .collect(),
+            )
+        }
+
+        fn of(name: &str, contents: Vec<Vec<u8>>) -> Bench {
             let root = std::env::temp_dir().join(format!(
                 "feat-capped-{name}-{}-{:?}",
                 std::process::id(),
@@ -1022,14 +1449,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("a scratch directory");
             let mut records = Vec::new();
-            for (position, &letter) in classes.iter().enumerate() {
-                // Same bytes everywhere but the last kilobyte, so nothing can
-                // separate two files without reading them to the end.
-                let mut content = vec![0x5A_u8; size];
-                let tail = content.len() - 1024;
-                content[tail..].fill(letter);
+            for (position, content) in contents.iter().enumerate() {
                 let path = format!("f{position:03}.bin");
-                std::fs::write(root.join(&path), &content).expect("a scratch file");
+                std::fs::write(root.join(&path), content).expect("a scratch file");
                 let meta = std::fs::metadata(root.join(&path)).expect("a stat");
                 use std::os::unix::fs::MetadataExt;
                 records.push(FileRec {
@@ -1038,7 +1460,9 @@ mod tests {
                     dev: meta.dev(),
                     ino: meta.ino(),
                     nlink: meta.nlink(),
-                    mtime_ns: 0,
+                    // The real one, so a record carrying kept bytes survives
+                    // the stat that decides whether they still prove anything.
+                    mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
                     retained: None,
                 });
             }
@@ -1054,20 +1478,35 @@ mod tests {
             .expect("a scratch file we own");
         }
 
-        /// The partition each comparison reaches, normalised so two answers
+        /// Turn a member into a directory under the same name: the open still
+        /// succeeds and every read fails. It is the only way to stage a file
+        /// that goes away with its descriptor already in hand, which is the
+        /// case the sweep's bookkeeping exists for.
+        fn vanish(&self, position: usize) {
+            let path = self.root.join(self.records[position].path());
+            std::fs::remove_file(&path).expect("a scratch file we own");
+            std::fs::create_dir(&path).expect("a scratch directory");
+        }
+
+        /// Hand every record the bytes stage 3 would have kept of it, so the
+        /// comparison starts where the retained head ends and stops where the
+        /// retained tail begins.
+        fn keep(&mut self, head: usize, tail: usize) {
+            for record in self.records.iter_mut() {
+                let whole = std::fs::read(self.root.join(record.path())).expect("a scratch file");
+                let end = whole.len() - tail;
+                record.keep_ends(whole[..head].to_vec(), whole[end..].to_vec());
+            }
+        }
+
+        /// The partition each comparison reaches, normalised so the answers
         /// can be compared regardless of the order they were found in.
-        fn partitions(&self, chunk: usize) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+        fn partitions(&self, chunk: usize) -> Answers {
             let members: Vec<usize> = (0..self.records.len()).collect();
             let effort = Effort::default();
             let mut sink = Vec::new();
             let plain = split_identical(
-                &Compare {
-                    root: &self.root,
-                    effort: &effort,
-                    profile: Profile::Flash,
-                    solid: true,
-                    learn: false,
-                },
+                &reading(&self.root, &effort, Profile::Flash),
                 &self.records,
                 &members,
                 chunk,
@@ -1077,19 +1516,26 @@ mod tests {
             );
             let mut sink = Vec::new();
             let capped = split_identical_capped(
-                &Compare {
-                    root: &self.root,
-                    effort: &effort,
-                    profile: Profile::Spinning,
-                    solid: true,
-                    learn: false,
-                },
+                &reading(&self.root, &effort, Profile::Spinning),
                 &self.records,
                 &members,
                 chunk,
                 &mut sink,
             );
-            (tidy(plain.matched), tidy(capped.matched))
+            let mut sink = Vec::new();
+            let pivot = split_pivot_windows(
+                &reading(&self.root, &effort, Profile::Spinning),
+                &self.records,
+                &members,
+                chunk,
+                &mut sink,
+                Vec::new(),
+            );
+            (
+                tidy(plain.matched),
+                tidy(capped.matched),
+                tidy(pivot.matched),
+            )
         }
     }
 
@@ -1106,9 +1552,10 @@ mod tests {
         // Three times the cohort width, every file the same: the sweep has to
         // gather all of them into one class, across four cohorts.
         let bench = Bench::new("wide", &[b'A'; 24], 8192);
-        let (plain, capped) = bench.partitions(4096);
+        let (plain, capped, pivot) = bench.partitions(4096);
         assert_eq!(capped, vec![(0..24).collect::<Vec<usize>>()]);
         assert_eq!(capped, plain);
+        assert_eq!(pivot, plain);
     }
 
     #[test]
@@ -1120,7 +1567,7 @@ mod tests {
         assert_eq!(SPIN_INTERLEAVE, 8, "this shape is built around the cap");
         let classes = *b"ACCCCCCBBDDDDDDA";
         let bench = Bench::new("boundary", &classes, 8192);
-        let (plain, capped) = bench.partitions(4096);
+        let (plain, capped, pivot) = bench.partitions(4096);
         assert_eq!(
             capped,
             vec![
@@ -1131,6 +1578,7 @@ mod tests {
             ]
         );
         assert_eq!(capped, plain);
+        assert_eq!(pivot, plain);
     }
 
     #[test]
@@ -1139,9 +1587,10 @@ mod tests {
         // be offered to every pivot before it can be called unique.
         let classes = *b"ABCDEFGHIJKLMNOPA";
         let bench = Bench::new("singletons", &classes, 8192);
-        let (plain, capped) = bench.partitions(4096);
+        let (plain, capped, pivot) = bench.partitions(4096);
         assert_eq!(capped, vec![vec![0, 16]]);
         assert_eq!(capped, plain);
+        assert_eq!(pivot, plain);
     }
 
     #[test]
@@ -1150,8 +1599,9 @@ mod tests {
         // rounds inside each cohort and the divergence is in the last one.
         let classes = *b"AABBBCAAAAABBCCCCA";
         let bench = Bench::new("rounds", &classes, 32 * 1024);
-        let (plain, capped) = bench.partitions(4096);
+        let (plain, capped, pivot) = bench.partitions(4096);
         assert_eq!(capped, plain);
+        assert_eq!(pivot, plain);
         assert_eq!(
             capped,
             vec![
@@ -1182,13 +1632,10 @@ mod tests {
                 .map(|_| b'A' + next(variety as u64) as u8)
                 .collect();
             let bench = Bench::new(&format!("shape{shape}"), &classes, 8192);
-            let (plain, capped) = bench.partitions(4096);
-            assert_eq!(
-                capped,
-                plain,
-                "shape {shape}: {:?}",
-                String::from_utf8_lossy(&classes)
-            );
+            let (plain, capped, pivot) = bench.partitions(4096);
+            let says = String::from_utf8_lossy(&classes).into_owned();
+            assert_eq!(capped, plain, "shape {shape}: {says}");
+            assert_eq!(pivot, plain, "shape {shape}: {says}");
         }
     }
 
@@ -1311,5 +1758,500 @@ mod tests {
         // One round of four cohorts: 8 + 8 + 8 + 3 files, the pivot re-opened
         // in each. Anything wider would mean the cap is not being applied.
         assert_eq!(effort.opens(), 27);
+    }
+
+    // -------------------------------------------------------- the pivot windows
+
+    /// The chunk every shape below is built around. A window starts there and
+    /// doubles, so with a group read from offset zero the windows are
+    /// `[0, C)`, `[C, 3C)`, `[3C, 7C)`, `[7C, 15C)`, and the runs inside them
+    /// are every C bytes.
+    const C: usize = 4096;
+
+    /// Long enough for four windows and an end: the shapes below put their
+    /// divergence in each of them in turn.
+    const SPAN: usize = 16 * C;
+
+    fn sweep(
+        bench: &Bench,
+        chunk: usize,
+        effort: &Effort,
+        unreadable: &mut Vec<String>,
+    ) -> Settled {
+        let members: Vec<usize> = (0..bench.records.len()).collect();
+        split_pivot_windows(
+            &reading(&bench.root, effort, Profile::Spinning),
+            &bench.records,
+            &members,
+            chunk,
+            unreadable,
+            Vec::new(),
+        )
+    }
+
+    fn march(
+        bench: &Bench,
+        chunk: usize,
+        effort: &Effort,
+        unreadable: &mut Vec<String>,
+    ) -> Settled {
+        let members: Vec<usize> = (0..bench.records.len()).collect();
+        split_identical(
+            &reading(&bench.root, effort, Profile::Flash),
+            &bench.records,
+            &members,
+            chunk,
+            unreadable,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Two pairs that agree everywhere but the byte at `at`.
+    fn parting(name: &str, at: usize) -> Bench {
+        Bench::sculpt(name, SPAN, &[&[], &[], &[(at, b'B')], &[(at, b'B')]])
+    }
+
+    fn classes(bench: &Bench, chunk: usize) -> Vec<Vec<usize>> {
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        tidy(sweep(bench, chunk, &effort, &mut sink).matched)
+    }
+
+    #[test]
+    fn a_divergence_in_the_first_window_splits_the_group() {
+        assert_eq!(classes(&parting("first", 100), C), [[0, 1], [2, 3]]);
+    }
+
+    #[test]
+    fn a_divergence_in_a_middle_window_splits_the_group() {
+        // Inside `[3C, 7C)`, the third window, with windows either side of it.
+        assert_eq!(classes(&parting("middle", 5 * C), C), [[0, 1], [2, 3]]);
+    }
+
+    #[test]
+    fn a_divergence_in_the_last_window_splits_the_group() {
+        // Past `15C`, so only the run that reaches the end of the file can
+        // separate them.
+        assert_eq!(classes(&parting("last", SPAN - 7), C), [[0, 1], [2, 3]]);
+    }
+
+    #[test]
+    fn a_divergence_on_a_window_boundary_splits_the_group() {
+        // Either side of every boundary a doubling window has in this file,
+        // plus the first and last byte of the file itself. An off-by-one in
+        // where a window starts or ends loses one of these.
+        for at in [
+            0,
+            1,
+            C - 1,
+            C,
+            C + 1,
+            3 * C - 1,
+            3 * C,
+            3 * C + 1,
+            7 * C - 1,
+            7 * C,
+            7 * C + 1,
+            15 * C - 1,
+            15 * C,
+            15 * C + 1,
+            SPAN - 1,
+        ] {
+            let bench = parting(&format!("edge{at}"), at);
+            assert_eq!(classes(&bench, C), [[0, 1], [2, 3]], "parting at {at}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_finds_the_same_classes_wherever_the_files_part() {
+        // The named cases above, exhaustively: every run boundary and a spread
+        // of offsets between them, each checked against the lockstep answer
+        // rather than against a hand-written one.
+        for at in (0..SPAN).step_by(311).chain((0..16).map(|run| run * C)) {
+            let bench = parting(&format!("walk{at}"), at);
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            let lock = tidy(march(&bench, C, &effort, &mut sink).matched);
+            assert_eq!(classes(&bench, C), lock, "parting at {at}");
+        }
+    }
+
+    #[test]
+    fn two_members_that_left_the_pivot_together_are_compared_to_each_other() {
+        // The residue regroup, in one run: 1 and 2 both part from the pivot at
+        // the same byte and are equal to each other. Nothing in the pivot's own
+        // sweep can see that, so a sweep that dropped its leavers would report
+        // no group at all.
+        let bench = Bench::sculpt(
+            "residue-one-run",
+            SPAN,
+            &[&[], &[(5 * C + 7, b'X')], &[(5 * C + 7, b'X')]],
+        );
+        assert_eq!(classes(&bench, C), [[1, 2]]);
+    }
+
+    #[test]
+    fn two_members_that_left_the_pivot_in_different_runs_still_find_their_own() {
+        // The residue spans two windows: 1 leaves in the first, 2 and 3 in the
+        // fourth. 2 and 3 are equal and must still be found, and 1 must join
+        // neither — it differs from both at the byte it left over.
+        let bench = Bench::sculpt(
+            "residue-two-runs",
+            SPAN,
+            &[&[], &[(200, b'X')], &[(9 * C, b'Y')], &[(9 * C, b'Y')]],
+        );
+        assert_eq!(classes(&bench, C), [[2, 3]]);
+    }
+
+    #[test]
+    fn a_residue_that_is_two_classes_is_split_again_rather_than_merged() {
+        // Four members leave the pivot in the same run, as two pairs. The
+        // regroup has to run a second time to tell the pairs apart: a sweep
+        // that took "left in the same run" for "equal" would merge two files
+        // that differ, which is the failure this stage exists to prevent.
+        let at = 5 * C + 900;
+        let bench = Bench::sculpt(
+            "residue-two-classes",
+            SPAN,
+            &[
+                &[],
+                &[(at, b'X')],
+                &[(at, b'X')],
+                &[(at, b'Y')],
+                &[(at, b'Y')],
+            ],
+        );
+        assert_eq!(classes(&bench, C), [[1, 2], [3, 4]]);
+    }
+
+    #[test]
+    fn members_that_left_in_one_run_at_different_bytes_are_not_merged() {
+        // Both leave the pivot inside the run beginning at `5C`, seven hundred
+        // bytes apart. They are filed together and then told apart by reading
+        // that run again against each other.
+        let bench = Bench::sculpt(
+            "residue-same-run-apart",
+            SPAN,
+            &[&[], &[(5 * C + 10, b'X')], &[(5 * C + 710, b'X')]],
+        );
+        assert!(classes(&bench, C).is_empty());
+    }
+
+    #[test]
+    fn a_residue_class_that_parts_later_parts_at_the_right_byte() {
+        // 1 and 2 leave the pivot together and agree for another two windows
+        // before parting from each other. The second sweep has to carry on
+        // from where the first left off and still read to the end.
+        let bench = Bench::sculpt(
+            "residue-deep",
+            SPAN,
+            &[
+                &[],
+                &[(C + 5, b'X'), (11 * C, b'M')],
+                &[(C + 5, b'X'), (11 * C, b'N')],
+                &[(C + 5, b'X'), (11 * C, b'M')],
+            ],
+        );
+        assert_eq!(classes(&bench, C), [[1, 3]]);
+    }
+
+    #[test]
+    fn a_file_shorter_than_one_window_is_compared_in_one() {
+        for size in [1, 7, 1024, C - 1, C, C + 1] {
+            let bench = Bench::sculpt(
+                &format!("tiny{size}"),
+                size,
+                &[&[], &[], &[(size - 1, b'B')]],
+            );
+            assert_eq!(classes(&bench, C), [[0, 1]], "at {size} bytes");
+        }
+    }
+
+    #[test]
+    fn groups_of_two_of_three_and_of_many_all_come_back_whole() {
+        for width in [2, 3, 9, 64] {
+            let bench = Bench::new(&format!("width{width}"), &vec![b'A'; width], SPAN);
+            assert_eq!(
+                classes(&bench, C),
+                [(0..width).collect::<Vec<usize>>()],
+                "a group of {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_where_nothing_matches_reports_nothing() {
+        let letters: Vec<u8> = (0..12).map(|position| b'A' + position).collect();
+        let bench = Bench::new("allunique", &letters, SPAN);
+        assert!(classes(&bench, C).is_empty());
+    }
+
+    #[test]
+    fn a_pivot_that_cannot_be_read_hands_its_class_to_the_next_one() {
+        // The open succeeds and the read does not, which is a file that went
+        // away with the descriptor already in hand. Nothing it was measured
+        // against may be settled on it, and nobody may be stranded.
+        let bench = Bench::new("lostpivot", b"AAAABB", SPAN);
+        bench.vanish(0);
+        let effort = Effort::default();
+        let mut unreadable = Vec::new();
+        let settled = sweep(&bench, C, &effort, &mut unreadable);
+        assert_eq!(tidy(settled.matched), [vec![1, 2, 3], vec![4, 5]]);
+        assert_eq!(unreadable, ["f000.bin"]);
+    }
+
+    #[test]
+    fn a_member_that_cannot_be_read_leaves_the_rest_of_its_group_alone() {
+        let bench = Bench::new("lostmember", b"AAAABBB", SPAN);
+        bench.lock(1); // the open fails
+        bench.vanish(5); // the open works and the read does not
+        let effort = Effort::default();
+        let mut unreadable = Vec::new();
+        let settled = sweep(&bench, C, &effort, &mut unreadable);
+        assert_eq!(tidy(settled.matched), [vec![0, 2, 3], vec![4, 6]]);
+        unreadable.sort();
+        assert_eq!(unreadable, ["f001.bin", "f005.bin"]);
+    }
+
+    #[test]
+    fn the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window() {
+        // The point of the profile, in the two counters that see it. Lockstep
+        // charges a head movement per member per chunk; the sweep charges one
+        // per member per window, and a window doubles.
+        let bench = Bench::new("runs", &[b'A'; 8], 128 * C);
+        let lock = Effort::default();
+        let mut sink = Vec::new();
+        march(&bench, C, &lock, &mut sink);
+        let spin = Effort::default();
+        let mut sink = Vec::new();
+        sweep(&bench, C, &spin, &mut sink);
+
+        assert_eq!(lock.opens(), 8);
+        assert_eq!(spin.opens(), 8, "one open per member, and it is kept");
+        assert_eq!(
+            spin.bytes_read(),
+            lock.bytes_read(),
+            "identical files: every byte read once, whichever order"
+        );
+        // 128 chunks: lockstep takes 129 rounds (the last one finds the end)
+        // and moves the head once per member per round. The sweep's windows
+        // are 1, 2, 4, 8, 16, 32, 64 chunks — 127 of them — and then one more
+        // that finds the end, at one movement per member per window.
+        assert_eq!(lock.seeks(), 129 * 8);
+        assert_eq!(spin.seeks(), 8 * 8);
+    }
+
+    #[test]
+    fn the_window_budget_is_the_cap_however_wide_the_group_is() {
+        // No term for the group's width, which is the law M7-PIVOT.md sets:
+        // only the pivot's window is held, and members stream against it one
+        // at a time.
+        for chunk in [MIN_CHUNK, SLOW_CHUNK, CHUNK] {
+            assert_eq!(held_ceiling(chunk), PIVOT_WINDOW + chunk);
+        }
+        // ...and the sweep's own debug assertion that it never holds more,
+        // exercised over a group wide enough that a window per member would be
+        // the whole budget many times over.
+        let bench = Bench::new("hold", &[b'A'; 200], 4 * C);
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        let settled = sweep(&bench, C, &effort, &mut sink);
+        assert_eq!(tidy(settled.matched), [(0..200).collect::<Vec<usize>>()]);
+        assert_eq!(effort.opens(), 200);
+    }
+
+    #[test]
+    fn the_kept_head_is_compared_rather_than_read_a_second_time() {
+        let mut bench = Bench::new("kepthead", b"AAB", 8 * C);
+        bench.keep(C, 0);
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        let settled = sweep(&bench, C, &effort, &mut sink);
+        assert_eq!(tidy(settled.matched), [[0, 1]]);
+        assert_eq!(
+            effort.bytes_read(),
+            3 * (8 * C - C) as u64,
+            "three files, each read from the end of its kept head"
+        );
+    }
+
+    #[test]
+    fn the_kept_tail_settles_the_end_without_reading_it() {
+        // The divergence is inside the kept tail, so the sweep must stop short
+        // of it and let the bytes in hand do the splitting.
+        let mut bench = Bench::new("kepttail", b"AAB", 8 * C);
+        bench.keep(C, C);
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        let settled = sweep(&bench, C, &effort, &mut sink);
+        assert_eq!(tidy(settled.matched), [[0, 1]]);
+        assert_eq!(
+            effort.bytes_read(),
+            3 * (8 * C - C - C) as u64,
+            "neither end is read a second time"
+        );
+    }
+
+    #[test]
+    fn a_group_read_here_is_learned_as_the_digest_of_the_whole_file() {
+        for (name, head, tail) in [("plain", 0, 0), ("ends", C, C)] {
+            let mut bench = Bench::new(&format!("learn{name}"), b"AAB", 8 * C);
+            if head > 0 || tail > 0 {
+                bench.keep(head, tail);
+            }
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            let members: Vec<usize> = (0..3).collect();
+            let settled = split_pivot_windows(
+                &Compare {
+                    root: &bench.root,
+                    effort: &effort,
+                    profile: Profile::Spinning,
+                    solid: true,
+                    learn: true,
+                },
+                &bench.records,
+                &members,
+                C,
+                &mut sink,
+                Vec::new(),
+            );
+            assert_eq!(settled.learned.len(), 2, "{name}: the pair that matched");
+            for (index, digest) in &settled.learned {
+                let path = bench.root.join(bench.records[*index].path());
+                let whole = std::fs::read(path).expect("a scratch file");
+                assert_eq!(*digest, sha256(&whole), "{name}: file {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_digest_survives_the_regrouping_that_reads_a_run_twice() {
+        // 1 and 2 leave the pivot in the same run and are then compared to
+        // each other from the start of that run — so those bytes go past twice.
+        // A hasher that had eaten them on the way out would learn the digest of
+        // a file that does not exist, and the next scan would match on it.
+        let bench = Bench::sculpt(
+            "relearn",
+            8 * C,
+            &[&[], &[(3 * C + 11, b'X')], &[(3 * C + 11, b'X')]],
+        );
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        let members: Vec<usize> = (0..3).collect();
+        let settled = split_pivot_windows(
+            &Compare {
+                root: &bench.root,
+                effort: &effort,
+                profile: Profile::Spinning,
+                solid: true,
+                learn: true,
+            },
+            &bench.records,
+            &members,
+            C,
+            &mut sink,
+            Vec::new(),
+        );
+        assert_eq!(settled.matched, [vec![1, 2]]);
+        assert_eq!(settled.learned.len(), 2);
+        for (index, digest) in &settled.learned {
+            let path = bench.root.join(bench.records[*index].path());
+            let whole = std::fs::read(path).expect("a scratch file");
+            assert_eq!(*digest, sha256(&whole), "file {index}");
+        }
+    }
+
+    #[test]
+    fn the_two_comparisons_are_the_same_function() {
+        // The property M7-PIVOT.md makes binding, over shapes nobody chose by
+        // hand and at chunk sizes that move every window boundary: the sweep
+        // reaches the partition lockstep reaches, byte for byte. A residue
+        // carried wrongly between windows shows up here as a group lockstep did
+        // not find, or one it did.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |ceiling: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % ceiling
+        };
+        for shape in 0..60 {
+            let size = 512 + next(40_000) as usize;
+            let chunk = 64 + next(6_000) as usize;
+            let variety = 1 + next(5) as usize;
+            let plans: Vec<Vec<(usize, u8)>> = (0..variety)
+                .map(|_| {
+                    (0..1 + next(3))
+                        .map(|_| (next(size as u64) as usize, b'A' + next(3) as u8))
+                        .collect()
+                })
+                .collect();
+            let width = 2 + next(9) as usize;
+            let drawn: Vec<&[(usize, u8)]> = (0..width)
+                .map(|_| plans[next(variety as u64) as usize].as_slice())
+                .collect();
+            let bench = Bench::sculpt(&format!("prop{shape}"), size, &drawn);
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            let lock = tidy(march(&bench, chunk, &effort, &mut sink).matched);
+            assert_eq!(
+                classes(&bench, chunk),
+                lock,
+                "shape {shape}: {width} files of {size} bytes at chunk {chunk}"
+            );
+        }
+    }
+
+    // -------------------------------------------- the sweep's own bookkeeping
+
+    #[test]
+    fn members_that_left_in_different_runs_are_never_compared_again() {
+        let mut sweep = Sweep::over(vec![1, 2, 3, 4], 0);
+        sweep.left(1, 0);
+        sweep.left(2, C);
+        sweep.left(3, 0);
+        sweep.left(4, C);
+        sweep.live = Vec::new();
+        let (live, left) = sweep.residue();
+        assert!(live.is_empty());
+        assert_eq!(left, [(vec![1, 3], 0), (vec![2, 4], C)]);
+    }
+
+    #[test]
+    fn a_member_that_left_on_its_own_is_settled_and_does_not_come_back() {
+        let mut sweep = Sweep::over(vec![1, 2], 0);
+        sweep.left(1, 0);
+        sweep.left(2, C);
+        sweep.live = Vec::new();
+        let (_, left) = sweep.residue();
+        assert!(
+            left.is_empty(),
+            "two classes of one are two settled classes"
+        );
+    }
+
+    #[test]
+    fn a_pivot_that_goes_away_mid_sweep_settles_nothing_and_carries_its_class_on() {
+        // The case a file on disk cannot be made to produce: the pivot is read
+        // for the first window and gone by the second. What it proved in the
+        // first is real — 1 and 2 are equal to each other as far as it got — so
+        // they carry on together from exactly there rather than starting over.
+        let mut sweep = Sweep::over(vec![1, 2, 3], 0);
+        sweep.left(3, 0);
+        sweep.live = vec![1, 2];
+        sweep.reached(C);
+        assert_eq!(sweep.abandoned(), [(vec![1, 2], C)]);
+    }
+
+    #[test]
+    fn a_pivot_that_goes_away_with_one_member_left_strands_nobody() {
+        let mut sweep = Sweep::over(vec![1], 0);
+        sweep.reached(8 * C);
+        assert!(
+            sweep.abandoned().is_empty(),
+            "a class of one is not a group and is not work"
+        );
     }
 }

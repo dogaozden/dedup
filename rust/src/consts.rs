@@ -61,6 +61,18 @@ pub const PARTITION_FANOUT: usize = 256;
 /// `COMPARE_BUDGET` — the widest a group can be read before the round-robin
 /// between its members turns a sequential read into a seek storm.
 pub const SPIN_INTERLEAVE: usize = 8;
+/// How much of one member the `spinning` comparison holds while the rest of
+/// its group streams past it.
+///
+/// This is the ceiling on a window, not its size: a sweep starts at
+/// `SLOW_CHUNK` and doubles until it reaches this, so a member that parts from
+/// the pivot in its first megabytes costs exactly what the lockstep round it
+/// replaces cost, and only a group that keeps agreeing pays for the long
+/// windows that make it cheap. The spinning comparison holds one window and
+/// one member's run — `PIVOT_WINDOW + SLOW_CHUNK` — however wide the group is,
+/// where `COMPARE_BUDGET` bounds a lockstep round, which holds one run per
+/// member. M7-PIVOT.md sets the order of magnitude.
+pub const PIVOT_WINDOW: usize = 256 * 1024 * 1024;
 /// Ceiling on head bytes carried from stage 3 to stage 5 so the compare does
 /// not read them a second time.
 pub const RETAIN_BUDGET: usize = 128 * 1024 * 1024;
