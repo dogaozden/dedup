@@ -702,3 +702,13 @@ reviewer re-running its own suppressed-Enter sabotage rather than trusting
 the builder's capture — is recorded here as completed only in the builder's
 captured form (26 differing, 9 NOT REACHED); the maintainer judged the
 mutant battery and live e2e re-runs above sufficient corroboration.
+
+**Correction, same day:** the e2e and conformance numbers first quoted above
+were produced against a stale `target/release` binary — `menu_mutants.py`
+leaves its last mutant's build in place, and the maintainer's battery ran
+after it without rebuilding. Caught by a smoke test (old help text, `100kb`
+refused). After a forced clean rebuild (`cf3196e9`), both were re-run and
+hold: `m5_end_to_end.py` 0 differing, `--gate all` 33/33 green. The mutant
+battery's own 8/8 is unaffected (it builds its own binaries). Lesson for the
+next battery: `cargo build --release` after any mutant script, before
+anything else runs the binary.
