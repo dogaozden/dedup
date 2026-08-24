@@ -1,0 +1,11 @@
+tree                  files  groups   flash seeks  spinning seeks   flash bytes  spinning bytes  verdict
+tails                     5       2            18              18        319488          425984  same
+middles                   3       1            63               9      27856896        26279936  same
+last-chunk                3       1            60              12      38805504        56623104  same
+cohort-boundary          16       4           110              76      33554432        35389440  same
+wide                     24       1           693              72     239075328       226492416  same
+links                     6       2            16              12       1048576         1048576  same
+unreadable                5       1            70               9      29884416        28311552  same
+mixed                    46      10           132              75      20717575        45826056  same
+
+8 trees, every profile identical to the oracle

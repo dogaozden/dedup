@@ -19,7 +19,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::cache::ScanCache;
 use crate::consts::{
-    CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, PIVOT_WINDOW, SLOW_CHUNK, SPIN_INTERLEAVE,
+    CHUNK, COMPARE_BUDGET, MIN_CHUNK, PARTITION_FANOUT, PIVOT_GROWTH, PIVOT_RUN, PIVOT_WINDOW,
+    SLOW_CHUNK, SPIN_INTERLEAVE,
 };
 use crate::device::Profile;
 use crate::effort::Effort;
@@ -616,6 +617,12 @@ impl Sweep {
     }
 }
 
+/// How much of a window is read at a time — see `PIVOT_RUN`. Never longer than
+/// the chunk, so a caller asking for short reads gets them.
+fn pivot_run(chunk: usize) -> usize {
+    chunk.min(PIVOT_RUN)
+}
+
 /// What one sweep may hold: the pivot's window, and the run of the one member
 /// being compared against it.
 ///
@@ -624,7 +631,7 @@ impl Sweep {
 /// lockstep round holds one run per member and shrinks the run to stay inside
 /// `COMPARE_BUDGET`.
 fn held_ceiling(chunk: usize) -> usize {
-    PIVOT_WINDOW.max(chunk) + chunk
+    PIVOT_WINDOW.max(chunk) + pivot_run(chunk)
 }
 
 /// Compare a group by holding one member's window in memory and streaming the
@@ -658,10 +665,17 @@ fn held_ceiling(chunk: usize) -> usize {
 /// byte-equality classes — the same partition lockstep reaches, which
 /// `the_two_comparisons_are_the_same_function` holds it to on random shapes.
 ///
-/// **What it holds.** One window and one member's run, `PIVOT_WINDOW +
-/// chunk`, however wide the group: the pivot's bytes are held, the members'
-/// stream past. A window starts at `chunk` and doubles, so a member that parts
-/// early costs what the lockstep round it replaces cost.
+/// **What it holds.** One window and one member's run, `held_ceiling`, however
+/// wide the group: the pivot's bytes are held, the members' stream past.
+///
+/// **Windows and runs are two different sizes, for two different reasons.** A
+/// window is what a head movement buys — it starts at `chunk` and grows by
+/// `PIVOT_GROWTH` to `PIVOT_WINDOW`, so a group that parts early costs what
+/// the lockstep round it replaces cost, and one that keeps agreeing pays a
+/// movement per member per 256 MiB. A run is what a parting is placed to, and
+/// since runs inside a window carry straight on from each other they cost no
+/// movement at all — so `PIVOT_RUN` is short, and a member that parts is read
+/// barely past the byte it parted at.
 fn split_pivot_windows(
     context: &Compare,
     records: &[FileRec],
@@ -689,6 +703,7 @@ fn split_pivot_windows(
     let mut at_tail: Vec<Vec<usize>> = Vec::new();
     let mut positions: Vec<u64> = vec![prefix as u64; opened.len()];
     let ceiling = PIVOT_WINDOW.max(chunk);
+    let run = pivot_run(chunk);
 
     // Classes still to settle, each already proved equal as far as the offset
     // beside it. Taken from the back, so the first class is swept first.
@@ -742,7 +757,7 @@ fn split_pivot_windows(
             let mut at_end = false;
             let mut lost = false;
             while filled < span {
-                let want = chunk.min(span - filled);
+                let want = run.min(span - filled);
                 let block = {
                     let mut file = handles[pivot].lock().expect("no reader panics");
                     let where_from = records[opened[pivot]].at(positions[pivot]);
@@ -769,7 +784,7 @@ fn split_pivot_windows(
                 break;
             }
             debug_assert!(
-                held.iter().map(|(_, block)| block.len()).sum::<usize>() + chunk
+                held.iter().map(|(_, block)| block.len()).sum::<usize>() + run
                     <= held_ceiling(chunk),
                 "the window budget is the cap"
             );
@@ -823,7 +838,7 @@ fn split_pivot_windows(
                 ending = Ending::Ended;
                 break;
             }
-            window = window.saturating_mul(2).min(ceiling);
+            window = window.saturating_mul(PIVOT_GROWTH).min(ceiling);
         }
 
         let left = match ending {
@@ -2036,10 +2051,11 @@ mod tests {
         );
         // 128 chunks: lockstep takes 129 rounds (the last one finds the end)
         // and moves the head once per member per round. The sweep's windows
-        // are 1, 2, 4, 8, 16, 32, 64 chunks — 127 of them — and then one more
-        // that finds the end, at one movement per member per window.
+        // are 1, 4, 16 and 64 chunks — 85 of them — and then a fifth that asks
+        // for 256 and finds the last 43 and the end, at one movement per
+        // member per window.
         assert_eq!(lock.seeks(), 129 * 8);
-        assert_eq!(spin.seeks(), 8 * 8);
+        assert_eq!(spin.seeks(), 5 * 8);
     }
 
     #[test]
@@ -2048,8 +2064,9 @@ mod tests {
         // only the pivot's window is held, and members stream against it one
         // at a time.
         for chunk in [MIN_CHUNK, SLOW_CHUNK, CHUNK] {
-            assert_eq!(held_ceiling(chunk), PIVOT_WINDOW + chunk);
+            assert_eq!(held_ceiling(chunk), PIVOT_WINDOW + chunk.min(PIVOT_RUN));
         }
+        assert_eq!(held_ceiling(SLOW_CHUNK), PIVOT_WINDOW + PIVOT_RUN);
         // ...and the sweep's own debug assertion that it never holds more,
         // exercised over a group wide enough that a window per member would be
         // the whole budget many times over.
@@ -2200,6 +2217,139 @@ mod tests {
                 classes(&bench, chunk),
                 lock,
                 "shape {shape}: {width} files of {size} bytes at chunk {chunk}"
+            );
+        }
+    }
+
+    // --------------------------------- runs shorter than the chunk asked for
+
+    /// Every shape above reads at chunks below `PIVOT_RUN`, where a run IS the
+    /// chunk. The spinning profile's real chunk is `SLOW_CHUNK`, a hundred and
+    /// twenty-eight times longer than a run, and the split between the two is
+    /// what keeps the residue cheap. These read at a chunk above the run.
+    const LONG: usize = 4 * PIVOT_RUN;
+
+    #[test]
+    fn a_window_longer_than_a_run_is_still_split_at_the_right_byte() {
+        // Two windows of four runs each, with the parting walked across every
+        // run boundary in them and either side of each.
+        let size = 12 * PIVOT_RUN;
+        for at in [
+            0,
+            PIVOT_RUN - 1,
+            PIVOT_RUN,
+            2 * PIVOT_RUN + 3,
+            4 * PIVOT_RUN - 1,
+            4 * PIVOT_RUN,
+            7 * PIVOT_RUN,
+            size - 1,
+        ] {
+            let bench = Bench::sculpt(
+                &format!("longrun{at}"),
+                size,
+                &[&[], &[], &[(at, b'B')], &[(at, b'B')]],
+            );
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            let lock = tidy(march(&bench, LONG, &effort, &mut sink).matched);
+            assert_eq!(classes(&bench, LONG), lock, "parting at {at}");
+            assert_eq!(classes(&bench, LONG), [[0, 1], [2, 3]], "parting at {at}");
+        }
+    }
+
+    #[test]
+    fn a_member_that_parts_is_read_to_the_end_of_its_run_and_no_further() {
+        // The reason a run is short, and the reason the first window is only a
+        // chunk long. Two files of eight runs that part in their first
+        // kilobyte cost the pivot one window — a chunk, exactly what lockstep's
+        // first round reads from each member — and the member one run.
+        let size = 8 * PIVOT_RUN;
+        let bench = Bench::sculpt("earlypart", size, &[&[], &[(64, b'B')]]);
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        assert!(sweep(&bench, LONG, &effort, &mut sink).matched.is_empty());
+        assert_eq!(effort.bytes_read(), (LONG + PIVOT_RUN) as u64);
+
+        // ...where lockstep at the same chunk reads one from each.
+        let plain = Effort::default();
+        let mut sink = Vec::new();
+        march(&bench, LONG, &plain, &mut sink);
+        assert_eq!(plain.bytes_read(), 2 * LONG as u64);
+    }
+
+    #[test]
+    fn a_residue_is_read_again_from_its_own_run_rather_than_from_the_start() {
+        // Four content classes in a file that fits inside one chunk — the
+        // shape the differential calls `cohort-boundary`, and the one a sweep
+        // that regrouped from offset zero reads three times over. Here every
+        // class parts in the last run, so the three passes after the first
+        // cost one run per member instead of one file per member.
+        let size = 8 * PIVOT_RUN;
+        let at = size - 100;
+        let bench = Bench::sculpt(
+            "residue-runs",
+            size,
+            &[
+                &[],
+                &[],
+                &[(at, b'B')],
+                &[(at, b'B')],
+                &[(at, b'C')],
+                &[(at, b'C')],
+                &[(at, b'D')],
+                &[(at, b'D')],
+            ],
+        );
+        let effort = Effort::default();
+        let mut sink = Vec::new();
+        let settled = sweep(&bench, LONG, &effort, &mut sink);
+        assert_eq!(
+            tidy(settled.matched),
+            [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
+        );
+        // Eight files read whole, then the six that parted read again a run at
+        // a time: 6, then 4, then 2 — never the whole file a second time.
+        assert_eq!(
+            effort.bytes_read(),
+            (8 * size + 12 * PIVOT_RUN) as u64,
+            "a class re-read from zero would cost far more than this"
+        );
+    }
+
+    #[test]
+    fn the_two_comparisons_agree_where_a_window_holds_several_runs() {
+        // The property test again, at a chunk above `PIVOT_RUN`, so windows
+        // hold several runs and the residue offsets are run boundaries rather
+        // than window ones.
+        let mut state = 0xDEAD_BEEF_1234_5678_u64;
+        let mut next = move |ceiling: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % ceiling
+        };
+        for shape in 0..12 {
+            let size = 2 * PIVOT_RUN + next(6 * PIVOT_RUN as u64) as usize;
+            let variety = 1 + next(4) as usize;
+            let plans: Vec<Vec<(usize, u8)>> = (0..variety)
+                .map(|_| {
+                    (0..1 + next(3))
+                        .map(|_| (next(size as u64) as usize, b'A' + next(3) as u8))
+                        .collect()
+                })
+                .collect();
+            let width = 2 + next(6) as usize;
+            let drawn: Vec<&[(usize, u8)]> = (0..width)
+                .map(|_| plans[next(variety as u64) as usize].as_slice())
+                .collect();
+            let bench = Bench::sculpt(&format!("longprop{shape}"), size, &drawn);
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            let lock = tidy(march(&bench, LONG, &effort, &mut sink).matched);
+            assert_eq!(
+                classes(&bench, LONG),
+                lock,
+                "shape {shape}: {width} files of {size} bytes"
             );
         }
     }

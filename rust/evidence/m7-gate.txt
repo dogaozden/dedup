@@ -1,0 +1,58 @@
+$ ls /Volumes   (before)
+\]
+dedupbench
+
+$ python3 conformance/run.py --gate all \
+    --candidate 'rust/target/release/dedup-rs {root} --report-json {json} {flags} {stage}'
+
+M1 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M2 gate
+  mixed                    pass
+  mixed-minsize            pass
+  mixed-ext                pass
+  mixed-skipext            pass
+  mixed-exclude            pass
+  smallzoo                 pass
+  smallzoo-j1              pass
+  prefix                   pass
+  bighead                  pass
+  bighead-j8               pass
+  links                    pass
+  adversarial              pass
+  deletion                 pass
+
+M3 gate
+  m3-cold                  pass (13.0 MB read)
+  m3-warm                  pass (0.0 MB read)
+  m3-poison-refusal        pass
+  m3-same-second           pass
+
+M4 gate
+  m4-deletion              pass
+  m4-links                 pass
+  m4-trashes               pass
+
+33 check(s), 0 failed
+gate all: green
+   exit 0
+
+$ ls /Volumes   (after)
+\]
+dedupbench
+
+$ hdiutil info | grep -c dedupconf   (0 = the check detached its image)
+0

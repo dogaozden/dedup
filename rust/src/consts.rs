@@ -65,14 +65,42 @@ pub const SPIN_INTERLEAVE: usize = 8;
 /// its group streams past it.
 ///
 /// This is the ceiling on a window, not its size: a sweep starts at
-/// `SLOW_CHUNK` and doubles until it reaches this, so a member that parts from
-/// the pivot in its first megabytes costs exactly what the lockstep round it
-/// replaces cost, and only a group that keeps agreeing pays for the long
-/// windows that make it cheap. The spinning comparison holds one window and
-/// one member's run — `PIVOT_WINDOW + SLOW_CHUNK` — however wide the group is,
-/// where `COMPARE_BUDGET` bounds a lockstep round, which holds one run per
-/// member. M7-PIVOT.md sets the order of magnitude.
+/// `SLOW_CHUNK` and grows by `PIVOT_GROWTH` until it reaches this, so a member
+/// that parts from the pivot in its first megabytes costs exactly what the
+/// lockstep round it replaces cost, and only a group that keeps agreeing pays
+/// for the long windows that make it cheap. The spinning comparison holds one
+/// window and one member's run — `PIVOT_WINDOW + PIVOT_RUN` — however wide the
+/// group is, where `COMPARE_BUDGET` bounds a lockstep round, which holds one
+/// run per member. M7-PIVOT.md sets the order of magnitude.
 pub const PIVOT_WINDOW: usize = 256 * 1024 * 1024;
+/// How fast a window grows towards `PIVOT_WINDOW`.
+///
+/// The bytes a pivot reads past the point its class falls apart are wasted, and
+/// a window that grows by a factor of N holds that waste to N times the bytes
+/// the class had already agreed on — so this is the price cap on being wrong
+/// about a group, expressed as a multiple of how right it had been so far.
+///
+/// Four, not two, because the ceiling is sixteen chunks away and the number of
+/// head movements is what this profile is for: at two the ramp takes four
+/// windows to get there and a 256 MiB file costs five, where at four it costs
+/// three. Measured over the corpora in `pivot_seeks.py`, the whole change is
+/// worth 1.5-2.7x fewer seeks at two and 2.5-4.8x at four.
+pub const PIVOT_GROWTH: usize = 4;
+/// How much of a window is read at a time.
+///
+/// Runs inside one member's window carry straight on from each other, so their
+/// length costs no head movement at all: a window is one movement whether it
+/// is read in one run or two thousand. What the length decides is how closely
+/// a divergence is placed. A member that parts from the pivot stops at the end
+/// of the run it parted in, and is compared against its own kind from the
+/// start of that run — so a short run is fewer bytes read past a parting, and
+/// fewer read a second time after one. On a group of four content classes that
+/// fits in one `SLOW_CHUNK`, running at the chunk read 90 MB where running at
+/// this reads 35.
+///
+/// It is `MIN_CHUNK` for the reason `MIN_CHUNK` is what it is: below this the
+/// call starts to cost more than the bytes it carries.
+pub const PIVOT_RUN: usize = MIN_CHUNK;
 /// Ceiling on head bytes carried from stage 3 to stage 5 so the compare does
 /// not read them a second time.
 pub const RETAIN_BUDGET: usize = 128 * 1024 * 1024;
