@@ -38,16 +38,6 @@ pub struct Compare<'a> {
     /// does not, so a group read here is also a group learned — but only with
     /// a cache to put it in.
     pub learn: bool,
-    /// Where to open this stage's files.
-    ///
-    /// The comparison reads with `sequential_jobs` because it streams whole
-    /// files and that genuinely wants every core. Opening them is the other
-    /// shape — one catalog, and past the performance cores the readers only
-    /// queue deeper. Measured over `widegroup`'s 1,827 files, open and close
-    /// and nothing else, best of nine: **5.54 ms on four readers against
-    /// 10.60 on eight.** So the opens go to the same shallow pool the page
-    /// probes use, and the reads stay where they were.
-    pub open_pool: Option<&'a ThreadPool>,
 }
 
 /// What one comparison settled: the runs that agree to the last byte, and the
@@ -220,12 +210,7 @@ pub fn split_identical(
                 .open(&context.root.join(records[index].path()))
                 .ok()
         };
-        // Only when this call owns a pool. `compare_stage` hands `None` to the
-        // members of a packed wave precisely because they are already running
-        // as pool work, and installing onto a second pool from inside pool
-        // work is the thing that comment is warning about — `photos` packs
-        // waves and regressed 21% when this ignored it.
-        match pool.and(context.open_pool).or(pool) {
+        match pool {
             Some(pool) => pool.install(|| members.par_iter().map(open).collect()),
             None => members.iter().map(open).collect(),
         }
@@ -935,7 +920,6 @@ mod tests {
                     profile: Profile::Flash,
                     solid: true,
                     learn: false,
-                    open_pool: None,
                 },
                 &self.records,
                 &members,
@@ -951,7 +935,6 @@ mod tests {
                     profile: Profile::Spinning,
                     solid: true,
                     learn: false,
-                    open_pool: None,
                 },
                 &self.records,
                 &members,
@@ -1079,7 +1062,6 @@ mod tests {
                 profile: Profile::Spinning,
                 solid: true,
                 learn: false,
-                open_pool: None,
             },
             &bench.records,
             &members,
@@ -1172,7 +1154,6 @@ mod tests {
                 profile: Profile::Spinning,
                 solid: true,
                 learn: false,
-                open_pool: None,
             },
             &bench.records,
             &members,

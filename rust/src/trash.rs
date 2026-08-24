@@ -759,7 +759,6 @@ mod selection {
             profile,
             solid: true,
             learn: false,
-            open_pool: None,
         }
     }
 
