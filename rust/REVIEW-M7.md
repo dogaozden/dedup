@@ -1,6 +1,14 @@
 # REVIEW-M7.md — maintainer review of the M7 claim
 
-**Verdict: CHANGES — three binding items, none of them a design objection**
+**Verdict: APPROVED at `cf62e3c`.** See the re-review at the end of this file.
+All three binding items below are discharged and all five non-binding notes
+were taken. The first round's verdict is kept unedited beneath, because the
+record of what was wrong is the reason the fixes can be checked.
+
+---
+
+**First round — verdict: CHANGES — three binding items, none of them a design
+objection**
 
 Claimed at `479ccb0` on branch `m7-pivot`, reviewed at that tip (8 commits atop
 `main@cc654c4`). Binding specs are `M7-PIVOT.md`, and `SPIN.md`'s Laws, which
@@ -582,3 +590,217 @@ untouched and behaves identically under both profiles. Fix items 1-3 and this
 is an approval.
 
 I would also take non-binding notes 1 and 2.
+
+---
+
+# Re-review — 2026-08-24, at `cf62e3c`
+
+**Verdict: APPROVED.**
+
+Six commits atop the `479ccb0` I reviewed. All three binding items are
+discharged, all five non-binding notes were taken, and two of the fixes are
+better than what I asked for. Everything below I ran myself in my own checkout;
+where I re-ran a builder script I say so and treat it as a reproduction.
+
+## The headline fact, checked my own way
+
+The claim is that the release binary did not move. I could not confirm that by
+matching the builder's SHA — `d614552…f11382` is built at
+`/Users/dogaozden/AI_Projects/dedup-m7`, and a release build embeds its path,
+which is why my build at `479ccb0` was `bcc295bc…e46b88e1` and never could have
+matched. So I checked it two better ways.
+
+**Structurally.** `#[cfg(test)]` sits at `compare.rs:1315`, and every hunk in
+the `479ccb0..cf62e3c` diff of that file begins at line 1781 or later:
+
+```
+@@ -1781,3 +1781,8 @@ mod tests {      @@ -1856,20 +1915,9 @@ mod tests {
+@@ -1786,3 +1791,23 @@ mod tests {     @@ -1880,0 +1929,12 @@ mod tests {
+@@ -1843,2 +1868,3 @@ mod tests {     @@ -1883,4 +1943,14 @@ mod tests {
+@@ -1849,2 +1875,4 @@ mod tests {     @@ -2036 +2106 @@ mod tests {
+@@ -1853,0 +1882,31 @@ mod tests {
+```
+
+Every change to `compare.rs` is inside the test module. The `consts.rs` diff is
+a doc comment and nothing else. No shipping code was touched.
+
+**Empirically.** I rebuilt at `cf62e3c` in the same checkout, at the same path,
+so the comparison means something:
+
+```
+my sha at cf62e3c   bcc295bc305b1aa72854f1e0f2aef254e31f0f2d5ebd29954be59e6ee46b88e1
+my sha at 479ccb0   bcc295bc305b1aa72854f1e0f2aef254e31f0f2d5ebd29954be59e6ee46b88e1
+```
+
+Byte-identical. The builder's own SHA is likewise unchanged across the round
+(`m7-standards.txt` carries `d614552…` at both tips, and the diff of that file
+shows no change to those lines). Two independent builds from two different
+paths, each unmoved. **My correctness derivation from the first review carries
+over wholesale** — the sweep, its proof, and every boundary I attacked are the
+same code.
+
+It carries over in practice too: my eight probes, re-applied to the fix-round
+source, still pass 8/8, and `cargo test` at the tip is **226 passed, 0 failed**,
+confirming 224 → 226.
+
+## Binding item 1 — discharged, and the corpus was fixed, not just the prose
+
+`MILESTONES.md:2741` now reads "**On these nine shapes** bytes run from 0.70x
+to 1.05x of what `main` reads — so mostly equal or lower, and on two of them
+higher. That is a statement about this corpus and not a general result", and a
+new subsection states plainly that shapes exist which read more and seek more,
+that SPIN.md permits it in terms, and that "nothing here rules out shapes worse
+than the ones measured." That is the honest epistemic position, which is more
+than I asked for.
+
+The part that matters more than the prose: **the corpus absorbed my
+counter-examples.** `pivot_seeks.py` now carries nine shapes. I re-ran it
+against my own `main@cc654c4` build and reproduced the committed table exactly,
+including both new rows:
+
+```
+shape                  groups  flash   main   ours vs main vs flash     opens
+three-way-in-one-run        3     90     24     24    1.0x     3.8x     12->6
+strangers-of-one-size       0     16     24     51    0.5x     0.3x     16->8
+
+  three-way-in-one-run            36.0          36.0          36.4     1.01x
+  strangers-of-one-size            0.1          32.0          33.7     1.05x
+
+  reads more than main: three-way-in-one-run, strangers-of-one-size
+  seeks more than main: strangers-of-one-size
+```
+
+`strangers-of-one-size` reproduces my own 24 → 51 figure from an independently
+written corpus. The summary now prints both directions and names the shapes in
+each, and the script's gate no longer requires every shape to improve — a gate
+that could only ever be satisfied by a friendly corpus. My verification recipe
+asked that the claim not assert "every shape" for a range measured on seven; it
+now asserts a range for nine and says so twice.
+
+## Binding item 2 — discharged; my recipe run verbatim
+
+My recipe was `grep -n "at two\|at four" rust/src/consts.rs rust/LOG.md` and
+check the two agree. They do: both now carry **1.25x-1.40x fewer head
+movements**, both sourced to the new `evidence/scripts/pivot_growth.py`. The
+contradictory `2.5-4.8x` survives in exactly one place — `MILESTONES.md:3178`,
+inside the paragraph *describing the defect I raised* — and `1.5-2.7x` is gone
+from the tree entirely. That is the right disposition: the wrong number is
+preserved as history, not as a live claim.
+
+The new script's numbers are the numbers I measured independently before the
+builder wrote them, from my own `PIVOT_GROWTH = 2` build:
+
+```
+shape               growth2  growth4 fewer at 4  bytes equal
+3 x 256 MiB              21       15      1.40x         True
+2 x 512 MiB              16       12      1.33x         True
+4 x 64 MiB               20       16      1.25x         True
+```
+
+Identical in every cell to my own first-round table. Four is the better factor
+and it is now a measurement rather than an assertion.
+
+## Binding item 3 — discharged, in a stronger form than I specified
+
+I asked for the stale comments to be fixed and the offset list extended to the
+real boundaries. The builder did something better: the geometry is now
+**derived and pinned** rather than written down. `window_edges()`
+(`compare.rs:1798-1812`) computes the boundaries from `PIVOT_GROWTH` and
+`PIVOT_WINDOW`, `SPAN` is raised to `40C` so three real boundaries exist, the
+boundary test walks `edge-1, edge, edge+1` over the derived edges, and the old
+run-boundary walk survives under the honest name
+`a_divergence_on_a_run_boundary_splits_the_group`.
+
+The pin is `the_windows_are_where_the_growth_factor_puts_them`, which
+*measures* the window count via seeks at three file sizes, holds it against
+`window_edges`, and then asserts `PIVOT_GROWTH == 4` and
+`window_edges(0, SPAN) == [C, 5C, 21C]`.
+
+My recipe said: set `PIVOT_GROWTH` back to 2 and confirm the amended boundary
+test **fails**, because a boundary test that passes at both growth factors is
+not testing boundaries. I ran that myself on a scratch copy of the fix-round
+source:
+
+```
+test compare::tests::the_windows_are_where_the_growth_factor_puts_them ... FAILED
+  panicked at src/compare.rs:1909: assertion `left == right` failed:
+  the offsets below belong to this factor
+test compare::tests::the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window ... FAILED
+test result: FAILED. 224 passed; 2 failed
+```
+
+Note what does **not** fail: the boundary test itself passes at growth 2 —
+correctly, because `window_edges` retargets it onto the growth-2 boundaries, so
+it is still testing real boundaries. The silent retargeting I was worried about
+is now impossible because the pin fails loudly instead. That satisfies the
+intent of my recipe better than the letter of it, and I accept the stronger
+form. `pivot_growth.py` carries this same check as a required failure, so it is
+in the suite and not just in this review.
+
+## The other checks
+
+- **Gate.** `m7_gate.sh` now diffs its two `/Volumes` listings and exits
+  non-zero on a difference, and gates on the leftover-image count too — note 3
+  taken properly. My run: 33/33, `gate all: green`, `exit 0`, "gate green,
+  mount table unchanged, no image left attached". `/Volumes` held `\]` and
+  `dedupbench` before and after, unchanged.
+- **Re-captured batteries.** The differential moved only in the `flash seeks`
+  column (696→695, 16→15) — the one column documented as scheduler-dependent;
+  every byte column and every group identical. `m7-flash-inert.txt`'s counters
+  are identical to the previous capture; only wall-clock moved, geomean 0.999x
+  against a 1.015x noise floor at load 6.1. That is consistent with my own
+  reproduction last round (1.007x against a 0.862x floor at load 4.1).
+- **`claim_audit.py`.** M7 audits clean: 11 blocks, 0 untraced.
+
+## Non-binding notes from this round
+
+1. **`pivot_growth.py` takes a main-binary argument it never uses.** It is
+   bound at line 108, existence-checked at 109-110, and never referenced again;
+   the comparison is tip-at-growth-2 against tip-at-growth-4. **The experiment
+   is the right one** — `PIVOT_GROWTH` exists only at the tip, `main`'s spinning
+   path is the capped cohort sweep with no growth factor at all, so a
+   main-relative growth measurement is a category error. My own binding item 2
+   recipe asked for "a growth-2 build **against the tip**", which is exactly
+   what the script does, and it is what I did myself. So this is cosmetic and
+   **not** a re-open. It is worth fixing anyway because it already misled one
+   careful reader into expecting a baseline comparison: drop the parameter, or
+   use it only to print a context line.
+
+2. **`claim_audit.py` is worth keeping but it cries wolf, and I would fix that
+   before anyone relies on it.** All four blocks its `--all` pass reports are
+   benign, and I checked each myself:
+
+   - Three of the four *do* have their content committed —
+     "confirmed deletion moves exactly…" is in `m5-end-to-end.txt`,
+     "ctrl-c at the keyboard, by screen" is in `m5_2-signals.txt`, and
+     "18 check(s) differing / main@fbc196d" is in
+     `m5_2-m5-suite-restored.txt`. The runs happened and their output is in the
+     repository; the claim quotes an excerpt or an elided version rather than a
+     contiguous block, so the matcher misses it. Reporting that as
+     "NOTHING IN evidence/ CONTAINS THIS" is wrong and alarming.
+   - The fourth, `cargo test … 101 passed`, has no evidence anywhere — but it
+     sits at `MILESTONES.md:662`, inside
+     "## M5 — the interactive TUI — **CLAIMED**", the *superseded* original
+     claim. The live "RE-CLAIMED after REVIEW-M5 CHANGES" section quotes
+     `105 passed` at line 997, and that one traces cleanly to
+     `m5-standards.txt`. Four tests were added during the M5 fix round, the
+     evidence was re-captured, and the archived original kept its own
+     contemporaneous number — which is what an archive should do.
+
+   **Nothing here smells worse than staleness. No fabricated measurement.** My
+   recommendation is backlog, with the fix being to the tool rather than to the
+   old claims: report an excerpt of a known file as "excerpt of X" instead of
+   "nothing contains this", and either skip superseded sections or bucket them
+   separately. A claim-auditor whose only four findings are false alarms will be
+   ignored the first time it finds something real.
+
+## Disposition
+
+M7 is approved at `cf62e3c`. The shipping binary is byte-identical to the one I
+proved correct, the record now says what was measured and on what, the growth
+constant is a measurement with a script behind it, and the window-boundary
+guard cannot silently retarget again. The two backlog items stand where they
+were: the super-linear wide all-distinct group on both spinning comparisons —
+which this branch improves by an order of magnitude and does not introduce —
+and a user-supervised wall-clock run on real spinning media, which is still
+owed and which nothing here claims.
