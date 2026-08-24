@@ -1,10 +1,11 @@
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 181 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 182 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
 
 $ cargo clippy --all-targets -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m52/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.95s
 
 $ cargo fmt --check
 (no output: clean)

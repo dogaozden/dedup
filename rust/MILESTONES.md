@@ -1938,8 +1938,8 @@ Eight cases through a real pty, `evidence/m5_2-pulse.txt`:
 $ python3 rust/evidence/scripts/m5_2_pulse.py rust/target/release/dedup-rs \
     <scratch> <a build of main@fbc196d>
 a piped run says nothing at all                ok (stdout byte-identical to main, 5188 bytes; stderr empty on both; 5 counters equal at -j1)
-a terminal gets a line, and gets it back       ok (5 repaints, stages Reading small files+Sampling+Comparing, bar Reading small files 5469→12002/12002; Sampling 6→6/14; Comparing 6→6/14, cleared before the browser)
-the walk counts files out loud                 ok (2 repaints, counts 59320…59320 against 100000 files seen, never ahead and never backwards)
+a terminal gets a line, and gets it back       ok (6 repaints, stages Reading small files+Comparing, bar Reading small files 2402→12002/12002; Comparing 0→0/14, cleared before the browser)
+the walk counts files out loud                 ok (2 repaints, counts 54472…54472 against 100000 files seen, never ahead and never backwards)
 --quiet means quiet on a terminal too          ok (nothing between the menu and the browser, 9 groups found)
 --list down a pipe, the line on the terminal   ok (37729 bytes of list down the pipe, 1 repaints on the terminal, neither in the other)
 the menu takes 100mb, 1m and 1k                ok (100mb→0 group(s), 1m→7 group(s), 1k→9 group(s))
@@ -1972,9 +1972,9 @@ stderr piped, alternating builds so a warming disk drifts through both sides,
   bytes_seen        640221184      640221184   same
   seeks                 51260          51260   same
   groups                  254            254   same
-  m5.2         0.870s median, 0.848–4.462
-  main         0.863s median, 0.850–4.461
-  difference   +0.8% (+0.007s), against a 3.614s spread within a build
+  m5.2         4.601s median, 4.373–4.900 over the fastest 14 of 15
+  main         4.531s median, 4.362–4.952 over the fastest 14 of 15
+  difference   +1.6% (+0.070s), against a 0.590s trimmed spread within a build
 
 == stderr piped, -j8 ==
   opens                 51052          51052   same
@@ -1983,9 +1983,9 @@ stderr piped, alternating builds so a warming disk drifts through both sides,
   bytes_seen        640221184      640221184   same
   groups                  254            254   same
   seeks                 51260          51260   not compared: nondeterministic above one reader
-  m5.2         0.781s median, 0.767–0.795
-  main         0.783s median, 0.772–0.796
-  difference   -0.2% (-0.002s), against a 0.028s spread within a build
+  m5.2         1.114s median, 0.948–1.250 over the fastest 14 of 15
+  main         1.164s median, 0.984–1.260 over the fastest 14 of 15
+  difference   -4.3% (-0.050s), against a 0.302s trimmed spread within a build
 
 the pulse costs a piped run nothing that can be measured
 exit=0
@@ -1998,11 +1998,22 @@ Concurrent readers interleave and count against each other, which is the honest
 answer for one set of heads and is what M6 scores; a comparison there would be
 measuring the scheduler.
 
-This machine has other agents on it, which is what the 4.46s outliers and the
-wide `-j1` spread are; the alternating design is what keeps a burst of their
-work from landing on one side, and it caught both builds equally. The `-j8`
-half is what the measurement looks like when the machine is quiet: 0.028s of
-spread, and a difference of two milliseconds in this build's favour.
+This machine has other agents on it, and the noise floor now drops the slowest
+tenth of each build's runs before taking the spread — REVIEW-M5_2's non-binding
+note 4, taken, because a floor set by the worst outlier is a gate that cannot
+fail. Only the slow tail goes: a run cannot be spuriously *fast*, so the fast
+end is real and the trim cannot hide a regression.
+
+The two halves disagree about the sign — `+1.6%` at one reader and `-4.3%` at
+eight, this build slower on one and faster on the other, on the same tree in
+the same minutes. A cost that appears and disappears with the job count is not
+a cost. The counters, which are the evidence that does not have a spread, are
+identical on both.
+
+(The absolute times are higher than the first capture because that one ran on a
+warm page cache and this one on a freshly written tree. Both halves of each
+comparison were run alternately against the same tree, which is what the
+comparison rests on.)
 
 ### Also
 
@@ -2023,10 +2034,11 @@ drive that started M5.2.
 $ cargo test
 test sys::terminal::a_live_terminal_with_something_typed_at_it_is_ready ... ok
 
-test result: ok. 181 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 182 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
 
 $ cargo clippy --all-targets -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m52/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.95s
 
 $ cargo fmt --check
 (no output: clean)
@@ -2034,9 +2046,10 @@ $ cargo fmt --check
 FMT_EXIT=0
 ```
 
-164 tests on `main@fbc196d`, 181 here — counted by building that commit and
+164 tests on `main@fbc196d`, 182 here — counted by building that commit and
 running its own suite, not by reading the last claim, which said 163 before
-`main` gained one.
+`main` gained one. (181 at the first claim; the fix round added one, taking
+REVIEW-M5_2's non-binding note 2.)
 
 ```text
 M1 gate
@@ -2120,12 +2133,9 @@ Three harness bugs, no program change:
 `evidence/m5_2-m5-suite-restored.txt`:
 
 ```text
-=== this branch ===
-0 check(s) differing
-exit=0
-=== main@fbc196d ===
-0 check(s) differing
-exit=0
+=== 2. the repaired script, both builds, unmodified ===
+this branch    0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+main@fbc196d   0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
 ```
 
 Byte-identical output on both builds, so nothing in M5.2 moved the browser; and
@@ -2152,9 +2162,29 @@ Raw mode means the terminal raises no SIGINT of its own, so nothing happens at
 all. Driven on a pty, at both screens, on both builds:
 
 ```text
-ctrl-c at the menu: STILL RUNNING after 5s
-ctrl-c at the browser: left with exit 0
+== menu / keyboard ==
+   reached menu before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (False, False, False)
+   exit: IGNORED — still running after 5s, then killed
+   alternate screen entered 1, left 0
+   terminal came back as it was: False (after our SIGKILL, not after the interrupt — the interrupt did nothing)
+
+== browser / keyboard ==
+   reached browser before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: 0
+   alternate screen entered 2, left 2
+   terminal came back as it was: True
 ```
+
+The `menu / keyboard` row says the terminal did not come back, and says why in
+the same breath: the keystroke did nothing, so the probe had to `SIGKILL` the
+run, and it is the `SIGKILL` those modes describe. The interrupt itself is not
+what wrecked anything — nothing at all happened.
 
 `q` and Esc still leave, so nobody is trapped, and M5_1-MENU.md specifies only
 those two — which is why I am reporting this rather than changing another
@@ -2178,13 +2208,18 @@ than its `KeyCode`, as the browser does) and it belongs to whoever owns M5.1.
   painted stays where it is and the shell's next prompt lands after it. Driven
   on a pty, interrupt sent while the line was provably up:
 
+  From `evidence/m5_2-signals.txt`, which the fix round turned from a
+  terminal probe I pasted from into a script that fails if any of this changes:
+
   ```text
-  the line was up when the interrupt landed: True
-  modes (canonical, echo) before/during/after: (True, True) (True, True) (True, True)
-  terminal came back as it was: True
-  exit: -2
-  mode-changing escapes written (alt screen / raw): False
-  last bytes: '\r\x1b[2K  Sampling further…  ███░░░░░░░░░░░░░░░░░░░░░  12%  2/16 · 176 MiB/s'
+== scan / keyboard ==
+   reached scan before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (True, True, True)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: -2
+   alternate screen entered 0, left 0
+   terminal came back as it was: True
   ```
 
   The oracle clears it, because Python hands it a `KeyboardInterrupt` to catch.
@@ -2205,18 +2240,19 @@ than its `KeyCode`, as the browser does) and it belongs to whoever owns M5.1.
   during and after:
 
   ```text
-  how: keyboard
-  (canonical, echo, ISIG) before/during/after: (True, True, True) (False, False, False) (True, True, True)
-  exit: 0
-  alt screen entered: 2  left: 2
-  terminal came back as it was: True
+ctrl-c at the keyboard, by screen:
+  scan/keyboard    exit -2     terminal intact  canonical mode, so it is a real SIGINT; nothing to restore
+  menu/keyboard    exit killed ignored          raw mode clears ISIG and the menu's key map drops the modifiers, so nothing happens — M5.1's, reported not fixed
+  browser/keyboard exit 0      terminal intact  raw mode clears ISIG; read as a key and mapped to Quit
 
-  how: kill
-  (canonical, echo, ISIG) before/during/after: (True, True, True) (False, False, False) (False, False, False)
-  exit: -2
-  alt screen entered: 2  left: 1
-  terminal came back as it was: False
+a signal from anywhere but the keyboard, at the browser:
+  browser/signal   exit -2     TERMINAL WRECKED no unwinding, so neither the drop guard nor the panic hook runs — M5's, reported not fixed
   ```
+
+  Byte-identical on `main@fbc196d` for the three rows that exist there — the
+  fourth is the scan, which `main` has no progress line to be interrupted
+  through. That is what makes the wrecked terminal M5's and the ignored ctrl-c
+  M5.1's rather than this milestone's.
 
   Byte-for-byte the same on `main@fbc196d`, so it predates this branch. The
   terminal is left in raw mode with the alternate screen still on — the M5.4
@@ -2239,3 +2275,164 @@ generated under this worktree's `rust/target/`, including the copy of
 archive` and built into a target directory of its own rather than by touching
 any other worktree. No `conformance/` file, no `rbench/`, `bench/` or `xbench/`
 file, and no other branch was touched.
+
+---
+
+## M5.2 — fix round after REVIEW-M5_2 — 2026-08-23 — RE-CLAIMED
+
+`REVIEW-M5_2.md` returned **CHANGES** on two binding items, both in the evidence
+harnesses. Neither touches the program, and the program has not moved: the only
+`rust/src` change in this round is inside a `#[cfg(test)]` module, taking
+non-binding note 2.
+
+### Binding 1 — `menu_mutants.py`, broken by this branch and missing from the claim
+
+The reviewer is right, and right about the part that stings: this branch edits
+the flag table more than anything since M5.1, `menu_mutants.py` is the script
+that exists to guard the flag table, and I ran the suites I remembered instead
+of the ones that touch what I changed. It aborted at mutant 3 of 8, so five
+mutants never ran — including both whole-program terminal-death mutants M5.1 was
+approved on.
+
+The retarget is the reviewer's, one line: the `default:` line is unique in
+`cli.rs` on its own, and the `help:` line above it was never what the mutant
+needed. `evidence/m5_2-menu-mutants.txt`:
+
+```text
+$ python3 rust/evidence/scripts/menu_mutants.py
+Baseline: the tree as written.
+  cli::tests and tui::menu::tests all pass
+
+mutant help-misses-a-flag           renders every flag but the first
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags, the_help_text_says_something_about_every_flag
+
+mutant help-invents-a-flag          hand-writes a line for a flag the parser does not accept
+  caught by the_help_text_and_the_parser_know_exactly_the_same_flags
+
+mutant help-default-drifts          says a default the code does not have
+  caught by the_defaults_the_help_text_prints_are_the_defaults_the_code_has, clearing_a_field_puts_the_default_back, the_min_size_field_shows_a_size_a_person_can_read_and_type
+
+mutant menu-writes-its-own-default  shows a default of its own instead of the table's
+  caught by clearing_a_field_puts_the_default_back, the_form_shows_the_root_every_field_and_every_default, the_min_size_field_shows_a_size_a_person_can_read_and_type
+
+mutant menu-drops-a-field           leaves a field out of the argument list it hands back
+  caught by a_switch_toggles_and_reaches_the_options, the_command_line_prefills_the_fields_it_names
+
+mutant menu-skips-validation        accepts whatever is typed and lets the scan find out
+  caught by a_bad_profile_is_refused_the_same_way, a_field_is_refused_in_the_field_with_the_parsers_own_words, a_refusal_is_shown_beside_the_field_it_belongs_to
+
+Baseline: the same tree, built and run through tui-terminal-death.py.
+  every scenario passed
+
+mutant one-of-three-answers         enters the blocking read when poll said nothing was typed
+  caught: hangup/menu      FAIL  the menu was still running 5s after the terminal died, 5.02 CPU-seconds in that window — SPINNING
+
+mutant drop-the-dead-terminal       lets ratatui print to a descriptor that is gone, panicking on the way out
+  caught: hangup/menu      FAIL  the menu left in 0.06s but by panicking (exit 101)
+
+every mutant was caught
+MENU_MUTANTS_EXIT=0
+```
+
+Eight named, eight caught, exit 0 — and `help-default-drifts` and
+`menu-writes-its-own-default` are now caught by M5.2's own
+`the_min_size_field_shows_a_size_a_person_can_read_and_type` as well. The guard
+got stronger while it was not being run, which is the part worth worrying about.
+
+**The process fix, so this does not recur:** before claiming, run every script
+under `evidence/scripts/` that names a file the branch touched. `git diff
+--name-only` against the base, grepped through the scripts, finds it in a
+second. Written into `LOG.md` as a rule rather than as an apology.
+
+### Binding 2 — `NOT REACHED` now counts
+
+`drive` hands the flag back, and all nine of its call sites turn it into
+`failures += not check("reached the browser", reached, True)`. Proved the way
+the reviewer proved it — suppress only the menu `Enter`, change nothing else,
+and require the suite to fail. From `evidence/m5_2-m5-suite-restored.txt`, which
+now carries all three states end to end:
+
+```text
+=== 1. the script as of main@fbc196d, against this branch's binary ===
+18 check(s) differing
+EXIT=1
+(every pty case timed out and was killed; none of them was on the browser)
+
+=== 2. the repaired script, both builds, unmodified ===
+this branch    0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+main@fbc196d   0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+
+=== 3. the same script with only the menu Enter suppressed ===
+26 check(s) differing
+EXIT=1   NOT REACHED lines: 9
+```
+
+and the two cases the review named, on that suppressed run:
+
+```text
+=== cancelling the confirmation removes nothing ===
+    expect: all three files survive and the Trash is empty
+    NOT REACHED: the browser screen never appeared
+    reached the browser: False (DIFFERENT)
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== quitting with copies marked removes nothing ===
+    expect: all three files survive
+    NOT REACHED: the browser screen never appeared
+    reached the browser: False (DIFFERENT)
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+```
+
+26 differing where the unrepaired script gave 17. Nine of the ten cases now
+report a differing check; the tenth is `-i without a terminal refuses instead of
+guessing`, the only case in the file that never opens a pty — a plain subprocess
+with no terminal, which suppressing the menu `Enter` cannot reach. It is honest
+for that one to stay green, and the evidence file says so in as many words.
+
+### The non-binding notes, answered
+
+**1. Stale quote — taken, and then taken further.** Two of the eight lines the
+claim quoted from `evidence/m5_2-pulse.txt` were from a run before the last
+re-capture. Corrected from the file. The cause is worth naming: I hand-copied
+timing-dependent output into the claim instead of pasting the file, then
+re-captured the file and never re-synced the quote.
+
+So I checked the rest of the claim the same way the reviewer would have to —
+mechanically, every fenced line against every file in `evidence/` — and found
+fifteen more lines with no evidence file behind them at all. All of them were
+from ad-hoc terminal probes I ran, pasted from the screen, and never saved.
+Those probes are now `evidence/scripts/m5_2_signals.py`, and it is a gate rather
+than a print-out: it names the four behaviours it records and exits 1 if any of
+them changes. Every fenced line in this claim now comes from a file under
+`evidence/`.
+
+**2. The `16.0 EiB` boundary — taken.** The fuzz shifted its values by 4 bits to
+stay under the one string `human_size` can produce that the grammar refuses. It
+now sweeps the whole u64 range and asserts the boundary from both sides, in
+`what_the_browser_shows_is_at_least_readable_back` and a new
+`the_one_size_the_browser_can_show_that_the_grammar_refuses`. The boundary is
+*searched for* by bisection rather than written down, so a change to the
+rounding moves it instead of breaking the arithmetic that names it — and the
+search standing on `human_size` being non-decreasing is itself checked at the
+boundary.
+
+**3. `m5_2_pulse.py` wants a quiet machine — taken.** Said in the docstring,
+with the failure it actually produces under load (`exit -9 … [the run did not
+exit; killed]`) so a reader can recognise it rather than chase it.
+
+**4. The inertness gate could not fail at `-j1` — taken.** The noise floor now
+drops the slowest tenth of each build's runs before taking the spread. Only the
+slow tail goes, and deliberately: a run cannot be spuriously *fast*, so the fast
+end is real and the trim cannot hide a genuine regression.
+
+**5. `passport-measure.sh`'s `/dev/tty` guard — accepted as written.** Nothing
+to do; recorded here so the audit is not lost.
+
+**6. Not this branch's — left alone, as instructed.** `menu_mutants.py`
+hardcodes one session's scratchpad path at lines 23-25. `m5_screens.py` passed
+for the reviewer at both tips and dies with `EIO` for me, so it is
+machine-dependent; either way it is M5.1's.

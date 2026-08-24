@@ -13,6 +13,12 @@ program:
 Nothing is mocked: the release binary, a pty, the bytes a keyboard sends, and
 trees generated fresh under the scratch directory given.
 
+Wants a quiet machine. Every case waits on the screen rather than on the clock,
+but the outer patience is 120 seconds of wall time, and on a box with other
+builds running that has not always been enough — a `--quiet` case has failed
+with `exit -9 ... [the run did not exit; killed]` under load and passed alone
+moments later. Run it on its own before believing a failure.
+
 Usage: m5_2_pulse.py <path-to-dedup-rs> <scratch-dir> [path-to-main-dedup-rs]
 """
 

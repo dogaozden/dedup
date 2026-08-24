@@ -1,0 +1,111 @@
+Signals, and what they do to a terminal this program is holding.
+
+M5.2 is the first thing outside the TUI to write to the terminal, so the M5.4
+law had to be re-asked of the progress line. Asking it turned up an older
+answer about the browser, which is why main@fbc196d is run here too. The two
+builds are run separately, each against a fresh tree.
+
+$ python3 rust/evidence/scripts/m5_2_signals.py <binary> <scratch>
+
+########## this branch ##########
+
+== scan / keyboard ==
+   reached scan before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (True, True, True)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: -2
+   alternate screen entered 0, left 0
+   terminal came back as it was: True
+   last bytes: '\r\x1b[2K  Reading small files…  ████████████████████████ 100%  6,000/6,000 · 269 MiB/s^C'
+
+== menu / keyboard ==
+   reached menu before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (False, False, False)
+   exit: IGNORED — still running after 5s, then killed
+   alternate screen entered 1, left 0
+   terminal came back as it was: False (after our SIGKILL, not after the interrupt — the interrupt did nothing)
+
+== browser / keyboard ==
+   reached browser before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: 0
+   alternate screen entered 2, left 2
+   terminal came back as it was: True
+
+== browser / signal ==
+   reached browser before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (False, False, False)
+   exit: -2
+   alternate screen entered 2, left 1
+   terminal came back as it was: False
+
+ctrl-c at the keyboard, by screen:
+  scan/keyboard    exit -2     terminal intact  canonical mode, so it is a real SIGINT; nothing to restore
+  menu/keyboard    exit killed ignored          raw mode clears ISIG and the menu's key map drops the modifiers, so nothing happens — M5.1's, reported not fixed
+  browser/keyboard exit 0      terminal intact  raw mode clears ISIG; read as a key and mapped to Quit
+
+a signal from anywhere but the keyboard, at the browser:
+  browser/signal   exit -2     TERMINAL WRECKED no unwinding, so neither the drop guard nor the panic hook runs — M5's, reported not fixed
+
+The progress line never wrecks a terminal: it writes text and never
+a mode, and an interrupt through it leaves the modes untouched.
+All four behave as recorded.
+EXIT=0
+
+########## main@fbc196d ##########
+
+== scan / keyboard ==
+   no progress line ever appeared: nothing to interrupt through
+
+== menu / keyboard ==
+   reached menu before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (False, False, False)
+   exit: IGNORED — still running after 5s, then killed
+   alternate screen entered 1, left 0
+   terminal came back as it was: False (after our SIGKILL, not after the interrupt — the interrupt did nothing)
+
+== browser / keyboard ==
+   reached browser before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (True, True, True)
+   exit: 0
+   alternate screen entered 2, left 2
+   terminal came back as it was: True
+
+== browser / signal ==
+   reached browser before interrupting: True
+   (canonical, echo, ISIG) before : (True, True, True)
+   (canonical, echo, ISIG) during : (False, False, False)
+   (canonical, echo, ISIG) after  : (False, False, False)
+   exit: -2
+   alternate screen entered 2, left 1
+   terminal came back as it was: False
+
+ctrl-c at the keyboard, by screen:
+  scan/keyboard    exit None   no progress line canonical mode, so it is a real SIGINT; nothing to restore
+  menu/keyboard    exit killed ignored          raw mode clears ISIG and the menu's key map drops the modifiers, so nothing happens — M5.1's, reported not fixed
+  browser/keyboard exit 0      terminal intact  raw mode clears ISIG; read as a key and mapped to Quit
+
+a signal from anywhere but the keyboard, at the browser:
+  browser/signal   exit -2     TERMINAL WRECKED no unwinding, so neither the drop guard nor the panic hook runs — M5's, reported not fixed
+
+The progress line never wrecks a terminal: it writes text and never
+a mode, and an interrupt through it leaves the modes untouched.
+All four behave as recorded.
+EXIT=0
+
+The two builds differ in exactly one row, and it is the row that only exists
+here: main has no progress line, so there is nothing to interrupt through. The
+menu ignoring ctrl-c and a signal wrecking the browser's terminal are
+byte-identical on both, which is what makes them M5.1's and M5's rather than
+this milestone's.

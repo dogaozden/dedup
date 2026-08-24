@@ -1,12 +1,58 @@
-The M5 browser suite, screen-aware again. Every case had been driving the
-pre-flight menu since M5.1 put one in front of the browser; 18 checks were
-reported as differing and none of them was testing the browser.
+The M5 browser suite: what it did before this branch repaired it, what it
+does now, and what it does when the browser is made unreachable on purpose.
 
-$ python3 rust/evidence/scripts/m5_end_to_end.py <binary> <scratch>
+The middle one is the milestone's claim. The first and the last are what make
+that claim worth anything: a suite that was reporting eighteen differing checks
+while testing nothing, and a suite that now refuses to call a case green when
+it never reached the screen the case is about.
 
-=== this branch ===
-0 check(s) differing
-exit=0
-=== main@fbc196d ===
-0 check(s) differing
-exit=0
+
+=== 1. the script as of main@fbc196d, against this branch's binary ===
+$ python3 <git show fbc196d:...m5_end_to_end.py> rust/target/release/dedup-rs <scratch>
+18 check(s) differing
+EXIT=1
+(every pty case timed out and was killed; none of them was on the browser)
+
+=== 2. the repaired script, both builds, unmodified ===
+this branch    0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+main@fbc196d   0 check(s) differing   EXIT=0   NOT REACHED lines: 0   'reached the browser' checks: 9
+
+=== 3. the same script with only the menu Enter suppressed ===
+$ sed 's/os.write(master, ENTER)/pass/' ... && python3 <that copy>
+26 check(s) differing
+EXIT=1   NOT REACHED lines: 9
+
+per case, with the browser unreachable:
+  confirmed deletion moves exactly the marked copies to the  reports a differing check
+  cancelling the confirmation removes nothing                reports a differing check
+  quitting with copies marked removes nothing                reports a differing check
+  --hard deletes permanently and puts nothing in the Trash   reports a differing check
+  space on every copy in a group cannot empty it             reports a differing check
+  removing a hardlinked record removes every name it wears   reports a differing check
+  bulk keep-shortest keeps the copy --auto shortest keeps    reports a differing check
+  a terminal too small to lay out will not confirm a deletio reports a differing check
+  a group the cache vouched for is re-read, disbelieved and  reports a differing check
+  -i without a terminal refuses instead of guessing          all ok
+
+The one case that still reports all ok is `-i without a terminal refuses
+instead of guessing`, which is the only case in the file that never opens a
+pty: it is a plain subprocess with no terminal at all, so suppressing the menu
+Enter cannot reach it. Every case that drives a terminal now fails.
+
+The two cases REVIEW-M5_2 named, before and after:
+
+=== cancelling the confirmation removes nothing ===
+    expect: all three files survive and the Trash is empty
+    NOT REACHED: the browser screen never appeared
+    reached the browser: False (DIFFERENT)
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)
+
+=== quitting with copies marked removes nothing ===
+    expect: all three files survive
+    NOT REACHED: the browser screen never appeared
+    reached the browser: False (DIFFERENT)
+    exit: 0 (ok)
+    survivors: ['a.bin', 'b.bin', 'c.bin'] (ok)
+    trash: [] (ok)

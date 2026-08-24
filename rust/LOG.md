@@ -2205,16 +2205,18 @@ repaint.
 
 | | opens | bytes_read | files_seen | bytes_seen | seeks | wall-clock |
 |---|---|---|---|---|---|---|
-| -j1, m5.2 | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.870s median |
-| -j1, main | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.863s median |
-| -j8, m5.2 | 51052 | 647872512 | 30516 | 640221184 | — | 0.781s median |
-| -j8, main | 51052 | 647872512 | 30516 | 640221184 | — | 0.783s median |
+| -j1, m5.2 | 51052 | 647872512 | 30516 | 640221184 | 51260 | 4.601s median |
+| -j1, main | 51052 | 647872512 | 30516 | 640221184 | 51260 | 4.531s median |
+| -j8, m5.2 | 51052 | 647872512 | 30516 | 640221184 | — | 1.114s median |
+| -j8, main | 51052 | 647872512 | 30516 | 640221184 | — | 1.164s median |
 
-+0.8% at one reader and -0.2% at eight, against spreads of 3.614s and 0.028s
-within a single build — this machine has other agents on it, and the alternating
-design is what keeps a burst of their work from landing on one side. The `-j8`
-half is the measurement with the machine quiet: 0.028s of spread and two
-milliseconds of difference, in this build's favour.
++1.6% at one reader and -4.3% at eight, against trimmed within-build spreads of
+0.590s and 0.302s. The two halves disagree about the *sign* — slower on one,
+faster on the other, same tree, same minutes — and a cost that appears and
+disappears with the job count is not a cost. The counters, which have no
+spread, are identical either way. (Re-measured in the fix round with the
+trimmed noise floor of non-binding note 4; the first capture ran warm and this
+one cold, which is the difference in the absolute times.)
 
 `seeks` is compared at one reader only. Above that it is nondeterministic by
 design, and I checked rather than assumed: eight repeats of `main` against
@@ -2297,3 +2299,74 @@ logged verbatim is a page of carriage returns. Guarded: where `/dev/tty`
 cannot be opened the line stays off and everything goes to the log as before.
 An unguarded redirection there fails the whole scan, which I found by running
 the script under a pty with no controlling terminal.
+
+## 2026-08-23 — REVIEW-M5_2, the fix round
+
+CHANGES, two binding items, both in the evidence harnesses. The program was not
+asked to move and has not: the only `rust/src` change in this round is inside a
+`#[cfg(test)]` module, taking non-binding note 2.
+
+### Binding 1 — I broke `menu_mutants.py` and did not notice
+
+The `help-default-drifts` mutant anchored on the exact `--min-size` help and
+default text, which is text this milestone rewrote. The script is well built and
+refuses to pretend — it aborts rather than skipping — so it stopped at mutant 3
+of 8 and **five mutants never ran**, including both whole-program terminal-death
+mutants M5.1 was approved on. Exit 1 here, exit 0 on `main@fbc196d`.
+
+The retarget is one line: the `default:` line is unique in `cli.rs` on its own,
+and the `help:` line above it was never what the mutant needed. 8/8 caught now,
+and two of them are caught by M5.2's own new test as well — the guard got
+*stronger* while it was not being run, which is the part that should worry
+somebody.
+
+What actually went wrong is not the anchor. It is that I ran the suites I
+remembered — `tui-terminal-death.py`, `m5_1_menu_end_to_end.py`, and the M5
+browser suite I was already repairing — instead of the ones that touch what I
+changed. This branch edits the flag table more than anything since M5.1, and
+`menu_mutants.py` is the script that exists to guard the flag table. The rule I
+should have followed, and am writing down: **before claiming, run every script
+under `evidence/scripts/` that names a file you touched.** `git diff --name-only`
+against the base, grepped through the scripts, would have found it in a second.
+
+### Binding 2 — the detector that printed and then let it pass
+
+`NOT REACHED` was printed and never counted, so the two cases whose expected
+outcome is that nothing happens reported every check ok on a run that reached
+nothing. `drive` now hands the flag back and every one of its nine call sites
+turns it into a real check.
+
+Proved the way the reviewer proved it: suppress only the menu `Enter` and
+require the suite to fail. 26 differing where the unfixed one gave 17, nine
+`NOT REACHED` lines, and both named cases now show `reached the browser: False
+(DIFFERENT)`. Nine of the ten cases fail; the tenth is `-i without a terminal`,
+which never opens a pty at all, so nothing about the menu can reach it — that
+one is honest to stay green, and the evidence file says so.
+
+### The notes, taken
+
+1. **Two of the eight lines quoted from `m5_2-pulse.txt` were from an earlier
+   run.** True, and worse than it looks: I hand-copied timing-dependent output
+   into the claim instead of pasting the file, and then re-captured the file
+   without re-syncing the quote. Corrected from the file. Then I checked the
+   whole claim the same way, mechanically, and found fifteen more lines with no
+   evidence file behind them at all — all of them from ad-hoc terminal probes I
+   ran and never saved. Those probes are now `evidence/scripts/m5_2_signals.py`,
+   which is a gate rather than a print-out: it fails if any of the four
+   behaviours it records changes. Every fenced line in the claim now comes from
+   a file in `evidence/`.
+2. **`human_size` has one string the grammar cannot read back**, and the fuzz
+   shifted by 4 bits to stay under it. Taken. The sweep now runs the whole u64
+   range and asserts the boundary from both sides, and the boundary is *searched
+   for* rather than written down, so a change to the rounding moves it instead
+   of breaking the arithmetic that names it.
+3. **`m5_2_pulse.py` wants a quiet machine.** Taken, in the docstring, with the
+   failure it actually produces under load so a reader can recognise it.
+4. **The inertness gate could not fail at `-j1` on a busy machine.** Taken. The
+   noise floor drops the slowest tenth of each build's runs. Only the slow tail
+   goes: a run cannot be spuriously fast, so the fast end is real.
+5. **`passport-measure.sh`'s guard accepted as written.** Nothing to do.
+6. **Not this branch's**, and I am leaving them: `menu_mutants.py` hardcodes one
+   session's scratchpad path at lines 23-25, and `m5_screens.py` passed for the
+   reviewer at both tips while dying with EIO for me — machine-dependent, and
+   M5.1's either way.

@@ -143,10 +143,13 @@ def drive(binary, root, home, keys, extra=(), size=(30, 100), cwd=None):
         time.sleep(0.05)
     time.sleep(0.4)
     drain()
-    if output.decode("utf-8", "replace").count("\x1b[?1049h") < 2:
-        # Said out loud, because this is the failure that hides: a screen in
-        # front of the browser turns every key below into a test of something
-        # else, and the case still prints numbers.
+    # Said out loud AND handed back, because this is the failure that hides: a
+    # screen in front of the browser turns every key below into a test of
+    # something else, and the case still prints numbers. Saying it was not
+    # enough — a case whose expected outcome is that nothing happens reports
+    # every check ok on a run that reached nothing.
+    reached_browser = output.decode("utf-8", "replace").count("\x1b[?1049h") >= 2
+    if not reached_browser:
         print("    NOT REACHED: the browser screen never appeared")
     if tuple(size) != ROOMY:
         # ratatui asks the terminal its size on every frame, so the next
@@ -176,7 +179,7 @@ def drive(binary, root, home, keys, extra=(), size=(30, 100), cwd=None):
         output.extend(b"\n[the browser did not exit; killed]")
     drain()
     os.close(master)
-    return code, output.decode("utf-8", "replace")
+    return code, output.decode("utf-8", "replace"), reached_browser
 
 
 def case(name, expectation):
@@ -221,7 +224,8 @@ def main():
             "y.dat": b"second content",
         },
     )
-    code, _ = drive(binary, root, home, [b"a", ENTER, b"y", b"a", ENTER, b"y"])
+    code, _, reached = drive(binary, root, home, [b"a", ENTER, b"y", b"a", ENTER, b"y"])
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["a.bin", "x.dat"])
     failures += not check("trash", trashed(home), ["b.bin", "c.bin", "y.dat"])
@@ -234,7 +238,8 @@ def main():
     )
     root, home = fresh(scratch, "m5-e2e-cancel")
     build(root, {n: b"identical bytes here" for n in ("a.bin", "b.bin", "c.bin")})
-    code, _ = drive(binary, root, home, [b"a", ENTER, b"n", b"q"])
+    code, _, reached = drive(binary, root, home, [b"a", ENTER, b"n", b"q"])
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["a.bin", "b.bin", "c.bin"])
     failures += not check("trash", trashed(home), [])
@@ -247,7 +252,8 @@ def main():
     )
     root, home = fresh(scratch, "m5-e2e-quit")
     build(root, {n: b"identical bytes here" for n in ("a.bin", "b.bin", "c.bin")})
-    code, _ = drive(binary, root, home, [b"a", b"q"])
+    code, _, reached = drive(binary, root, home, [b"a", b"q"])
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["a.bin", "b.bin", "c.bin"])
     failures += not check("trash", trashed(home), [])
@@ -260,7 +266,8 @@ def main():
     )
     root, home = fresh(scratch, "m5-e2e-hard")
     build(root, {"a.bin": b"permanent content", "b.bin": b"permanent content"})
-    code, _ = drive(binary, root, home, [b"a", ENTER, b"y"], extra=["--hard"])
+    code, _, reached = drive(binary, root, home, [b"a", ENTER, b"y"], extra=["--hard"])
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["a.bin"])
     failures += not check("trash", trashed(home), [])
@@ -274,7 +281,8 @@ def main():
     root, home = fresh(scratch, "m5-e2e-guard")
     build(root, {n: b"guarded content xx" for n in ("a.bin", "b.bin", "c.bin")})
     keys = [b" ", b"j", b" ", b"j", b" ", ENTER, b"y"]
-    code, output = drive(binary, root, home, keys)
+    code, output, reached = drive(binary, root, home, keys)
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["c.bin"])
     failures += not check("trash", trashed(home), ["a.bin", "b.bin"])
@@ -295,7 +303,8 @@ def main():
         links=[("a.bin", "sub/also-a.bin")],
     )
     # The cluster is the shortest name, so it is member 0; keep z.bin instead.
-    code, _ = drive(binary, root, home, [b"j", b"a", ENTER, b"y"])
+    code, _, reached = drive(binary, root, home, [b"j", b"a", ENTER, b"y"])
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["z.bin"])
     failures += not check("trash", trashed(home), ["a.bin", "also-a.bin"])
@@ -310,7 +319,8 @@ def main():
     root, home = fresh(scratch, "m5-e2e-bulk-shortest")
     build(root, {"b.bin": b"ranked content", "photos/aaaa.bin": b"ranked content"})
     inside = os.path.join(root, "photos")
-    code, _ = drive(binary, root, home, [b"b", b"3", ENTER, b"y"], cwd=inside)
+    code, _, reached = drive(binary, root, home, [b"b", b"3", ENTER, b"y"], cwd=inside)
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("browser survivors", survivors(root), ["b.bin"])
 
@@ -350,7 +360,9 @@ def main():
     )
     root, home = fresh(scratch, "m5-e2e-too-small")
     build(root, {"a.bin": b"cramped content", "b.bin": b"cramped content"})
-    code, output = drive(binary, root, home, [b" ", ENTER, b"y", b"q"], size=(8, 20))
+    code, output, reached = drive(binary, root, home, [b" ", ENTER, b"y", b"q"],
+                                  size=(8, 20))
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("survivors", survivors(root), ["a.bin", "b.bin"])
     failures += not check("trash", trashed(home), [])
@@ -403,9 +415,10 @@ def main():
         handle.write(b"X")
     os.utime(os.path.join(root, "b.bin"), (stamp, stamp))
 
-    code, output = drive(binary, root, home, [b"a", ENTER, b"y", b"q"])
+    code, output, reached = drive(binary, root, home, [b"a", ENTER, b"y", b"q"])
     with open(os.path.join(home, "report.json")) as handle:
         report = json.load(handle)
+    failures += not check("reached the browser", reached, True)
     failures += not check("exit", code, 0)
     failures += not check("the scan still grouped them", len(report["groups"]), 1)
     print(f"    the scan read {report['bytes_read']} bytes to do it")

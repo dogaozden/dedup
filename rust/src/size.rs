@@ -376,24 +376,80 @@ mod tests {
         assert_eq!(human_size(1), "1 B");
     }
 
+    /// The first byte count `human_size` rounds up to `16.0 EiB` — sixteen
+    /// exbibytes being 2⁶⁴, one byte more than there is, so it is the one
+    /// string the browser can show that the grammar is right to refuse.
+    ///
+    /// Searched for rather than written down: a change to the rounding should
+    /// move this boundary, not break the arithmetic that names it. The search
+    /// stands on `human_size` being non-decreasing, which the assertions below
+    /// check at the boundary itself.
+    fn rounds_past_u64() -> u64 {
+        let (mut low, mut high) = (1_u64 << 63, u64::MAX);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if parse_size(&human_size(middle)).is_err() {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    }
+
     #[test]
     fn what_the_browser_shows_is_at_least_readable_back() {
         // `human_size` rounds, so it makes no promise about the number — that
         // law is `exact_size`'s. It does have to stay inside the grammar,
         // which is what fails the moment somebody spells a unit a new way.
+        //
+        // The whole u64 range, boundary included. Above `ROUNDS_PAST_U64` the
+        // only string it can produce is one the grammar is right to refuse, and
+        // asserting that is worth more than shifting the sweep to miss it.
+        let cliff = rounds_past_u64();
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut past = 0;
         for _ in 0..5000 {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            // Below an exbibyte, which is every tree there has ever been. At
-            // the very top the rounding runs past u64 itself.
-            let bytes = seed >> 4;
-            let shown = human_size(bytes);
-            assert!(
-                parse_size(&shown).is_ok(),
-                "{bytes} was shown as {shown:?}, which the grammar cannot read"
-            );
+            for bytes in [seed, seed >> 4, seed >> 20] {
+                let shown = human_size(bytes);
+                if bytes >= cliff {
+                    past += 1;
+                    assert_eq!(shown, "16.0 EiB", "{bytes}");
+                    assert!(parse_size(&shown).is_err(), "{bytes} rounds to 2^64");
+                    continue;
+                }
+                assert!(
+                    parse_size(&shown).is_ok(),
+                    "{bytes} was shown as {shown:?}, which the grammar cannot read"
+                );
+            }
+        }
+        assert!(past > 0, "the sweep never reached the boundary");
+    }
+
+    #[test]
+    fn the_one_size_the_browser_can_show_that_the_grammar_refuses() {
+        // The boundary itself, from both sides, so a change to the rounding or
+        // to the ladder has to come past this test rather than around it.
+        let cliff = rounds_past_u64();
+        assert_eq!(human_size(cliff), "16.0 EiB");
+        assert!(parse_size("16.0 EiB").is_err());
+        assert!(parse_size(&human_size(cliff - 1)).is_ok());
+        assert_ne!(human_size(cliff - 1), "16.0 EiB");
+        // It is the very top of the range and nothing else: below the cliff
+        // every rung reads back, and above it there is nothing but 16.0 EiB.
+        assert!(
+            cliff > 15 * (1_u64 << 60),
+            "the cliff is not in the top rung"
+        );
+        assert_eq!(human_size(u64::MAX), "16.0 EiB");
+        // ...and `exact_size`, whose law this actually is, round-trips at both
+        // sides of it and at the very end.
+        for bytes in [cliff - 1, cliff, u64::MAX] {
+            assert_eq!(parse_size(&exact_size(bytes)), Ok(bytes), "{bytes}");
         }
     }
 

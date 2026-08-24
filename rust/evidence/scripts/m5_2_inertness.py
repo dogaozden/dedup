@@ -83,9 +83,23 @@ def once(binary, root, home, jobs):
     return elapsed, said
 
 
+def trimmed(times):
+    """The runs with the slowest tenth dropped.
+
+    The noise floor this gate compares against used to be the full range, and
+    on a shared machine one six-second outlier made every difference "inside
+    the noise" — a gate that cannot fail is not a gate. Only the slow tail is
+    dropped: a run cannot be spuriously fast, so the fast end is real.
+    """
+    ordered = sorted(times)
+    keep = max(2, len(ordered) - max(1, len(ordered) // 10))
+    return ordered[:keep]
+
+
 def spread(times):
-    return "{:.3f}s median, {:.3f}–{:.3f}".format(
-        statistics.median(times), min(times), max(times))
+    kept = trimmed(times)
+    return "{:.3f}s median, {:.3f}–{:.3f} over the fastest {} of {}".format(
+        statistics.median(times), min(kept), max(kept), len(kept), len(times))
 
 
 def main():
@@ -140,11 +154,12 @@ def main():
         here = statistics.median(timings["m5.2"])
         there = statistics.median(timings["main"])
         # The noise floor: how far each build's own runs move around their
-        # median. A difference smaller than that is not a difference.
-        noise = max(max(t) - min(t) for t in timings.values())
-        print("  {:<12} {:+.1f}% ({:+.3f}s), against a {:.3f}s spread within "
-              "a build".format("difference", (here - there) / there * 100,
-                               here - there, noise))
+        # median, with the slowest tenth dropped so one outlier cannot excuse a
+        # real difference. A difference smaller than this is not a difference.
+        noise = max(max(trimmed(t)) - min(trimmed(t)) for t in timings.values())
+        print("  {:<12} {:+.1f}% ({:+.3f}s), against a {:.3f}s trimmed spread "
+              "within a build".format("difference", (here - there) / there * 100,
+                                      here - there, noise))
         if abs(here - there) > noise:
             print("  the difference is outside the noise")
             failed += 1
