@@ -144,14 +144,6 @@ fn pool_of(jobs: usize) -> ThreadPool {
         .expect("a thread pool of a positive size")
 }
 
-// TEMP-PROFILE (diagnostic only; never committed)
-static PROF_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-pub fn prof(label: &str) {
-    if std::env::var_os("DEDUP_PROF").is_none() { return; }
-    let t0 = PROF_T0.get_or_init(std::time::Instant::now);
-    eprintln!("PROF {:>16} {:9.3} ms", label, t0.elapsed().as_secs_f64() * 1000.0);
-}
-
 pub fn find_duplicates(
     root: &Path,
     filters: Filters,
@@ -160,7 +152,6 @@ pub fn find_duplicates(
     mut cache: Option<&mut ScanCache>,
     wanted: Wanted,
 ) -> Scan {
-    prof("enter");
     if let Some(cache) = cache.as_deref_mut() {
         cache.open_path(root);
     }
@@ -174,11 +165,9 @@ pub fn find_duplicates(
         &mut bytes_seen,
         &mut unreadable,
     );
-    prof("walk");
 
     // stage 2 — group by size, collapse hardlinks, discard unique sizes
     let mut records = candidates(root, entries);
-    prof("candidates");
     let mut scan = Scan {
         profile: Profile::Flash,
         hint: None,
@@ -200,7 +189,6 @@ pub fn find_duplicates(
     // The volume probe has been running since the root was known; this is the
     // first thing that needs its answer.
     let device = probe.device();
-    prof("device");
     let (profile, hint) = wanted.resolve(device);
     scan.profile = profile;
     scan.hint = hint;
@@ -253,7 +241,6 @@ pub fn find_duplicates(
         );
         settled.extend(proven);
         remembered.extend(attested);
-        prof("small_stage");
         if !fallback.is_empty() {
             staged.extend(fallback);
             staged.sort_by_key(|&index| records[index].layout());
@@ -287,7 +274,6 @@ pub fn find_duplicates(
         &mut unreadable,
         cache.as_deref_mut(),
     );
-    prof("hash_ends");
     let mut pending: Vec<Vec<usize>> = end_buckets
         .into_iter()
         .filter(|bucket| bucket.len() > 1)
@@ -328,7 +314,6 @@ pub fn find_duplicates(
         }
     }
 
-    prof("hash_deep");
     // stage 4 — sample points spread through the file. Only files big enough
     // to be worth sampling go through it: below SAMPLE_SPAN there is nothing
     // to sample, since a full read there would just be repeated by stage 5.
@@ -361,7 +346,6 @@ pub fn find_duplicates(
         pending.extend(sample_buckets.into_iter().filter(|bucket| bucket.len() > 1));
     }
 
-    prof("hash_sample");
     // stage 5 — compare what is left byte for byte, in step. Sampled agreement
     // is not proof and this tool deletes things, so the bytes get read; doing
     // it as a comparison rather than a hash means files that turn out to
@@ -375,7 +359,6 @@ pub fn find_duplicates(
         remembered.extend(matched);
     }
 
-    prof("attested");
     pending.sort_by_key(|bucket| {
         bucket
             .iter()
@@ -399,7 +382,6 @@ pub fn find_duplicates(
         &sequential_pool,
         &mut unreadable,
     );
-    prof("compare");
     settled.extend(compared.matched);
     // The bytes went past anyway, so a group read here is also a group learned.
     // The digests come back from the pool rather than being written from inside

@@ -181,7 +181,6 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // Straight to the file: building the whole document in memory first costs
     // another copy of every reported path.
     serde_json::to_writer_pretty(BufWriter::new(fs::File::create(destination)?), &report)?;
-    pipeline::prof("report_json");
 
     if options.list {
         print_report(&report.groups);
