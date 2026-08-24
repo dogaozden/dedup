@@ -1,7 +1,7 @@
 === main@cc654c4, for the before-count and the clippy verdict that predates this branch ===
 $ cargo test
 
-test result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+test result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
 
 
 $ cargo clippy --all-targets -- -D warnings
@@ -22,12 +22,12 @@ error: could not compile `dedup-rs` (bin "dedup-rs" test) due to 1 previous erro
 === this branch ===
 $ cargo test
 
-test result: ok. 224 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+test result: ok. 226 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
 
 
 $ cargo clippy --all-targets -- -D warnings
     Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m7/rust)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.94s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.95s
    exit 0
 
 $ cargo fmt --check
@@ -38,6 +38,6 @@ $ cargo fmt --check
 $ shasum -a 256 target/release/dedup-rs
 d61455257d5e735bbed1b947e439760293eb1af9750900791c938146eef11382  target/release/dedup-rs
 $ touch src/compare.rs src/consts.rs && cargo build --release
-    Finished `release` profile [optimized] target(s) in 12.22s
+    Finished `release` profile [optimized] target(s) in 11.93s
 $ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
 d61455257d5e735bbed1b947e439760293eb1af9750900791c938146eef11382  target/release/dedup-rs

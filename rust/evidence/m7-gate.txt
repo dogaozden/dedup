@@ -54,5 +54,10 @@ $ ls /Volumes   (after)
 \]
 dedupbench
 
+$ diff <(ls /Volumes before) <(ls /Volumes after)
+(no output: the mounted volumes are the ones that were there before)
+
 $ hdiutil info | grep -c dedupconf   (0 = the check detached its image)
 0
+
+gate green, mount table unchanged, no image left attached
