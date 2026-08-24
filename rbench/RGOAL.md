@@ -327,25 +327,41 @@ new idea you check whether the log already killed it.
 
 ## 2026-08-23 — ROUND TWO, OPUS: STOP SUMMARY
 
-**Refereed score 0.5886**, against the `94739ad` pin, on branch `opus-r2` at
-`a0b1ab8`. Unmerged, as §10 asks.
+**Refereed score ≈0.494**, against the `94739ad` pin, on branch `opus-r2` at
+`0a75595`. Unmerged, as §10 asks. `main` was never touched and nothing was
+merged.
 
-The round stopped once at **0.6669** (`db6b8c7`) and was reopened; what
-follows covers both halves. Two changes landed in the second half and took it
-from 0.6669 to 0.5886, **11.7%**.
+The round stopped twice before this and was reopened twice: at **0.6669**
+(`db6b8c7`), then at **0.5886** (`a0b1ab8`). What follows covers all three
+parts. The third took it from 0.5886 to ≈0.494, **16%**, on two changes.
+
+**≈, and why there is no single number.** Five referee runs of one unchanged
+commit (`b561415`) read 0.5047, 0.5137, 0.5147, 0.5220 and 0.5406 tonight — a
+**7% spread against a ±0.42% geomean floor**. An absolute score on this machine
+is a measurement of what else is awake. `0a75595` read 0.4822, 0.4860, 0.5019
+and 0.5165 across four referee runs; **median ≈0.494**. Every verdict in this
+round is a pairing taken inside one window, never a single reading, and the
+four pairings are quoted rather than averaged into a number that would look
+more precise than it is.
 
 ```
-run                                                  load   score
-referee, 21 rounds, a0b1ab8   (clean main)           4.42  0.5886   <- of record
-referee,  9 rounds, 8c2e4dd                          -     0.6004
-referee,  9 rounds, 8c2e4dd  (second reading)        -     0.6125
-referee, 21 rounds, 8c2e4dd                          -     0.6029
-referee,  9 rounds, b3d81fd                          -     0.6102
-referee,  9 rounds, db6b8c7  (where the round paused) 4.49  0.6669
+commit     what landed there                        refereed
+94739ad    the pin                                    1.0000
+db6b8c7    where the round first paused               0.6669
+a0b1ab8    where it paused the second time            0.5886
+246faf2    diagnostics removed; clean re-read         0.5335
+b561415    the staged pipeline keeps its descriptors  0.5047-0.5406  (five runs)
+0a75595    the device answers, not the registry       0.4822-0.5165  (four runs)
 ```
 
-Noise floor measured on this machine: **±7.4%** in the afternoon, **±3.7%** in
-the evening. Every gate green in every run; `--selftest` passes each time.
+Noise floor, measured with `--calibrate` at the start of this part rather than
+inherited: **±2.4% per scenario, ±0.42% on the geomean**. (Earlier parts of the
+round recorded ±7.4% and ±3.7%; those were per-scenario figures and were
+applied to the geomean for several hours, which is what made the second stop
+premature. The two floors are not interchangeable and §6.2 says so.)
+
+Every gate green in every run; `--selftest` passes each time; `cargo test`
+175 passing at HEAD; `cargo fmt` clean.
 
 **The second half had to change how it measures, and that is the first
 finding.** Three referee readings of `8c2e4dd` came back 0.6004, 0.6125 and
@@ -364,17 +380,26 @@ it does about the code.
 
 Referee's per-scenario table, which is the one to read:
 
+Referee's per-scenario table at HEAD (`0a75595`, 21 rounds, the quietest
+window of the night — the one whose candidate beat both its controls on every
+scenario):
+
 ```
 scenario     base s  cand s   ratio  spread     bytes   ceiling     floor
-needle       0.7741  0.5678  0.7653   ±6.0%  122.1 MB  122.1 MB  133.3 KB
-typical      0.1785  0.1040  0.5785   ±2.0%   70.6 MB   70.6 MB   33.0 MB
-samesize     0.0244  0.0200  0.8206   ±1.5%   32.8 MB   32.8 MB   22.5 MB
-widegroup    0.1750  0.1011  0.6075   ±5.1%  451.3 MB  451.3 MB  451.3 MB
-photos       0.0275  0.0119  0.4761   ±6.0%  147.9 MB  147.9 MB  147.8 MB
-bigheader    0.0268  0.0154  0.5930   ±4.6%  134.2 MB  146.2 MB  112.0 MB
-rescan       0.0265  0.0104  0.3928   ±1.0%       0 B    5.2 MB    5.2 MB
-prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
+needle       0.6992  0.4806  0.6751   ±3.0%  122.1 MB  122.1 MB  133.3 KB
+typical      0.1655  0.0833  0.5046   ±0.7%   70.6 MB   70.6 MB   33.0 MB
+samesize     0.0232  0.0155  0.6677   ±0.9%   32.8 MB   32.8 MB   22.5 MB
+widegroup    0.1626  0.0609  0.3870   ±2.6%  451.3 MB  451.3 MB  451.3 MB
+photos       0.0255  0.0097  0.3916   ±4.5%  147.9 MB  147.9 MB  147.8 MB
+bigheader    0.0240  0.0127  0.5306   ±6.6%  134.2 MB  146.2 MB  112.0 MB
+rescan       0.0263  0.0087  0.3316   ±1.5%       0 B    5.2 MB    5.2 MB
+prefixtrap*  0.0068  0.0044  0.6414   ±2.1%   16.2 MB   16.2 MB   16.0 MB
 ```
+
+Read the `cand s` column, not the ratio: the ratio's denominator is measured
+too, and on the short scenarios it is the noisier half. **`needle` is 481 ms of
+a 590 ms scan** — more than the other six together — and the two worst ratios
+belong to `needle` (0.675) and `samesize` (0.668).
 
 ### Kept, in the order they landed
 
