@@ -2402,6 +2402,112 @@ before writing the refactor.** The refactor here would have touched `FileRec`,
 the walk, `Effort`, and five call sites to buy −4.5%.
 
 
+## 2026-08-23 — the catalog is the floor: three more measured, none kept
+
+Three separate ideas, and one measurement kills all three. Recorded together
+because the shared answer is worth more than any of them.
+
+### 1. More readers for the stage that opens 50,000 files
+
+`needle` runs entirely in the small-file stage's tiny tier — every file is
+1–4 KB, under `HEAD_BYTES`, so `size <= HEAD_BYTES` sends all 50,000 there —
+and that stage reads on the shallow pool, `fast_bound(8)` = **4** on this
+machine. That bound was measured on `widegroup`'s 1,827 *large* files. Whether
+four is also right for fifty thousand tiny ones is a different question and
+nobody had asked it.
+
+Asked, on the real binary with the harness's own flags (`--report-json`,
+`--min-size` from the manifest, `--no-cache`), best of nine alternating:
+
+    -j     1      2      3      4      5      6      8     10     12
+    ms  189.3  120.6  98.0   82.0  102.4  110.8  116.0  120.9  120.7
+
+**Four is the optimum and the curve turns sharply either side of it.** One to
+four buys 2.3×; five is already 25% worse than four. The existing bound is
+right, and it is right for a reason the next section names.
+
+Nor is the *mixed* default beatable by any uniform setting — small-file 4,
+random 8, sequential 8, against `-j N` for every N:
+
+    corpus                  default     j3     j4     j6     j8
+    typical-r2-seed1          82.60  96.45  83.08 110.43 115.88
+    widegroup-r2-seed1        60.07  77.86  66.25  64.88  62.45
+
+`widegroup` wants eight where `typical` wants four, and the default gives each
+of them what it wants. Nothing to take.
+
+### 2. A faster walk
+
+`rbench/floor.py` says the walk is where the room is, and on the face of it that
+is right: `--stage size` (walk, no reading) is **15.20 ms of `typical`'s 83.06**
+and **6.59 ms of `rescan`'s 7.71** — `rescan` is 85% walk. At 19,202 entries
+that is 0.79 µs each against the floor table's 0.24 µs for `readdir`. Getting
+to 0.4 µs looked like −4.7% on the geomean, most of it on `rescan`.
+
+There were even two obvious things to take: `excluded()` computes
+`path.file_name()` before it checks whether there are any excludes to match it
+against — the bench passes none — and `child_relative` folds backslash onto
+slash one `char` at a time where almost every name has no backslash in it.
+
+**Measured before writing either.** `probe22` calls `getattrlistbulk` over the
+same tree and does *nothing at all* with what comes back:
+
+    19682 entries in 481 dirs
+      dedup's attributes   17.93 ms   0.911 us/entry
+      name + type only     17.59 ms   0.894 us/entry
+
+**The syscall alone costs 0.911 µs an entry — and dedup's whole walk, filters,
+allocations, `FileRec`s and all, costs 0.79.** The walk is already *under* the
+serial cost of the call it is made of, because it reads sibling directories
+concurrently. There is no 0.4 µs to reach: `readdir`'s 0.24 µs is not available
+through `getattrlistbulk`, whose minimal attribute set still costs 0.894. The
+attribute set is not the problem either — trimming five attributes buys 2%.
+
+### 3. Why all of it stops in the same place
+
+Put the two curves together. `getattrlistbulk` serial: 0.911 µs/entry.
+Concurrent across 481 directories: 0.79. **A thirteen percent gain from
+parallelism.** Opens do the same thing — 2.3× from four readers, then worse.
+
+**Both are metadata operations on one HFS+ catalog, and the catalog is a single
+B-tree behind a lock.** That is the wall `fast_bound`'s comment describes from
+the outside ("every reader is asking the same catalog") without naming what it
+is. It explains the whole shape of this round: why four readers beat eight, why
+the bulk walk was worth 4% and not 40%, why `needle` sits at 9.6 µs per file
+when a file is 2.4 KB on a RAM disk, and why `needle` and `typical` — 482 ms
+and 86 ms, more than everything else together — are finished.
+
+`needle` opens 50,000 files to settle 50,000 files, `typical` 13,310 of 19,202,
+`widegroup` 1,834 of 1,827, `photos` 47 of 100, `bigheader` 8 of 8. **Every
+scenario is at one open per file that has to be read.** There is no open left to
+remove and no way to make one cheaper; what is left is the catalog's price.
+
+### 4. Two smaller ones, same round
+
+**Borrowing the cached digests instead of copying them** (`0a75595`). `read_rows`
+pulled five 32-byte blob columns per row through `Option<Vec<u8>>` — one
+allocate-copy-free per column per row, 56,000 of them on `rescan` — to fill a
+fixed-size array that copies the bytes anyway. `row.get_ref` hands back sqlite's
+own buffer. Measured on `rescan` with an isolated `DEDUP_CACHE_DIR`, best of
+thirty-one alternating: **5.18 → 5.06 ms, −0.12 ms (−2.4%)**.
+
+`rescan` is the only scenario that reads the cache — the harness passes
+`--no-cache` everywhere else — so −0.12 ms of a 9.6 ms scenario is **−0.19% on
+the geomean, well inside the ±0.42% floor.** Kept because it is strictly less
+work for a byte-identical answer, and recorded here as **not a win**: it did not
+clear the floor and it is not what any of the numbers below moved on.
+
+A scored window appeared to show `rescan` −7.6% for it. It did not: the
+candidate's absolute was **0.0096 s in all three runs of that window** and only
+the *baseline* moved. Worth remembering — the ratio has a noisy denominator, and
+on the short scenarios the candidate's absolute second is the honest column.
+
+**Creating the reader pools lazily.** Every scan spawns 8 + 4 threads;
+`rescan` reads zero bytes and uses none of them. Killed without writing it:
+`rescan` at `-j 2` — which collapses the two pools into one of two threads —
+runs 8.08 ms against the default's 8.08. Pool creation does not register.
+
+
 ---
 
 ## 12. The loop, and when to stop
