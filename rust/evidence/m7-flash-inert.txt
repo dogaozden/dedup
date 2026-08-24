@@ -1,0 +1,21 @@
+RBENCH-shaped, on the local SSD in this worktree. Corpora from bench/corpus.py at
+scale smoke, seed 20260824. No profile flag on any run — this is the profile the harness scores.
+load average: 6.10 4.84 4.01  (shared machine: a figure above about 1 makes every
+timing below indicative only)
+
+scenario       files   bytes_read         opens    groups ours/base
+needle         10000     24682520          9635        10   0.991x
+typical         1600      2812459           430        64   0.975x
+samesize         142      3702784           142         4   1.018x
+widegroup         70     14501888            84         8   1.020x
+photos            13     47846337            11         3   1.003x
+bigheader          8     32677888             8         1   1.008x
+prefixtrap        32     16973824            32         4   0.980x
+
+geomean over 7 scenarios: 0.999x
+noise floor (base against itself, same corpus, same rounds): 1.015x
+load average at the end: 5.94 4.82 4.00
+
+bytes_read, opens, files_seen, bytes_seen and the groups are identical between the two
+builds on every scenario — that is the part of this that is a fact. The wall clock is not
+claimed: see the noise floor above.

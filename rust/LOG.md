@@ -2370,3 +2370,139 @@ one is honest to stay green, and the evidence file says so.
    session's scratchpad path at lines 23-25, and `m5_screens.py` passed for the
    reviewer at both tips while dying with EIO for me — machine-dependent, and
    M5.1's either way.
+
+## 2026-08-24 — M7, the pivot-window compare
+
+M7-PIVOT.md, from a wall the maintainer hit on real spinning media: stage 5 at
+~44 MB/s against a ~110–130 MB/s ceiling, because lockstep round-robins the
+head between every member of a group. Under `--profile spinning` the pivot is
+now read a window at a time and held, and every other member streams past it.
+
+### The thing I nearly got wrong
+
+The first version had one size where it needed two. I read a window in runs as
+long as the comparison chunk, which is the obvious thing, and the differential
+caught it: `cohort-boundary` — four content classes in files shorter than one
+chunk — went from `main`'s 49.8 MB to 90.4 MB. Every class needs a pass of its
+own, and a run as long as the file gives the next pass nothing to skip: a
+member that parted at the last kilobyte was filed under offset zero and read
+from zero again.
+
+Runs inside a window carry straight on from each other, so their length costs
+no head movement at all. Only the window buys movements. Once they are two
+different constants — `PIVOT_WINDOW` for what a movement buys, `PIVOT_RUN` for
+where a parting is placed — the same tree reads 35.4 MB, which is *below*
+`main`. That is what `pivot_run_size.py` exists for: it builds a
+`PIVOT_RUN = SLOW_CHUNK` variant and measures all three, so the constant is a
+measurement rather than an argument. 78.5 MiB, 47.5 MiB, 33.5 MiB.
+
+The lesson worth keeping: the differential is not decoration. I would have
+claimed a bytes regression as a win if I had only run the shapes the feature is
+good at, and my own seek corpus started out as five shapes that were all good
+at it. `classes-in-one-run` exists in `pivot_seeks.py` because of this, and it
+is the row that reports 1.0x.
+
+### Growth of four, not two
+
+Windows doubling took four steps to reach the ceiling, and a 256 MiB file cost
+five windows. Growing by four costs three, and the waste on a class that falls
+apart is still bounded — a window is at most N times the bytes the class had
+already agreed on, so the growth factor IS the price cap on being wrong.
+
+I wrote that ruling down as a measured seek ratio and it was not one: what I
+had measured was the whole feature against `main` at two different settings of
+the constant, which is not the same question, and the two places I wrote it
+down did not even agree with each other. REVIEW-M7 caught it. `pivot_growth.py`
+is the measurement the ruling always needed — a growth-two build of this branch
+against the tip, same corpora, cold, one reader: 1.25x-1.40x fewer head
+movements at four, bytes and groups identical. The decision was right and the
+record was wrong, which is its own kind of defect.
+
+### What I did not do
+
+`verify_attested` still calls the capped cohort comparison. The spec says
+"`verify_attested` untouched" and it is on the deletion path, so I read that
+literally rather than helpfully. It leaves two spinning splitters in the file;
+`bench.partitions` now runs lockstep, the capped sweep and the pivot sweep over
+every shape and requires all three to agree, so the older one earns its place
+as a second opinion. If the maintainer wants it moved it is one call site.
+
+### Two defects reported and not fixed
+
+A wide group of all-distinct same-size files is quadratic under both spinning
+comparisons — the pivot loop strips one class per pass and there is no
+`PARTITION_FANOUT` equivalent on this path. Not new, improved here, still
+there. And `cargo clippy --all-targets -- -D warnings` was already red on
+`main@cc654c4` (clippy 1.92's `assertions_on_constants` against M6's chunk-floor
+test, whose operands became const-foldable at the round-2 merge). The maintainer
+fixed that on main and I cherry-picked it; the side-by-side capture in
+`m7-standards.txt` stays, because a claim that says "clippy is green" should be
+able to show what it was before.
+
+## 2026-08-24 — REVIEW-M7, the fix round
+
+CHANGES on three binding items, no design objection. The reviewer derived the
+never-read-again inference independently and could not break it, so the sweep
+stands; all three items were the record. The release binary's SHA-256 is
+unchanged across this whole round, which is the shortest way to say what it did
+and did not touch.
+
+### The pattern worth killing
+
+Binding 1 was "bytes are equal or lower on every shape", a universal induced
+from seven shapes, in the same claim where I had correctly hedged the seeks
+range two paragraphs below it. So I knew the move. I hedged the number I had
+thought hard about and stated the other one as a law, because it was the one
+that flattered the work. REVIEW-M6 raised the same thing as a note and it came
+back binding.
+
+Prose was the cheap fix and not the real one: the corpus was the defect. Seven
+shapes, all chosen from the set the feature is good at. `pivot_seeks.py` now
+carries `three-way-in-one-run` (1.01x main's bytes) and `strangers-of-one-size`
+(1.05x the bytes and 51 head movements against main's 24) — written from the
+reviewer's findings and measured here independently, landing on the reviewer's
+24 → 51 exactly. The script's gate changed too: it used to fail if any shape
+failed to improve, which is a gate only a friendly corpus can satisfy.
+
+**The rule I am taking from this:** a benchmark corpus that contains no shape
+the change is bad at is not a measurement, it is an argument. Put the bad shape
+in before quoting the range.
+
+### The one that could have cost data
+
+Binding 3. When I changed `PIVOT_GROWTH` from 2 to 4 I updated the arithmetic
+in the seek test two lines below the comment and never looked at the test named
+`a_divergence_on_a_window_boundary_splits_the_group`. It kept passing, because
+correctness does not depend on where the window boundaries are — so it walked
+`3C`, `7C` and `15C`, which had stopped being boundaries, and never touched
+`5C`, which had become one. A green test that guards nothing, on the surface
+where a false merge deletes a file.
+
+Boundaries are derived from the constants now, and the geometry is *measured*
+(a pair of identical files costs one head movement per member per window, so
+the seek count says how many windows there really were) and held against the
+derivation. And because a derivation alone would have silently retargeted
+itself the same way, the test also pins `PIVOT_GROWTH == 4` and the resulting
+offsets outright, so changing the factor fails there with a reader's attention
+on it. `pivot_growth.py` builds a growth-2 tree and requires that failure.
+
+**The rule:** when a constant moves, grep for every test whose *name* describes
+a consequence of it, not just the ones that fail.
+
+### And the record that was not reproducible
+
+Binding 2: `PIVOT_GROWTH = 4`'s justification was written as a measured seek
+ratio in two places that disagreed with each other, and no committed script
+varied the constant — I had measured the whole feature against `main` at two
+settings, which is a different question. `pivot_growth.py` is the measurement
+the ruling always needed: 1.25x-1.40x fewer head movements at four, identical
+bytes and groups. Same figure the reviewer got separately.
+
+### Also
+
+`claim_audit.py` exists now (the reviewer's non-binding note 2) and caught a
+stale quote of mine within a minute — I had re-run `pivot_seeks.py` and not
+re-synced the claim, which is REVIEW-M5_2's note 1 happening to me while I was
+writing about REVIEW-M5_2's note 1. It reports four unbacked blocks in older
+claims, which are other milestones' and left alone. `m7_gate.sh` now diffs its
+two `/Volumes` listings instead of narrating them.

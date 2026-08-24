@@ -1,0 +1,10 @@
+16 x 2 MiB in 4 classes, parting in the last kilobyte, --profile spinning, one reader.
+
+read as                    bytes_read       MiB   seeks
+main, capped cohorts         49807360      47.5      73
+PIVOT_RUN = SLOW_CHUNK       82313216      78.5      72
+PIVOT_RUN = MIN_CHUNK        35127296      33.5      72
+
+all three report the same groups
+a run as long as the chunk reads 2.34x what this branch reads, and 1.65x what
+main's capped comparison reads; at MIN_CHUNK it is 0.71x main

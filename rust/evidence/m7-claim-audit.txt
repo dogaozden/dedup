@@ -1,0 +1,17 @@
+=== M7 ===
+    63 lines  <- m7-gate.txt
+    11 lines  <- m7-differential.txt
+    10 lines  <- m7-run-size.txt
+    51 lines  <- m7-seeks.txt
+    21 lines  <- m7-flash-inert.txt
+     9 lines  <- m7-combinations.txt  (also in m6-combinations.txt)
+    40 lines  <- m7-mutants.txt
+    28 lines  <- m7-m6-mutants.txt  (also in m6-mutants.txt)
+     5 lines  <- m7-descriptors.txt
+    43 lines  <- m7-standards.txt
+M7: 10 block(s), 0 untraced
+=== M7 ===
+    17 lines  <- m7-growth.txt
+M7: 1 block(s), 0 untraced
+
+every fenced output block is a verbatim quote of a file in evidence/

@@ -1,0 +1,5 @@
+three 6 MiB copies, --profile spinning, one reader:
+main@cc654c4    "bytes_read": 18874368, "opens": 6, "seeks": 12
+this branch     "bytes_read": 18874368, "opens": 3, "seeks": 9
+
+one open per member instead of two, the same bytes, fewer seeks
