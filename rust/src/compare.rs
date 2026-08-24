@@ -220,7 +220,12 @@ pub fn split_identical(
                 .open(&context.root.join(records[index].path()))
                 .ok()
         };
-        match context.open_pool.or(pool) {
+        // Only when this call owns a pool. `compare_stage` hands `None` to the
+        // members of a packed wave precisely because they are already running
+        // as pool work, and installing onto a second pool from inside pool
+        // work is the thing that comment is warning about — `photos` packs
+        // waves and regressed 21% when this ignored it.
+        match pool.and(context.open_pool).or(pool) {
             Some(pool) => pool.install(|| members.par_iter().map(open).collect()),
             None => members.iter().map(open).collect(),
         }
