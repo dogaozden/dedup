@@ -75,8 +75,16 @@ def drive(binary, root, home, keys, extra=(), size=(30, 100), cwd=None):
     """Run the browser under a pty, send `keys`, return (exit code, output)."""
     master, slave = pty.openpty()
     # A pty starts with no window size, and a terminal of no size is one the
-    # browser will not lay out. Give it 100x30 unless a case asks otherwise.
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
+    # browser will not lay out. The menu comes first now and has a floor of its
+    # own, so the terminal starts roomy and is shrunk to the size the case
+    # asked for once the browser has it — which is a window being resized,
+    # the only way a browser reaches a screen too small to read.
+    ROOMY = (30, 100)
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *ROOMY, 0, 0))
+    # Absolute, because a case that runs from inside the tree would otherwise
+    # put the run's own report, cache and Trash *in the tree being scanned* and
+    # then count them among the survivors.
+    home = os.path.abspath(home)
     environment = dict(os.environ, HOME=home, TERM="xterm-256color")
     environment.pop("DEDUP_CACHE_DIR", None)
     environment["DEDUP_CACHE_DIR"] = os.path.join(home, "cache")
@@ -115,9 +123,38 @@ def drive(binary, root, home, keys, extra=(), size=(30, 100), cwd=None):
         if b"\x1b[6n" in chunk:
             os.write(master, b"\x1b[1;1R")
 
-    for _ in range(15):  # let the scan finish and the first frame paint
-        time.sleep(0.1)
+    # Since M5.1 an interactive launch lands on the pre-flight menu, not on the
+    # browser. Enter accepts the form and starts the scan; the keys below are
+    # browser keys and must not be typed at a form that would ignore them. The
+    # browser is waited for by name, and a case that never reaches it says so
+    # rather than timing out with an exit code nobody can read.
+    reached = False
+    deadline = time.time() + 30
+    while time.time() < deadline and process.poll() is None:
         drain()
+        seen = output.decode("utf-8", "replace")
+        if not reached and "before the scan" in re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", seen):
+            time.sleep(0.3)
+            os.write(master, ENTER)
+            reached = True
+            continue
+        if reached and seen.count("\x1b[?1049h") >= 2:
+            break
+        time.sleep(0.05)
+    time.sleep(0.4)
+    drain()
+    if output.decode("utf-8", "replace").count("\x1b[?1049h") < 2:
+        # Said out loud, because this is the failure that hides: a screen in
+        # front of the browser turns every key below into a test of something
+        # else, and the case still prints numbers.
+        print("    NOT REACHED: the browser screen never appeared")
+    if tuple(size) != ROOMY:
+        # ratatui asks the terminal its size on every frame, so the next
+        # repaint — 250 ms away at most — is drawn at the new one.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
+        for _ in range(6):
+            time.sleep(0.1)
+            drain()
     for key in keys:
         # The browser may already have finished — a session that cleans up its
         # last group exits on its own. Writing into the far end of a pty
@@ -279,6 +316,9 @@ def main():
 
     # The same tree again, cleaned by --auto from the same directory.
     again, home_again = fresh(scratch, "m5-e2e-bulk-auto")
+    # Absolute for the same reason `drive` makes it absolute: this half runs
+    # from inside the tree too.
+    home_again = os.path.abspath(home_again)
     build(again, {"b.bin": b"ranked content", "photos/aaaa.bin": b"ranked content"})
     subprocess.run(
         [

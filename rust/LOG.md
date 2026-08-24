@@ -2223,6 +2223,39 @@ gave the same two numbers. A comparison there would be measuring the scheduler.
 commit rather than by reading the last claim. Clippy and fmt clean, `--gate
 all` 33/33.
 
+### What the regression suites said when I ran them, which is the point of them
+
+I re-ran M5's and M5.1's own scripts before claiming, expecting a formality.
+`m5_end_to_end.py` — the only proof in the repository that the browser deletes
+what it says it deletes — printed `18 check(s) differing`, and printed exactly
+the same thing against a build of `main@fbc196d`. It had not been testing the
+browser since M5.1: it launches with `-i`, which now lands on the pre-flight
+menu, and then types browser keys at a form that ignores them until the pty
+times out and the process is killed.
+
+That is REVIEW-M5_1's own third finding — a test that does not assert which
+screen it is on stops covering the screen it was written for the moment
+somebody adds another — fixed in `tui-terminal-death.py` at the time and not
+looked for anywhere else. Three harness bugs, no program change: wait for the
+menu by name and Enter through it, say `NOT REACHED` when the browser's screen
+never appears, make the two cases that run from inside the tree use an absolute
+`HOME` (their relative one put the run's own report, cache and Trash inside the
+tree and counted them as survivors), and start the too-small case roomy and
+shrink the pty once the browser has it, because the menu now refuses below
+54x16 before the browser is ever reached. 0 differing after, on both builds.
+
+Two scripts I did not fix, because what they turn up is not a harness bug.
+`m5_terminal_restore.py`'s ctrl-c case fails, and running it down found that
+**ctrl-c does not leave the pre-flight menu**: the browser checks
+`KeyModifiers::CONTROL` first, the menu's `key_for` is handed a `KeyCode` with
+the modifiers already dropped, and raw mode means the terminal raises no SIGINT
+either. Driven on a pty at both screens, on this build and on `main@fbc196d`
+alike: `ctrl-c at the menu: STILL RUNNING after 5s`, `ctrl-c at the browser:
+left with exit 0`. `q` and Esc still work and M5_1-MENU.md specifies only those,
+so nobody is trapped — but a user who reaches for ctrl-c gets nothing. One line,
+and it belongs to M5.1's owner, not to this milestone. `m5_screens.py` dies with
+EIO for the same menu-in-front reason, one screen further on.
+
 ### Also
 
 `tools/passport-measure.sh` takes `--min-size 1m`, and gives the scan's own

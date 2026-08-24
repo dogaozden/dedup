@@ -1,0 +1,12 @@
+The M5 browser suite, screen-aware again. Every case had been driving the
+pre-flight menu since M5.1 put one in front of the browser; 18 checks were
+reported as differing and none of them was testing the browser.
+
+$ python3 rust/evidence/scripts/m5_end_to_end.py <binary> <scratch>
+
+=== this branch ===
+0 check(s) differing
+exit=0
+=== main@fbc196d ===
+0 check(s) differing
+exit=0

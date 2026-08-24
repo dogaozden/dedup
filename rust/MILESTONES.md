@@ -2063,6 +2063,82 @@ gate all: green
 exit=0
 ```
 
+### A defect found on the way, in M5's evidence rather than in M5.2
+
+`evidence/scripts/m5_end_to_end.py` — the browser's end-to-end suite, the only
+proof in the repository that the browser deletes what it says it deletes — has
+not been testing the browser since M5.1 landed. It launches with `-i`, which
+now reaches the pre-flight menu, and then types browser keys at a form that
+ignores them. Every pty case timed out and was killed:
+
+```text
+18 check(s) differing
+```
+
+...on `main@fbc196d` exactly as on this branch, so the suite was reporting the
+same wreckage whatever it was pointed at. This is REVIEW-M5_1's own third
+finding — "a test that does not assert which screen it is on stops covering the
+screen it was written for the moment somebody adds another" — which was fixed
+in `tui-terminal-death.py` and not looked for anywhere else.
+
+Three harness bugs, no program change:
+
+- It now waits for the menu by name, presses Enter, waits for the browser's
+  alternate screen, and prints `NOT REACHED` where that never happens. A case
+  that is not on the browser must say so instead of printing numbers.
+- The two cases that run from inside the scanned tree passed a relative `HOME`,
+  so the run's own report, cache and Trash were created *inside the tree* and
+  counted among the survivors. Absolute now. This is the case that guards
+  REVIEW-M5's binding item 1, the keep rules ranking the scan's own name.
+- The too-small-terminal case can no longer start small: the menu refuses
+  below 54×16 before the browser is ever reached, and correctly so. The pty
+  starts roomy and is shrunk once the browser has it, which is a window being
+  resized — the only way a browser now reaches a screen too small to read.
+
+`evidence/m5_2-m5-suite-restored.txt`:
+
+```text
+=== this branch ===
+0 check(s) differing
+exit=0
+=== main@fbc196d ===
+0 check(s) differing
+exit=0
+```
+
+Byte-identical output on both builds, so nothing in M5.2 moved the browser; and
+eighteen checks that were dead are alive, including the deletion laws, the
+keep-rule law, and the refusal on a screen nobody can read.
+
+`tui-terminal-death.py` (4/4) and `m5_1_menu_end_to_end.py` (7/7) were re-run
+unchanged and are green. Two more scripts are **not**, on this branch and on
+`main@fbc196d` alike, and I have left them alone because what they turn up is
+not a harness bug:
+
+- `m5_screens.py` dies with `OSError: [Errno 5]` partway through — the same
+  menu-in-front cause, one screen further on.
+- `m5_terminal_restore.py` reports 5 checks differing. Its `quitting with q`
+  case is clean — raw mode entered and released, alternate screen entered and
+  left — but its `interrupting with ctrl-c` case is not, and running that down
+  found a program gap rather than a script one.
+
+**Ctrl-C does not leave the pre-flight menu.** The browser answers it before
+anything else (`tui/mod.rs`'s `key_for` checks `KeyModifiers::CONTROL` first);
+the menu's `key_for(editing: bool, code: KeyCode)` is never given the
+modifiers, so Ctrl-C arrives as `Char('c')` and falls through to `Key::Ignored`.
+Raw mode means the terminal raises no SIGINT of its own, so nothing happens at
+all. Driven on a pty, at both screens, on both builds:
+
+```text
+ctrl-c at the menu: STILL RUNNING after 5s
+ctrl-c at the browser: left with exit 0
+```
+
+`q` and Esc still leave, so nobody is trapped, and M5_1-MENU.md specifies only
+those two — which is why I am reporting this rather than changing another
+milestone's keymap inside this one. It is one line (take the `KeyEvent` rather
+than its `KeyCode`, as the browser does) and it belongs to whoever owns M5.1.
+
 ### What a reviewer should look at hardest
 
 - **Two humanisers where the spec says one.** Argued above and in LOG.md. The
