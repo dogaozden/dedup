@@ -2172,6 +2172,27 @@ than its `KeyCode`, as the browser does) and it belongs to whoever owns M5.1.
   nothing until it finishes. That is the oracle's behaviour in the same shape —
   its `tick` inside `split_identical` moves `hashed_bytes` and not
   `hashed_files` — and the rate is the sign of life there.
+- **Ctrl-C mid-scan leaves one line of text behind.** The pulse writes text and
+  never a mode change, so an interrupt while it is painting cannot wreck
+  anything — but `Drop` does not run on a default SIGINT, so the last line
+  painted stays where it is and the shell's next prompt lands after it. Driven
+  on a pty, interrupt sent while the line was provably up:
+
+  ```text
+  the line was up when the interrupt landed: True
+  modes (canonical, echo) before/during/after: (True, True) (True, True) (True, True)
+  terminal came back as it was: True
+  exit: -2
+  mode-changing escapes written (alt screen / raw): False
+  last bytes: '\r\x1b[2K  Sampling further…  ███░░░░░░░░░░░░░░░░░░░░░  12%  2/16 · 176 MiB/s'
+  ```
+
+  The oracle clears it, because Python hands it a `KeyboardInterrupt` to catch.
+  Matching that here means a signal handler, which means `libc::signal` and an
+  `unsafe` block, which REWRITE.md §7 keeps inside `sys.rs` — new machinery for
+  one stale line on a terminal that is otherwise exactly as it was found. I
+  left it, rather than decide that quietly.
+
 - **Nothing here is deletion-adjacent**, and the `ProvenGroups` guard, the
   survivor guard and `verify_attested` are untouched. `--gate all` is 33/33 and
   the piped stdout is byte-identical to `main`'s.
