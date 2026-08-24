@@ -2740,8 +2740,9 @@ HDD wall-clock unvalidated: no rotational drive is available here.
 
 **On these nine shapes** bytes run from 0.70x to 1.05x of what `main` reads —
 so mostly equal or lower, and on two of them higher. That is a statement about
-this corpus and not a general result; see the paragraph after next, which is
-where the shapes that cost more live. Where the sweep reads less it is for one
+this corpus and not a general result; "Where the win is, and where it is not",
+below, is where the shapes that cost more live. Where the sweep reads less it is
+for one
 reason: `main`'s capped comparison re-reads a pivot once per cohort, and this
 sweep opens and reads each member once per pass instead. The `opens` column is
 the same fact from the other side — at least halved on every shape, and better
