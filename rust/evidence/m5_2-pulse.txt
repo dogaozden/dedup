@@ -1,8 +1,8 @@
 $ python3 rust/evidence/scripts/m5_2_pulse.py rust/target/release/dedup-rs \
     <scratch> <a build of main@fbc196d>
 a piped run says nothing at all                ok (stdout byte-identical to main, 5188 bytes; stderr empty on both; 5 counters equal at -j1)
-a terminal gets a line, and gets it back       ok (5 repaints, stages Reading small files+Sampling+Comparing, bar Reading small files 5469→12002/12002; Sampling 6→6/14; Comparing 6→6/14, cleared before the browser)
-the walk counts files out loud                 ok (2 repaints, counts 59320…59320 against 100000 files seen, never ahead and never backwards)
+a terminal gets a line, and gets it back       ok (4 repaints, stages Reading small files+Comparing, bar Reading small files 7234→12002/12002; Comparing 0→0/14, cleared before the browser)
+the walk counts files out loud                 ok (2 repaints, counts 62281…62281 against 100000 files seen, never ahead and never backwards)
 --quiet means quiet on a terminal too          ok (nothing between the menu and the browser, 9 groups found)
 --list down a pipe, the line on the terminal   ok (37729 bytes of list down the pipe, 1 repaints on the terminal, neither in the other)
 the menu takes 100mb, 1m and 1k                ok (100mb→0 group(s), 1m→7 group(s), 1k→9 group(s))

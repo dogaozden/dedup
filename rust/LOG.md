@@ -2205,14 +2205,16 @@ repaint.
 
 | | opens | bytes_read | files_seen | bytes_seen | seeks | wall-clock |
 |---|---|---|---|---|---|---|
-| -j1, m5.2 | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.877s median |
-| -j1, main | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.871s median |
-| -j8, m5.2 | 51052 | 647872512 | 30516 | 640221184 | — | 0.782s median |
-| -j8, main | 51052 | 647872512 | 30516 | 640221184 | — | 0.782s median |
+| -j1, m5.2 | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.870s median |
+| -j1, main | 51052 | 647872512 | 30516 | 640221184 | 51260 | 0.863s median |
+| -j8, m5.2 | 51052 | 647872512 | 30516 | 640221184 | — | 0.781s median |
+| -j8, main | 51052 | 647872512 | 30516 | 640221184 | — | 0.783s median |
 
-+0.8% at one reader and +0.0% at eight, against spreads of 1.179s and 0.185s
++0.8% at one reader and -0.2% at eight, against spreads of 3.614s and 0.028s
 within a single build — this machine has other agents on it, and the alternating
-design is what keeps that from landing on one side.
+design is what keeps a burst of their work from landing on one side. The `-j8`
+half is the measurement with the machine quiet: 0.028s of spread and two
+milliseconds of difference, in this build's favour.
 
 `seeks` is compared at one reader only. Above that it is nondeterministic by
 design, and I checked rather than assumed: eight repeats of `main` against

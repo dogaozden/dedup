@@ -1965,9 +1965,9 @@ stderr piped, alternating builds so a warming disk drifts through both sides,
   bytes_seen        640221184      640221184   same
   seeks                 51260          51260   same
   groups                  254            254   same
-  m5.2         0.877s median, 0.854–2.033
-  main         0.871s median, 0.858–0.955
-  difference   +0.8% (+0.007s), against a 1.179s spread within a build
+  m5.2         0.870s median, 0.848–4.462
+  main         0.863s median, 0.850–4.461
+  difference   +0.8% (+0.007s), against a 3.614s spread within a build
 
 == stderr piped, -j8 ==
   opens                 51052          51052   same
@@ -1976,9 +1976,9 @@ stderr piped, alternating builds so a warming disk drifts through both sides,
   bytes_seen        640221184      640221184   same
   groups                  254            254   same
   seeks                 51260          51260   not compared: nondeterministic above one reader
-  m5.2         0.782s median, 0.760–0.945
-  main         0.782s median, 0.774–0.798
-  difference   +0.0% (+0.000s), against a 0.185s spread within a build
+  m5.2         0.781s median, 0.767–0.795
+  main         0.783s median, 0.772–0.796
+  difference   -0.2% (-0.002s), against a 0.028s spread within a build
 
 the pulse costs a piped run nothing that can be measured
 exit=0
@@ -1989,8 +1989,13 @@ than a convenience: eight repeats of `main` against itself at the default `-j`
 gave 348 and 349 on the same tree, and this build gave the same two numbers.
 Concurrent readers interleave and count against each other, which is the honest
 answer for one set of heads and is what M6 scores; a comparison there would be
-measuring the scheduler. This machine has other agents on it, which is what the
-2.033s outlier and the wide `-j1` spread are.
+measuring the scheduler.
+
+This machine has other agents on it, which is what the 4.46s outliers and the
+wide `-j1` spread are; the alternating design is what keeps a burst of their
+work from landing on one side, and it caught both builds equally. The `-j8`
+half is what the measurement looks like when the machine is quiet: 0.028s of
+spread, and a difference of two milliseconds in this build's favour.
 
 ### Also
 
