@@ -389,6 +389,7 @@ prefixtrap*  0.0068  0.0061  0.9012   ±4.0%   16.2 MB   16.2 MB   16.0 MB
 | 7 | hardware SHA-256 (`sha2` `asm` feature) | `b3d81fd` | → **0.6102** refereed |
 | 8 | a 512 KB comparison chunk, not 4 MB | `8c2e4dd` | −11.8% A/B; **0.6029** refereed |
 | 9 | parallel opens + no copies in the compare setup | `5dbe9d6` | −6.2% A/B; **0.5717** refereed |
+| 10 | hash the small-file keys on the readers | `b0c3b72` | −2.1% A/B; **0.5529** refereed |
 
 Two of those want the maintainer's eye before anything is taken:
 
@@ -1951,11 +1952,36 @@ NOISE FLOOR: ±2.4%   (worst scenario: photos at 0.9763)
   geomean of a baseline against itself: 0.9958
 ```
 
-**±2.4%**, tighter than the figure I borrowed — so the bar for keeping a change
-was lower than I had been holding it to, not higher. Note the second line:
-per-round dispersion reaches ±10.2% on `bigheader` while the geomean of the
-whole run is within 0.4% of 1.0000. That is the whole reason a single scenario
-in a single run means so little here and the A/B of two commits means so much.
+**And then I misread it.** §6.2 quotes the floor as two numbers — "about ±3.4%
+per scenario, ±1% on the geomean" — and this output has both: **±2.4% per
+scenario** (photos at 0.9763) and, on the last line, a geomean of a baseline
+against itself of 0.9958, which is **±0.42% on the geomean**. For several
+hours I applied the per-scenario number to the geomean, which is the wrong bar
+by a factor of six.
+
+That correction is not academic, because the stop entry above rests on it.
+Re-read against the right floor, of the "four consecutive ideas inside the
+floor" that ended the round the first time, only two actually were:
+
+```
+  idea                          A/B geomean   vs ±0.42% geomean floor
+  reader pool sizing               -2.1%      five times the floor
+  dlopen IOKit off startup         ~1.8%      four times the floor (est.)
+  the seek mutex, third test        0.0%      inside
+  reusing the compare's buffers    ~0.07%     inside
+```
+
+The pool change and the IOKit change were **not** inside the floor. There are
+still good reasons not to have kept them — the pool change is a §8
+cross-scenario trade and belongs to the maintainer, and IOKit wanted every
+CoreFoundation call rewritten into `dlsym` for its 1.8% — but "inside the
+noise floor" was the wrong reason to give, and §12's counter should not have
+reached three on them. **The round should not have stopped where it did.**
+
+Note the middle line of the calibration too: per-round dispersion reaches
+±10.2% on `bigheader` while the geomean of the whole run sits within 0.42% of
+1.0000. That is why a single scenario in a single run means so little here,
+and why the A/B of two commits means so much.
 
 **Change:** `rust/src/compare.rs`. Two pieces of avoidable work in
 `split_identical`'s setup, both timed inside the stage on `widegroup`:
@@ -2001,6 +2027,60 @@ it. Confirmed at `--seed 2`: **0.5859**. Refereed at 21 rounds: **0.5717**.
 `widegroup` reports the same 8 groups, 5,442 opens and 473.3 MB as before —
 the same bytes, compared the same way, in the same order. 174 tests and the
 selftest pass.
+
+## 2026-08-23 — the small-file stage hashed every byte it read, on one thread
+
+**Change:** `rust/src/ordered.rs` gains `push_hashed`; `rust/src/stages.rs`
+uses it from all three grouping loops.
+
+`small_file_stage` reads in parallel and groups serially, and the grouping is
+not bookkeeping: `Ordered::push` hashes the key, and in this stage the key *is*
+the file content. Every byte the stage read was then hashed on one thread.
+Timed inside the stage on `typical` — 13,372 files, 4 KiB of head each:
+
+```
+  tier-A read (parallel)     49.86 ms     against a ~46.7 ms measured floor
+  tier-A grouping (serial)    9.24 ms     53 MB at 5.8 GB/s
+```
+
+5.8 GB/s is exactly what the `Fast` mixer does on one core, so that loop was
+hash-bound, and the hash is the part of it that never needed to be serial.
+`push_hashed` takes a hash the caller already holds; all three loops now
+compute it where they read the bytes. Tier B's join moved with it — it was
+`head.clone()` then `extend_from_slice`, two passes over the file on the
+grouping thread, now one `with_capacity` build on a reader.
+
+The key still decides the grouping and is still compared in full before a match
+is believed, so the hash stays a hint: a wrong one could cost a comparison,
+never a wrong group. Insertion order is untouched, which is what
+`RETAIN_BUDGET` observes.
+
+**Numbers.** The full A/B at 21 rounds said **-2.1%**, which sits right on
+§6.2's "do not keep a change on the strength of a 2% score improvement" — so
+the two scenarios the change actually touches were isolated and run twice each,
+21 rounds, alternating:
+
+```
+                A1        A2        B1        B2      B vs A
+  needle      0.7407    0.7512    0.7025    0.7220     -4.5%
+  typical     0.5761    0.5874    0.5243    0.5395     -8.6%
+```
+
+Every B run is below every A run, on both scenarios, with spreads of ±0.9% to
+±3.9%. That is not a 2% reading being kept on faith; it is four separated runs
+behind a mechanism that was measured before the change was written. Kept.
+
+Confirmed at `--seed 2`: **0.5504**. Refereed at 21 rounds: **0.5529**, every
+gate green, with `needle` at 0.6891 and `typical` at 0.5409 — both their best
+of the round.
+
+`typical` reports the same 768 groups, 13,372 opens and 74.1 MB. 174 tests and
+the selftest pass.
+
+**A note on waiting.** Both confirmation runs were refused twice by the
+harness's own busy-check — another agent's harness was live out of
+`~/AI_Projects/dedup-m52` — and the retry loop simply kept asking until it
+went away. Nothing of theirs was touched.
 
 ---
 
