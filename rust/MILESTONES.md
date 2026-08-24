@@ -2886,9 +2886,10 @@ that would be remembered and matched against on the NEXT scan.
 **And M6's own mutants, re-run.** REVIEW-M5_2's process rule is to run every
 script under `evidence/scripts/` that names a file the branch touched before
 claiming, and `spinning_mutants.py` names `compare.rs`. It exercises the capped
-comparison, which this branch does not change but does move inside the file —
-an anchor that had drifted would have made it abort silently rather than fail.
-All seven still caught, `evidence/m7-m6-mutants.txt`:
+comparison, which this branch does not change but does move inside the file, so
+an anchor of M6's could have drifted out from under it. None did — the script
+refuses to run rather than guess when one has — and all seven are still caught.
+`evidence/m7-m6-mutants.txt`:
 
 ```text
 Baseline: the tree as written.
