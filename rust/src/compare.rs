@@ -1778,14 +1778,39 @@ mod tests {
     // -------------------------------------------------------- the pivot windows
 
     /// The chunk every shape below is built around. A window starts there and
-    /// doubles, so with a group read from offset zero the windows are
-    /// `[0, C)`, `[C, 3C)`, `[3C, 7C)`, `[7C, 15C)`, and the runs inside them
-    /// are every C bytes.
+    /// grows by `PIVOT_GROWTH`, so with a group read from offset zero the
+    /// windows of a `SPAN`-long file are `[0, C)`, `[C, 5C)`, `[5C, 21C)`,
+    /// `[21C, SPAN)`, and the runs inside every one of them are C bytes.
+    ///
+    /// Those numbers are not written down anywhere below: `window_edges` works
+    /// them out from the constants, and `the_windows_are_where_the_growth_factor
+    /// _puts_them` measures where they really fall and holds the two to each
+    /// other. A change to the ramp moves all three together or fails.
     const C: usize = 4096;
 
-    /// Long enough for four windows and an end: the shapes below put their
-    /// divergence in each of them in turn.
-    const SPAN: usize = 16 * C;
+    /// Long enough for four windows and an end, so a shape can put its parting
+    /// in each of them in turn and either side of all three boundaries.
+    const SPAN: usize = 40 * C;
+
+    /// Where the sweep's windows end, for a group read from `from` to `size` at
+    /// chunk `C` — derived from the constants rather than from a comment, so it
+    /// cannot describe a ramp the code no longer has.
+    ///
+    /// A window that reaches exactly to EOF still ends: the sweep only learns
+    /// the file is over when a read comes back short of what it asked for, so
+    /// one more window follows to find that out. `<=` rather than `<` is that
+    /// fact, and it is what makes the count agree with the seeks.
+    fn window_edges(from: usize, size: usize) -> Vec<usize> {
+        let mut edges = Vec::new();
+        let mut at = from;
+        let mut window = C;
+        while at + window <= size {
+            at += window;
+            edges.push(at);
+            window = window.saturating_mul(PIVOT_GROWTH).min(PIVOT_WINDOW.max(C));
+        }
+        edges
+    }
 
     fn sweep(
         bench: &Bench,
@@ -1840,50 +1865,95 @@ mod tests {
 
     #[test]
     fn a_divergence_in_a_middle_window_splits_the_group() {
-        // Inside `[3C, 7C)`, the third window, with windows either side of it.
-        assert_eq!(classes(&parting("middle", 5 * C), C), [[0, 1], [2, 3]]);
+        // Inside the third window, with windows either side of it.
+        let at = window_edges(0, SPAN)[1] + C;
+        assert_eq!(classes(&parting("middle", at), C), [[0, 1], [2, 3]]);
     }
 
     #[test]
     fn a_divergence_in_the_last_window_splits_the_group() {
-        // Past `15C`, so only the run that reaches the end of the file can
-        // separate them.
+        // Past the last boundary, so only the run that reaches the end of the
+        // file can separate them.
+        let last = *window_edges(0, SPAN).last().expect("several windows");
+        assert!(SPAN - 7 > last);
         assert_eq!(classes(&parting("last", SPAN - 7), C), [[0, 1], [2, 3]]);
     }
 
     #[test]
+    fn the_windows_are_where_the_growth_factor_puts_them() {
+        // The geometry every boundary test below stands on, MEASURED rather
+        // than read off a comment. A window costs one head movement per member,
+        // so a pair of identical files costs two per window: the seek count
+        // says how many windows the file took, and `window_edges` has to agree.
+        //
+        // This is the guard REVIEW-M7 asked for. When the ramp changes, the
+        // measured count and the derivation move together and this still holds;
+        // when only one of them changes, it fails.
+        for size in [C, SPAN, 4 * SPAN] {
+            let bench = Bench::new(&format!("geom{size}"), &[b'A'; 2], size);
+            let effort = Effort::default();
+            let mut sink = Vec::new();
+            sweep(&bench, C, &effort, &mut sink);
+            let windows = window_edges(0, size).len() + 1;
+            assert_eq!(
+                effort.seeks(),
+                2 * windows as u64,
+                "a {size}-byte pair should take {windows} window(s)"
+            );
+        }
+
+        // ...and the offsets the shapes below are written around, spelled out
+        // once so that changing the growth factor fails HERE, where a reader is
+        // told which offsets to look at, rather than silently retargeting a
+        // test named for boundaries onto offsets that are not boundaries.
+        assert_eq!(PIVOT_GROWTH, 4, "the offsets below belong to this factor");
+        assert_eq!(window_edges(0, SPAN), [C, 5 * C, 21 * C]);
+    }
+
+    #[test]
     fn a_divergence_on_a_window_boundary_splits_the_group() {
-        // Either side of every boundary a doubling window has in this file,
-        // plus the first and last byte of the file itself. An off-by-one in
-        // where a window starts or ends loses one of these.
-        for at in [
-            0,
-            1,
-            C - 1,
-            C,
-            C + 1,
-            3 * C - 1,
-            3 * C,
-            3 * C + 1,
-            7 * C - 1,
-            7 * C,
-            7 * C + 1,
-            15 * C - 1,
-            15 * C,
-            15 * C + 1,
-            SPAN - 1,
-        ] {
+        // Either side of every real window boundary in this file, plus the
+        // first and last byte of the file itself. An off-by-one in where a
+        // window starts or ends loses one of these.
+        let mut offsets = vec![0, 1, SPAN - 1];
+        for edge in window_edges(0, SPAN).into_iter().filter(|&e| e + 1 < SPAN) {
+            offsets.extend([edge - 1, edge, edge + 1]);
+        }
+        assert!(offsets.len() >= 12, "this file has boundaries to walk");
+        for at in offsets {
             let bench = parting(&format!("edge{at}"), at);
             assert_eq!(classes(&bench, C), [[0, 1], [2, 3]], "parting at {at}");
         }
     }
 
     #[test]
+    fn a_divergence_on_a_run_boundary_splits_the_group() {
+        // The same walk over the run boundaries, which are every C bytes and
+        // are not the same thing. Worth testing, just not under the other name.
+        for run in 0..SPAN / C {
+            for at in [run * C, (run * C + C).saturating_sub(1)] {
+                let bench = parting(&format!("run{at}"), at);
+                assert_eq!(classes(&bench, C), [[0, 1], [2, 3]], "parting at {at}");
+            }
+        }
+    }
+
+    #[test]
     fn the_sweep_finds_the_same_classes_wherever_the_files_part() {
-        // The named cases above, exhaustively: every run boundary and a spread
-        // of offsets between them, each checked against the lockstep answer
-        // rather than against a hand-written one.
-        for at in (0..SPAN).step_by(311).chain((0..16).map(|run| run * C)) {
+        // The named cases above, exhaustively: every run boundary, every window
+        // boundary and its neighbours, and a spread of offsets between them,
+        // each checked against the lockstep answer rather than a hand-written
+        // one. The stride is coprime with C so it does not walk in step with
+        // the runs.
+        let edges: Vec<usize> = window_edges(0, SPAN)
+            .into_iter()
+            .filter(|&e| e + 1 < SPAN)
+            .collect();
+        let walk = (0..SPAN)
+            .step_by(311)
+            .chain((0..SPAN / C).map(|run| run * C))
+            .chain(edges.iter().flat_map(|&e| [e - 1, e, e + 1]));
+        for at in walk {
             let bench = parting(&format!("walk{at}"), at);
             let effort = Effort::default();
             let mut sink = Vec::new();
@@ -2033,7 +2103,7 @@ mod tests {
     fn the_sweep_opens_each_member_once_and_reads_it_in_one_run_per_window() {
         // The point of the profile, in the two counters that see it. Lockstep
         // charges a head movement per member per chunk; the sweep charges one
-        // per member per window, and a window doubles.
+        // per member per window, and a window grows by `PIVOT_GROWTH`.
         let bench = Bench::new("runs", &[b'A'; 8], 128 * C);
         let lock = Effort::default();
         let mut sink = Vec::new();
