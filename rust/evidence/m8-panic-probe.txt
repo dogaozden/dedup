@@ -1,0 +1,18 @@
+$ python3 rust/evidence/scripts/m8_panic_probe.py
+
+$ inject a panic into live_loop, immediately after fresh.finished
+    browser reached:            True
+    alternate screens entered:  2
+    panic message on screen:    True
+    exited on its own:          True
+    exit code:                  101
+    seconds to leave:           0.47
+
+$ source restored and rebuilt   (the stale-mutant rule)
+    binary before the probe:  c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1
+    binary after the restore: c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1
+    identical: the mutant is gone
+
+pass  a browser-thread panic ends the process instead of hanging it
+
+   exit 0

@@ -3734,3 +3734,277 @@ Trash rather than the real one. Free disk on `/` at the end of the run: 13 GiB.
 The machine was shared with other agents throughout — the load average is
 printed beside every timing, which is why the only figures claimed as facts
 here are counters.
+
+## M8 — fix round after REVIEW-M8 — 2026-08-25 — RE-CLAIMED
+
+Branch `m8-live`, still off `main@a362ffa`. Binding review `rust/REVIEW-M8.md`
+at `m8-review`: **CHANGES, four binding items, no design objections.** Every
+call the first claim flagged was ratified — apply-pauses-scan, the declined
+idle-time promotion, the reuse of `attested`, `--force`, `MENU_EXPOSURE`. All
+four items are closed, and so are non-binding notes 1, 2 and 3. Notes 4 and 5
+need no action and got none.
+
+**The one that could have deleted the wrong file is item 1, and it is closed
+twice over** — once by removing the stale marks, once by making the panic they
+caused end the process rather than hang it.
+
+**Items 2 and 3 were the same lesson from two directions: a guard is only as
+good as the suite that can fail because of it.** I had built an 84-case fence
+proof, falsified it, and then left half of `live_wanted` behind a
+short-circuit the proof can never satisfy; and the single line that decides
+whether a candidate may be deleted from had no `cargo test` guard at all.
+Both now fail under mutation, and both mutations are committed scripts rather
+than things I did once.
+
+Tests: **226 on `main@a362ffa` → 258 here**, up from 250 at `be65b8a`.
+
+### Item 1 — a refusal left marks that named files that were no longer there
+
+`serve`'s `Refused` arm was the only answer that republished a list without
+clearing the marks against it. `absorb_found` pruned by group id alone, on the
+reasoning that "a mark on a group that is gone is not a mark on anything" —
+true, and not the case that bit. A resplit group is not gone, it is smaller,
+and `selection()` indexed past the end of it.
+
+The reviewer offered two fixes and I took neither literally, which is stated
+here because it is a judgement call. Clearing on the `Refused` path fixes the
+instance. Pruning by member position fixes the range error but not the real
+one: a rebuilt list only ever arrives after a proof or a deletion and **both
+rewrite membership**, so position 1 of a rebuilt group need not be the record
+the user marked at position 1. A mark pruned only for range would be in range
+and name a different file — keying marks by screen position again, wearing a
+different hat, on the path where being wrong deletes something nobody chose.
+
+So every mark goes whenever the scan rebuilds the list, which is the rule
+`absorb` already stated, applied in `absorb_found` — the one place a rebuilt
+list arrives — rather than at the single call site that happened to be wrong.
+
+Three terminal-free tests, one of them the reviewer's own reproducer.
+`m8_deletion_mutants.py` reverts the fix and requires them to fail, with the
+reviewer's exact message. Captured to `evidence/m8-deletion-mutants.txt`,
+quoted from the file:
+
+```text
+the stale-mark fix reverted              caught
+                                           by tui::model::tests::a_mark_does_not_survive_a_group_being_rebuilt_smaller
+                                           by tui::model::tests::a_mark_out_of_range_is_dropped_rather_than_panicked_on
+                                           by tui::model::tests::a_rebuild_clears_marks_on_groups_it_did_not_touch_either
+                                           index out of bounds: the len is 2 but the index is 3
+```
+
+`selection()` also stops indexing directly. That is a backstop and the comment
+says so; the guard is `absorb_found`.
+
+### Item 1, second half — a browser panic hung the process
+
+`live_scan` reached `watch.cancel()` only after `tui::run_live` returned, so a
+panic on the browser thread skipped it and unwound into a `thread::scope` join
+whose scan thread loops `while !live.cancelled()`. The reviewer measured the
+result: alive after 25 seconds, killed at the limit, terminal restored by the
+panic hook — a working shell and a process that would not die.
+
+`Watch::stopping()` is the mirror of the `Live::leaving()` guard the scan
+thread already had. What is worth admitting is that I wrote that scan-side
+guard for exactly this hazard and never asked whether the other end needed one.
+
+`m8_panic_probe.py` keeps it honest: it injects the panic at the reviewer's own
+injection point, rebuilds, drives a pty, and proves its own restore by hash.
+Captured to `evidence/m8-panic-probe.txt`, quoted from the file:
+
+```text
+$ inject a panic into live_loop, immediately after fresh.finished
+    browser reached:            True
+    alternate screens entered:  2
+    panic message on screen:    True
+    exited on its own:          True
+    exit code:                  101
+    seconds to leave:           0.47
+```
+
+With the guard removed the same script reports `THE PROCESS NEVER LEFT: still
+alive after 15s, killed at the limit` — so it is a guard and not a ritual.
+
+### Item 2 — the line that decides deletion now fails a mutant in `cargo test`
+
+`prove_marked`'s `whole`, inverted either way, left all 250 tests green. Three
+new terminal-free tests use the "same ends, different middles" fixture the
+first claim described: identical head, identical tail, identical deep head,
+different middles, so every cheap stage calls it one group and only reading the
+middle knows better.
+
+From the same file, the same two inversions the reviewer applied:
+
+```text
+the proof always PASSES  (whole = true)  caught
+                                           by pipeline::tests::the_proof_refuses_a_group_whose_middles_differ_however_its_ends_look
+the proof always FAILS   (whole = false) caught
+                                           by pipeline::tests::the_proof_accepts_a_group_that_really_is_identical
+```
+
+Both mutants were applied, run, reverted, and the suite proved green again. A
+third test pins the `proven` short-circuit on `Effort::bytes_read` being zero,
+rather than on what the function says about itself.
+
+The pty battery still owns the whole path from a keystroke to what is left on
+disk, and LOG.md now says so in as many words — non-binding note 1.
+
+### Item 3 — every clause of the fence's own guard is now guarded
+
+`live_flags` is the flag half of `live_wanted`, split out so it is decidable
+without a terminal. `m8_fence_clauses.py` deletes each clause in turn and
+requires a failure. Captured to `evidence/m8-fence-clauses.txt`, quoted from
+the file:
+
+```text
+live_flags loses the --report-json clause      caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+live_flags loses the --stage clause            caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+live_flags loses browsing_flags entirely       caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+browsing_flags stops excluding --auto          caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+                                                 by tests::the_menu_opens_for_exactly_the_runs_the_browser_opens_for
+browsing_flags stops excluding --list          caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+                                                 by tests::the_menu_opens_for_exactly_the_runs_the_browser_opens_for
+```
+
+Five clauses, five caught, the suite green again afterwards and the release
+binary's hash identical before and after — the stale-mutant rule, checked by
+the script rather than asserted by me. (The script builds before it measures.
+Its first run reported a mismatch that was only ever a binary older than the
+source, which is the rule catching the script; the sequencing is fixed and the
+reason is in a comment.)
+
+A unit test asks the function what it thinks, so `m8_tty_matrix.py` asks the
+binary what it does — six combinations on a real pty. Captured to
+`evidence/m8-tty-matrix.txt`, quoted from the file:
+
+```text
+case                         exit   alt  candidate   report   verdict
+bare interactive                0     2       True    False   as the fence requires
+--list                          0     0      False    False   as the fence requires
+--list --interactive            0     2       True    False   as the fence requires
+--report-json                   0     2      False     True   as the fence requires
+--stage size                    2     1      False    False   as the fence requires
+--auto shortest --yes           0     0      False    False   as the fence requires
+```
+
+Row for row, that is the reviewer's own matrix, measured independently here.
+`--report-json` on a terminal still writes its report and still shows no
+`candidate` label, which is the half of item 3's verification the freeze proof
+structurally cannot see.
+
+### Item 4 — `--list --interactive` on a terminal takes the live path
+
+**Recorded, as the review asked, and not changed.** `main.rs` claimed "`--list`
+and `--auto` are already excluded by `browsing_flags`". `--auto` is. `--list`
+is excluded only when `--interactive` is absent, because the expression is
+`options.auto.is_none() && (options.interactive || !options.list)`. So
+`dedup-rs /tree --list --interactive` on a terminal is an interactive run: it
+opens the live browser, streams candidates, and defers stage 5 to the moment of
+deletion, exactly as a bare interactive run does. `main` browses the same
+command fully proved, because it has no live path at all.
+
+That is what `-i` has always meant — "browse them, and fail if there is no
+terminal" — and the behaviour is right. The defect was a comment describing a
+guard the code does not have, on the one subject the milestone called absolute.
+The comment now quotes the expression; the `--list --interactive` row of the
+matrix above is the measurement; and this paragraph is the record, so a reader
+of `MILESTONES.md` cannot conclude that no run carrying `--list` defers stage 5.
+One does.
+
+### Non-binding notes 1, 2 and 3
+
+All three taken. Note 1: LOG.md says plainly that the end-to-end
+deletion-honesty proof lives in the pty battery, so a green `cargo test` is not
+read as covering it. Note 2: `Watch::fresh`'s `taken` cursor was permanently
+zero and the `.min()` guarding it was dead, while the comment described slots
+that stay behind — dropped rather than implemented, as the reviewer preferred.
+Note 3: `live.rs` claimed `cancel` and `taken_ask` were polled per file; both
+are polled at the four stage boundaries and in the serving loop and nowhere
+else. The module note now says where, and carries the reviewer's
+0.21s-on-3-GiB measurement so the next reader can judge the promptness for
+themselves.
+
+Note 4 (a fast live scan commits nothing before `close`) and note 5
+(time-to-first-group left unscored) were recorded as needing no action, and got
+none.
+
+### The fence, re-proved rather than assumed
+
+Item 3 edits `live_wanted`, so the freeze proof was re-captured from a fresh
+`git archive` build of the base rather than carried over. Captured to
+`evidence/m8-freeze.txt`, quoted from the file:
+
+```text
+84 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+```
+
+The gate, re-run, captured to `evidence/m8-gate.txt`:
+
+```text
+33 check(s), 0 failed
+gate all: green
+```
+
+```text
+gate green, mount table unchanged, no image left attached
+```
+
+Every other evidence file was re-captured against this tip too, so nothing in
+this section quotes a number taken with the `be65b8a` binary. The five pty
+cases, the five death scenarios, the three cache kills and the `--force`
+counters all reproduce unchanged; the flash-parity counters are identical
+digit for digit to both the first claim's and the reviewer's, while its wall
+clock was measured at load average 16.6 and is claimed as nothing at all.
+
+### Standards
+
+Captured to `evidence/m8-standards.txt`, quoted from the file:
+
+```text
+=== this branch ===
+$ cargo test
+
+test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+```
+
+226 on the base, 258 here: thirty-two new tests over the milestone, eight of
+them from this round. `clippy --all-targets -- -D warnings` exits 0;
+`cargo fmt --check` is clean; the release binary is proved current by
+`touch && rebuild && compare` within one build directory, which is the method
+the reviewer independently confirmed is the right one.
+
+`claim_audit.py M8` and `--all` both report 0 untraced.
+
+### Fence conditions this fix round was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m8`, branch `m8-live`, base
+`main@a362ffa` unchanged. The reviewer's worktree
+`/Users/dogaozden/AI_Projects/dedup-m8-review` was never entered, read from or
+written to; the review itself was read with `git show m8-review:rust/REVIEW-M8.md`
+from this worktree. No merges, no pushes, no other branch touched, no harness
+file edited, no `sudo`.
+
+Both mutant scripts edit `rust/src`, and both restore it and rebuild before
+they finish; each proves its own restore by comparing the release binary's hash
+with the one it started from, and both reported identical. `m8_capture.sh` runs
+them first and rebuilds after them, before anything else touches the binary.
+The tree was committed clean afterwards.
+
+`/Volumes` was `\]` and `dedupbench` before and after every run, and the gate
+script diffs its own listings rather than narrating them. The only `/Volumes`
+path anything here touched is the ephemeral image the `m4-trashes` check
+attaches at `/Volumes/dedupconf` and detaches itself; `hdiutil info | grep -c
+dedupconf` reported `0` afterwards. `dedupbench` was never read, written or
+mounted, and nothing went near the Passport.
+
+Every corpus was generated under `/tmp` or under this worktree's `target/`, and
+every `--auto` and every browser deletion went to a scratch `HOME`'s Trash
+rather than the real one. Free disk on `/` at the end: 14 GiB. The machine was
+shared with other agents throughout and the load average reached 16.6 during
+the flash-parity run, which is why the only figures claimed as facts here are
+counters, exit codes and hashes.

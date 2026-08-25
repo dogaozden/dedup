@@ -1,0 +1,21 @@
+$ python3 rust/evidence/scripts/m8_deletion_mutants.py
+
+the stale-mark fix reverted              caught
+                                           by tui::model::tests::a_mark_does_not_survive_a_group_being_rebuilt_smaller
+                                           by tui::model::tests::a_mark_out_of_range_is_dropped_rather_than_panicked_on
+                                           by tui::model::tests::a_rebuild_clears_marks_on_groups_it_did_not_touch_either
+                                           index out of bounds: the len is 2 but the index is 3
+the proof always PASSES  (whole = true)  caught
+                                           by pipeline::tests::the_proof_refuses_a_group_whose_middles_differ_however_its_ends_look
+the proof always FAILS   (whole = false) caught
+                                           by pipeline::tests::the_proof_accepts_a_group_that_really_is_identical
+
+$ cargo test   (source restored)
+   test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s
+$ shasum -a 256 target/release/dedup-rs   (the stale-mutant rule)
+   before: c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1
+   after:  c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1
+
+pass  every guard on the deletion path fails cargo test when it is taken away
+
+   exit 0

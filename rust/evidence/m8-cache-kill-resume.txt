@@ -10,7 +10,7 @@ pass  killed by SIGTERM
         resumed_opens          60
         opens_saved            24000
         groups_identical       True
-        cold_seconds           0.52
+        cold_seconds           0.75
 
 pass  killed by SIGINT (what Ctrl+C sends)
         rows_left_by_the_kill  12000
@@ -22,7 +22,7 @@ pass  killed by SIGINT (what Ctrl+C sends)
         resumed_opens          60
         opens_saved            24000
         groups_identical       True
-        cold_seconds           0.5
+        cold_seconds           0.79
 
 pass  killed by SIGKILL (unhandleable)
         rows_left_by_the_kill  12000
@@ -34,7 +34,7 @@ pass  killed by SIGKILL (unhandleable)
         resumed_opens          60
         opens_saved            24000
         groups_identical       True
-        cold_seconds           0.46
+        cold_seconds           0.8
 
 3 case(s), 0 failed
 

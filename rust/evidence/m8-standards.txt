@@ -1,43 +1,32 @@
 === main@a362ffa, for the before-count and the clippy verdict that predates this branch ===
 $ cargo test
 
-test result: ok. 226 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+test result: ok. 226 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
 
 
 $ cargo clippy --all-targets -- -D warnings
-    Checking ratatui-core v0.1.2
-    Checking serde v1.0.229
-    Checking serde_json v1.0.151
-    Checking ratatui-crossterm v0.1.2
-    Checking ratatui-widgets v0.3.2
-    Checking ratatui v0.30.2
-    Checking ahash v0.8.12
-    Checking hashbrown v0.14.5
-    Checking hashlink v0.9.1
-    Checking rusqlite v0.32.1
-    Checking dedup-rs v0.1.0 (/private/tmp/m8-mainco/rust)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.65s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
    exit 0
 
 === this branch ===
 $ cargo test
 
-test result: ok. 250 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
 
 
 $ cargo clippy --all-targets -- -D warnings
     Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m8/rust)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.10s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.05s
    exit 0
 
 $ cargo fmt --check
 (no output: clean)
 
 === the binary the evidence was measured with is the committed source ===
-    Finished `release` profile [optimized] target(s) in 0.10s
+    Finished `release` profile [optimized] target(s) in 0.16s
 $ shasum -a 256 target/release/dedup-rs
-ffb7be284856197dafd2a644480876a67293e080eba160dbecb4d90db72d256e  target/release/dedup-rs
+c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1  target/release/dedup-rs
 $ touch src/compare.rs src/consts.rs && cargo build --release
-    Finished `release` profile [optimized] target(s) in 13.01s
+    Finished `release` profile [optimized] target(s) in 32.79s
 $ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
-ffb7be284856197dafd2a644480876a67293e080eba160dbecb4d90db72d256e  target/release/dedup-rs
+c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1  target/release/dedup-rs

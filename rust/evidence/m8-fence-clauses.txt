@@ -1,0 +1,24 @@
+$ python3 rust/evidence/scripts/m8_fence_clauses.py
+
+live_flags loses the --report-json clause      caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+live_flags loses the --stage clause            caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+live_flags loses browsing_flags entirely       caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+browsing_flags stops excluding --auto          caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+                                                 by tests::the_menu_opens_for_exactly_the_runs_the_browser_opens_for
+browsing_flags stops excluding --list          caught
+                                                 by tests::the_fence_decides_the_live_path_by_flags_alone
+                                                 by tests::the_menu_opens_for_exactly_the_runs_the_browser_opens_for
+
+$ cargo test   (source restored)
+   test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+$ shasum -a 256 target/release/dedup-rs   (the stale-mutant rule)
+   before: c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1
+   after:  c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1
+
+pass  every clause of live_flags is guarded by a test that fails when it goes
+
+   exit 0
