@@ -75,11 +75,25 @@ fn menu_wanted(options: &Options) -> bool {
     tui::has_terminal() && browsing_flags(options)
 }
 
-/// Whether this run opens the browser before the scan rather than after it.
+/// Whether the FLAGS on this run ask for the live path, leaving aside whether
+/// there is a terminal to browse in.
 ///
-/// M8-LIVE.md's absolute fence decides most of this. `--list` and `--auto` are
-/// already excluded by `browsing_flags`; the other two exclusions are here:
+/// Split out of `live_wanted` so it can be decided without a terminal, and so
+/// tested. REVIEW-M8 item 3: every case in the freeze proof is a run with no
+/// terminal, so `has_terminal()` is already false and the clauses behind it are
+/// never evaluated — deleting two of them left `cargo test` at 250 passed and
+/// the freeze proof blind. The milestone whose whole premise is one absolute
+/// fence should not have half of that fence guarded by nothing.
 ///
+/// The four exclusions, and what each is for:
+///
+/// * `--auto` is excluded by `browsing_flags`: a run that deletes without
+///   asking has nobody to browse for.
+/// * `--list` is excluded by `browsing_flags` ONLY when `--interactive` is
+///   absent — the expression is `auto.is_none() && (interactive || !list)`.
+///   `--list --interactive` on a terminal is an interactive run and takes the
+///   live path, which is what `-i` has always meant and what `main` already
+///   did with it. See the note in the M8 claim.
 /// * An explicit `--report-json` keeps today's pipeline whatever else is true
 ///   of the run. That is the fence read literally, and it has a second effect
 ///   worth having: the conformance harness passes `--report-json` on every
@@ -87,11 +101,13 @@ fn menu_wanted(options: &Options) -> bool {
 ///   run on a terminal.
 /// * `--stage size` has read nothing, so it has nothing to stream, nothing to
 ///   prove and nothing anybody may delete.
+fn live_flags(options: &Options) -> bool {
+    browsing_flags(options) && options.report_json.is_none() && options.stage.is_empty()
+}
+
+/// Whether this run opens the browser before the scan rather than after it.
 fn live_wanted(options: &Options) -> bool {
-    tui::has_terminal()
-        && browsing_flags(options)
-        && options.report_json.is_none()
-        && options.stage.is_empty()
+    tui::has_terminal() && live_flags(options)
 }
 
 fn print_report(groups: &[Vec<&str>]) {
@@ -446,6 +462,97 @@ mod tests {
     fn the_default_report_path_is_a_file_not_a_directory() {
         assert!(default_report_path().file_name().is_some());
         assert!(default_report_path().starts_with(Path::new(&std::env::temp_dir())));
+    }
+
+    /// Options as a command line would build them, so a case here is a case
+    /// somebody could type.
+    fn flags(argv: &[&str]) -> Options {
+        let mut given: Vec<String> = vec!["/scratch".to_string()];
+        given.extend(argv.iter().map(|word| word.to_string()));
+        match parse_arguments_from(given.into_iter()).expect("a valid command line") {
+            Parsed::Scan(options) => *options,
+            Parsed::Help => panic!("the fixture asked for help"),
+        }
+    }
+
+    #[test]
+    fn the_fence_decides_the_live_path_by_flags_alone() {
+        // REVIEW-M8 item 3. This is the milestone's one absolute fence, and
+        // until this test existed two of its four clauses were guarded by
+        // nothing at any level: the freeze proof is 84 non-interactive cases,
+        // so `has_terminal()` short-circuits before the flags are ever looked
+        // at, and deleting `report_json.is_none()` and `stage.is_empty()` left
+        // the whole suite green.
+        //
+        // Every clause is pinned by at least one case that flips when it goes.
+        let cases: [(&[&str], bool, &str); 9] = [
+            (&[], true, "a bare interactive run is the live path"),
+            (
+                &["--report-json", "/tmp/r.json"],
+                false,
+                "an explicit --report-json keeps today's pipeline — this is \
+                 the clause every conformance invocation relies on",
+            ),
+            (
+                &["--stage", "size"],
+                false,
+                "--stage size has read nothing, so there is nothing to stream \
+                 and nothing anybody may delete",
+            ),
+            (
+                &["--auto", "shortest"],
+                false,
+                "--auto has nobody to browse for",
+            ),
+            (&["--list"], false, "--list prints and stops"),
+            (
+                &["--list", "--interactive"],
+                true,
+                "-i means browse them, and it has always overruled --list; \
+                 this row is the behaviour REVIEW-M8 item 4 records",
+            ),
+            (&["--interactive"], true, "-i on its own is the live path"),
+            (
+                &["--auto", "shortest", "--interactive"],
+                false,
+                "--auto wins over -i: there is nothing to browse afterwards",
+            ),
+            (
+                &["--quiet", "--hard"],
+                true,
+                "flags that say nothing about browsing do not change the path",
+            ),
+        ];
+        for (argv, wanted, why) in cases {
+            assert_eq!(
+                live_flags(&flags(argv)),
+                wanted,
+                "dedup-rs /scratch {}: {why}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_path_is_the_flags_and_a_terminal_and_nothing_else() {
+        // `live_wanted` may add the terminal to `live_flags` and may not add
+        // anything else — otherwise the test above would be pinning a
+        // different function from the one that decides.
+        for argv in [
+            &[][..],
+            &["--list"],
+            &["--list", "--interactive"],
+            &["--report-json", "/tmp/r.json"],
+            &["--stage", "size"],
+            &["--auto", "shortest"],
+        ] {
+            let options = flags(argv);
+            assert_eq!(
+                live_wanted(&options),
+                tui::has_terminal() && live_flags(&options),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

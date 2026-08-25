@@ -16,9 +16,22 @@
 //!
 //! The `Mutex` covers the whole non-atomic body: the group list, the request
 //! slot, the answer slot and the finished flag. `cancel` is an `AtomicBool`
-//! because the scan reads it in its innermost per-file loop, where taking a
-//! lock per file would be a cost on a path this milestone is not allowed to
-//! slow down.
+//! because it is read on the scan thread and set on the browser thread and
+//! needs nothing more than that.
+//!
+//! **Where the scan looks.** Both `cancelled` and `taken_ask` are polled at
+//! the four stage boundaries of `pipeline`'s `'stages:` block — immediately
+//! after `cache.settle()` — and nowhere else, plus the serving loop that runs
+//! once the stages are done. Not per file, and not inside a hash stage or a
+//! comparison sweep: a request answered mid-stage would be answered while a
+//! stage was rewriting the records the deletion walks, which is the race the
+//! apply-pauses-scan call exists to avoid.
+//!
+//! So a cancellation takes effect at the next stage boundary rather than
+//! immediately. REVIEW-M8 non-binding note 3 measured what that costs on a
+//! 3 GiB corpus: `q` mid-scan took 0.21s against 0.05s after the scan. The
+//! comments here used to claim a per-file poll, which would have promised a
+//! promptness the code does not have on a tree far larger than that.
 //!
 //! # Why the disk work is all on one side
 //!
@@ -83,10 +96,6 @@ struct Body {
     cancelled: bool,
     asked: Option<Ask>,
     answer: Option<Answer>,
-    /// How many groups the browser has already taken. A cursor into `groups`,
-    /// not a count of what is left: the published list is kept whole so that a
-    /// `republish` can rebuild it from nothing.
-    taken: usize,
     /// Set by `republish`, taken by `fresh`. An explicit flag rather than
     /// something inferred from the lengths, because "the list got shorter" and
     /// "the list was rebuilt" are different events and only one of them means
@@ -277,9 +286,9 @@ impl Live {
 
     /// Whether the browser has asked the scan to stop.
     ///
-    /// Read in the per-file loop of every reading stage, so it is a relaxed
-    /// atomic load and nothing more. `Acquire` rather than `Relaxed` because
-    /// the scan must see everything the browser wrote before it set the flag.
+    /// Read at the four stage boundaries and in the serving loop — see the
+    /// module note. `Acquire` rather than `Relaxed` because the scan must see
+    /// everything the browser wrote before it set the flag.
     #[inline]
     pub fn cancelled(&self) -> bool {
         self.shared.cancel.load(Ordering::Acquire)
@@ -287,12 +296,14 @@ impl Live {
 
     /// Take whatever the browser has asked for, if anything.
     ///
-    /// Called at the scan's safe points — between files in a reading stage and
-    /// between stages — never inside a comparison sweep, so a request can
-    /// never be served with a group's class half-decided.
+    /// Called at the scan's safe points, which are the four STAGE boundaries
+    /// and the serving loop — never between files, and never inside a hash
+    /// stage or a comparison sweep, so a request can never be served with a
+    /// group's class half-decided or with a stage part-way through rewriting
+    /// the records a deletion would walk.
     pub fn taken_ask(&self) -> Option<Ask> {
-        // The fast path is a lock and a `None`, taken once per file. It is
-        // only ever reached on the interactive path.
+        // The fast path is a lock and a `None`, taken a handful of times per
+        // scan. It is only ever reached on the interactive path.
         let mut body = body(&self.shared);
         body.asked.take()
     }
@@ -314,7 +325,6 @@ impl Live {
     pub fn republish(&self, groups: Vec<Group>) {
         let mut body = body(&self.shared);
         body.groups = groups;
-        body.taken = 0;
         body.replaced = true;
         drop(body);
         self.shared.stirred.notify_all();
@@ -378,23 +388,25 @@ impl Watch {
     /// Everything published since the last call. Never blocks.
     ///
     /// Groups are moved out rather than cloned — a group carries a string per
-    /// member and REWRITE.md §6 counts per-file costs — so the published list
-    /// holds `None` where the browser has already taken one. `taken` is the
-    /// cursor; the slots stay, which is what keeps every index stable.
+    /// member and REWRITE.md §6 counts per-file costs — so `body.groups` is
+    /// emptied on every look and refills from the next `found`. There is no
+    /// cursor and no need for one: nothing indexes this list, and `republish`
+    /// rebuilds what the browser draws from `Live::runs` rather than from
+    /// anything kept here.
+    ///
+    /// REVIEW-M8 non-binding note 2: this used to carry a `taken` cursor and a
+    /// comment describing slots that stay behind. Neither was real — `groups`
+    /// is a plain `Vec<Group>`, `drain` empties it, so `taken` was permanently
+    /// zero and the `.min()` guarding it was dead. The behaviour was right and
+    /// the description was not, which is the worse of the two ways to be
+    /// wrong; the cursor is gone rather than implemented.
     pub fn fresh(&self) -> Fresh {
         let mut body = body(&self.0);
-        let replaced = std::mem::take(&mut body.replaced);
-        // The invariant, which `republish` is the only thing that breaks and
-        // the only thing that repairs: after a look, the cursor sits at the
-        // end of the list, so the next `found` lands beyond it.
-        let from = body.taken.min(body.groups.len());
-        let groups: Vec<Group> = body.groups.drain(from..).collect();
-        body.taken = body.groups.len();
         Fresh {
-            groups,
+            groups: std::mem::take(&mut body.groups),
             finished: body.finished,
             cancelled: body.cancelled,
-            replaced,
+            replaced: std::mem::take(&mut body.replaced),
         }
     }
 
