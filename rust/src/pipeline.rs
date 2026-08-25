@@ -862,6 +862,205 @@ mod tests {
     use crate::consts::TAIL_BYTES;
     use crate::device::UNKNOWN_MEDIUM;
 
+    // ------------------------------------------------- the apply-time proof
+    //
+    // REVIEW-M8 item 2: `prove_marked`'s `whole` is the single line that
+    // decides whether a candidate group may be deleted from, and inverting it
+    // in either direction left all 250 tests green — only the pty battery
+    // noticed. These two are the terminal-free guard, because `cargo test` is
+    // the suite anybody editing this file runs first.
+    //
+    // `prove_marked` takes plain records and plain runs, so this needs a
+    // scratch directory and no terminal at all.
+
+    /// A scratch tree that outlives the test and takes itself away after.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let root = std::env::temp_dir().join(format!(
+                "m8-proof-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("a scratch directory");
+            Scratch(root)
+        }
+
+        fn write(&self, name: &str, body: &[u8]) {
+            std::fs::write(self.0.join(name), body).expect("a scratch file");
+        }
+    }
+
+    /// The records of a scratch tree, without running a scan over it.
+    fn records_of(root: &std::path::Path) -> Vec<FileRec> {
+        let (mut files_seen, mut bytes_seen) = (0, 0);
+        let mut unreadable = Vec::new();
+        let entries = walk(
+            root,
+            Filters {
+                min_size: 1,
+                include_ext: None,
+                skip_ext: &[],
+                excludes: &[],
+            },
+            &mut files_seen,
+            &mut bytes_seen,
+            &mut unreadable,
+            &Pulse::off(),
+        );
+        candidates(root, entries)
+    }
+
+    fn index_of(records: &[FileRec], name: &str) -> usize {
+        records
+            .iter()
+            .position(|record| record.path() == name)
+            .unwrap_or_else(|| panic!("no record named {name}"))
+    }
+
+    /// "Same ends, different middles" — the fixture the claim describes.
+    ///
+    /// Every cheap stage says these three are one group: identical head,
+    /// identical tail, identical deep head. Only reading the middle knows
+    /// better, which is exactly the case the apply-time proof exists for.
+    fn liars(scratch: &Scratch) -> Vec<FileRec> {
+        let head = vec![0xAB_u8; DEEP_HEAD * 2];
+        let tail = vec![0xCD_u8; TAIL_BYTES];
+        for n in 0..3_u8 {
+            let mut body = head.clone();
+            body.extend(std::iter::repeat_n(n, DEEP_HEAD * 2));
+            body.extend_from_slice(&tail);
+            scratch.write(&format!("liar-{n}.bin"), &body);
+        }
+        // ...and a pair that really is identical, at a different length so it
+        // is a group of its own.
+        let same = vec![0x11_u8; DEEP_HEAD * 3];
+        scratch.write("twin-a.bin", &same);
+        scratch.write("twin-b.bin", &same);
+        records_of(&scratch.0)
+    }
+
+    fn proving<'a>(root: &'a std::path::Path, effort: &'a Effort) -> Compare<'a> {
+        Compare {
+            root,
+            effort,
+            profile: Profile::Flash,
+            solid: true,
+            learn: false,
+        }
+    }
+
+    #[test]
+    fn the_proof_refuses_a_group_whose_middles_differ_however_its_ends_look() {
+        // Forcing `whole` true fails here: this group is a group to every
+        // stage that does not read the middle, and deleting from it would
+        // destroy two files that are not copies of anything.
+        let scratch = Scratch::new("refuses");
+        let records = liars(&scratch);
+        let members: Vec<usize> = (0..3)
+            .map(|n| index_of(&records, &format!("liar-{n}.bin")))
+            .collect();
+        let effort = Effort::default();
+        let context = proving(&scratch.0, &effort);
+        let mut unreadable = Vec::new();
+
+        let verdicts = prove_marked(
+            &context,
+            &records,
+            &[(members.clone(), false)],
+            &[0],
+            &mut unreadable,
+        );
+        assert_eq!(verdicts.len(), 1);
+        assert!(
+            !verdicts[0].whole,
+            "the proof passed a group whose bytes disagree — nothing else in \
+             cargo test would have caught this"
+        );
+        // ...and it says what the bytes really are, which is what the browser
+        // redraws the group as.
+        assert!(
+            verdicts[0].classes.iter().all(|class| class.len() < 3),
+            "a class held all three files that differ: {:?}",
+            verdicts[0].classes
+        );
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+        // The proof read the bytes rather than believing the ends.
+        assert!(effort.bytes_read() > 0, "the proof read nothing at all");
+    }
+
+    #[test]
+    fn the_proof_accepts_a_group_that_really_is_identical() {
+        // Forcing `whole` false fails here: a real duplicate group would be
+        // refused for ever and the browser could never delete anything.
+        let scratch = Scratch::new("accepts");
+        let records = liars(&scratch);
+        let members = vec![
+            index_of(&records, "twin-a.bin"),
+            index_of(&records, "twin-b.bin"),
+        ];
+        let effort = Effort::default();
+        let context = proving(&scratch.0, &effort);
+        let mut unreadable = Vec::new();
+
+        let verdicts = prove_marked(
+            &context,
+            &records,
+            &[(members.clone(), false)],
+            &[0],
+            &mut unreadable,
+        );
+        assert_eq!(verdicts.len(), 1);
+        assert!(
+            verdicts[0].whole,
+            "the proof refused a group that really is identical"
+        );
+        assert_eq!(
+            verdicts[0].classes,
+            vec![members],
+            "a whole group came back as something other than itself"
+        );
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+    }
+
+    #[test]
+    fn a_group_already_proven_is_not_read_a_second_time() {
+        // The `proven` short-circuit in `prove_marked`: the small-file stage
+        // held every byte of these in memory and compared them, so reading
+        // them again would be honest and pointless.
+        let scratch = Scratch::new("already");
+        let records = liars(&scratch);
+        let members: Vec<usize> = (0..3)
+            .map(|n| index_of(&records, &format!("liar-{n}.bin")))
+            .collect();
+        let effort = Effort::default();
+        let context = proving(&scratch.0, &effort);
+        let mut unreadable = Vec::new();
+
+        let verdicts = prove_marked(
+            &context,
+            &records,
+            &[(members.clone(), true)],
+            &[0],
+            &mut unreadable,
+        );
+        assert!(verdicts[0].whole, "a group already proven was doubted");
+        assert_eq!(verdicts[0].classes, vec![members]);
+        assert_eq!(
+            effort.bytes_read(),
+            0,
+            "a group already proven was read again"
+        );
+    }
+
     /// A scratch tree of two identical files, big enough to reach stage 3.
     struct Tree(std::path::PathBuf);
 
