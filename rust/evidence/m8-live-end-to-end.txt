@@ -1,0 +1,11 @@
+$ python3 rust/evidence/scripts/m8_live_end_to_end.py rust/target/release/dedup-rs /tmp/m8-e2e
+
+pass  the browser opens before the scan ends  (1.1s)
+pass  groups stream in and say they are candidates  (1.1s)
+pass  mark-and-apply during a running scan  (2.1s)
+pass  quitting mid-scan restores the terminal  (3.0s)
+pass  a failed proof deletes nothing  (1.5s)
+
+5 case(s), 0 failed
+
+   exit 0

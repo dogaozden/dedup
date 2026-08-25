@@ -2506,3 +2506,129 @@ re-synced the claim, which is REVIEW-M5_2's note 1 happening to me while I was
 writing about REVIEW-M5_2's note 1. It reports four unbacked blocks in older
 claims, which are other milestones' and left alone. `m7_gate.sh` now diffs its
 two `/Volumes` listings instead of narrating them.
+
+## 2026-08-24 — M8, the live scan
+
+Four things at once, and the risk in all of them is the same: this program
+deletes files, and everything M8 adds sits between the user and that.
+
+### The design fork the spec left open, and why apply pauses the scan
+
+M8-LIVE.md: "The apply flow may run while the walk/stages continue or pause
+them — builder's design call, stated in LOG.md with one reason."
+
+**It pauses.** The reason: the records the proof reads and the deletion walks
+are the scan's own, and a stage mutates them — `release` drops retained bytes,
+a split rewrites bucket membership. Letting a deletion walk that while a stage
+rewrites it is a data race the type system would have to be talked out of, and
+the only thing gained would be a second reader on a platter M7 spent a whole
+milestone giving one queue. The user is answering a confirmation dialog they
+just typed `y` into; there is nothing on screen a paused scan makes worse.
+
+So requests are served at STAGE BOUNDARIES, where nothing is half-decided: no
+group's class is part-way through being settled, and no pivot cursor can be
+perturbed by a pause. Between boundaries the scan checks one atomic for
+cancellation and nothing else.
+
+### The thing that made this small enough to build safely
+
+Stage 5 is deferred on the live path, which the spec asks for — and the
+consequence is that the live browser NEVER RUNS THE PIVOT SWEEP while anybody
+is browsing. Every hazard I was warned about downstream of that (a paused
+sweep's absolute running offset, `abandoned()`'s unsettled classes, the
+group-wide descriptor table compounding against `ulimit`) is a hazard about a
+sweep that is not running. That is not luck; it is the reason the spec's own
+structure works.
+
+The second economy: a streamed group is exactly `attested` — "matched without
+reading the bytes this scan" — which is a flag that already existed, already
+meant precisely that, and was already the flag `run_selected` keys on when it
+sends a group through `verify_attested` before removing anything from it. The
+deferral reuses the guard rather than introducing a second, weaker one.
+
+### `ProvenGroups` did not have to move, and did not
+
+The live path has no `Scan` while the scan is running, and `ProvenGroups` can
+only be minted by `Scan::proven`. The temptation was a constructor. Instead
+the scan thread LENDS its records to a real `Scan` for the length of a request
+and takes them back after — a pointer swap, not a copy — so the token is
+minted exactly the way `--auto` mints one and `run_selected` cannot tell the
+two apart. `proven: true` on that lent scan is honest for the same reason it
+is honest for a scan full of cache attestations: every group it carries has
+either been compared this scan or is flagged `attested`, and an attested group
+is read whole before anything of it is deleted.
+
+### Where the fence is enforced, and why it is there and not in a comment
+
+`live_wanted` refuses the live path to any run carrying `--report-json`. That
+is M8-LIVE.md's fence read literally, and it has a second effect worth more
+than the first: the conformance harness passes `--report-json` on every
+invocation, so no gate can reach the streaming browser even if one were
+somehow run on a terminal. The gate grades the frozen pipeline because it
+cannot do anything else.
+
+### Two flush triggers, because one of each is wrong
+
+The cache commits after `FLUSH_EVERY` seconds OR `FLUSH_ROWS` rows owed. The
+clock alone throws away everything a fast scan learned before its first tick —
+the first draft of the kill/resume evidence showed exactly that, a fifty-file
+corpus finishing in 0.2 seconds with nothing ever committed. The row count
+alone never fires on a small tree that runs for an hour. Together they bound
+what a kill costs by time and by work, and a scenario small enough to be
+scored by RBENCH trips neither and commits once, at the end, as it always did.
+
+### What the tests caught that I had not thought about
+
+Two real defects, both found by driving a real terminal rather than by
+reasoning:
+
+* `Pulse::stage` paints a frame itself at every stage boundary, outside the
+  ticker. "No ticker" was therefore not enough to keep stderr clear in live
+  mode, and the boundary frames were landing on top of the browser's alternate
+  screen — the exact fight M5.2 ended. `paints` now says whether anything may
+  be written at all.
+* A list emptied by a failed proof lost its own explanation: `view::draw`
+  returns early on an empty list, before the flash row. The user marked
+  copies, confirmed, and was told "No duplicates left" with nothing said about
+  the refusal. A deletion tool that goes quiet at the moment it declined to
+  delete something is lying by omission.
+
+### And four tests that were passing while testing nothing
+
+Recorded because the pattern is the point, not the instances:
+
+* The first mark-keying test put its mark on the group at position 0, where a
+  position and an id are the same number. The mis-keying it existed to catch
+  was invisible; a mutant survived it. It marks a group at position 1 now.
+* Three pty cases sent their first key at the first alternate screen they saw
+  — which is the pre-flight MENU. One of them reported that quitting mid-scan
+  restored the terminal, for a scan that had never started.
+* The death tests asked "is the scan still running" of the whole transcript,
+  which holds every frame since the browser opened. Once a stage label had
+  appeared once the answer was yes for ever, including for scenarios whose
+  scan had finished a second earlier. They ask a recent window now, and a
+  six-file corpus makes all five fail, which is what makes the passing run
+  mean anything.
+* The kill/resume script killed at half the cold wall time; the cold wall time
+  was 0.2 seconds, and every case silently reported the scan had already
+  finished. It kills on evidence of a commit now.
+
+**The rule, again:** a test that cannot fail is not evidence. Every guard in
+this milestone was mutated before it was believed.
+
+### Defects found and not fixed
+
+* SIGHUP and SIGTERM kill without unwinding, so neither the drop guard nor the
+  panic hook runs and the terminal is left raw. `m5_2_signals.py` already
+  records this as "browser/signal ... TERMINAL WRECKED ... M5's, reported not
+  fixed". `m8_live_death.py` prints it per scenario and does not grade it.
+* The menu's rows are a hand-kept list and nothing generated them, so a flag
+  added to `FLAGS` could reach `--help` and never reach the form. That one I
+  did close, because the spec asks for `--force` in the menu and a demand
+  without a guard is a demand that expires: `MENU_EXPOSURE` names every flag
+  and says whether the form should offer it.
+* A long stage 5 cannot flush mid-way — the learned digests are handed back
+  after `compare_stage` returns, so a scan killed deep inside one comparison
+  loses that comparison. The narrowing stages and the small-file stage all
+  commit as they go. Not fixed: it needs the cache threaded into the compare
+  pool, which is a change to the code M7 just finished measuring.

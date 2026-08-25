@@ -792,6 +792,47 @@ mod tests {
     }
 
     #[test]
+    fn the_live_screen_shows_progress_and_a_partial_list_at_once() {
+        // The screen M8 exists to produce: a scan still running, some of what
+        // it has found already on the list, and the group under the cursor
+        // saying honestly that nothing has compared its bytes.
+        let mut browser = browser();
+        browser.scanning = true;
+        browser.groups[0].proven = false;
+        browser.progress = Some(crate::tui::model::Progress {
+            label: "Sampling",
+            done: 640,
+            total: 1000,
+            bytes: 32 * 1024 * 1024,
+            rate: 8 * 1024 * 1024,
+        });
+        let screen = render(&browser, 80, 16);
+        let body = screen.join("\n");
+
+        // The list is there...
+        assert!(body.contains("2 groups"), "{body}");
+        assert!(body.contains("photos/beach.jpg"), "{body}");
+        // ...the scan is there, on its own row, with real numbers...
+        assert!(body.contains("Sampling…"), "{body}");
+        assert!(body.contains("64%  640/1,000 · 8.0 MiB/s"), "{body}");
+        // ...and the group under the cursor is not pretending to be proven.
+        assert!(body.contains("candidate"), "{body}");
+
+        // The progress row is the one below the summary, and it does not
+        // displace anything: the members are still where they were.
+        assert!(screen[3].contains("Sampling…"), "{:?}", screen[3]);
+        assert!(screen[2].contains("groups"), "{:?}", screen[2]);
+        assert!(screen[6].contains("photos/beach.jpg"), "{:?}", screen[6]);
+
+        // Once the scan stops, the row goes and the list stays.
+        browser.scanning = false;
+        browser.progress = None;
+        let after = render(&browser, 80, 16);
+        assert!(!after.join("\n").contains("Sampling…"), "{after:?}");
+        assert!(after[6].contains("photos/beach.jpg"), "{:?}", after[6]);
+    }
+
+    #[test]
     fn an_emptied_list_still_says_why_it_emptied() {
         // The case that matters is a candidate whose proof failed at apply
         // time: the group leaves the list, and if the screen loses the

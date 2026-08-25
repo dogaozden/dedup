@@ -1,0 +1,41 @@
+$ python3 rust/evidence/scripts/m8_cache_kill_resume.py rust/target/release/dedup-rs /tmp/m8-cache
+
+pass  killed by SIGTERM
+        rows_left_by_the_kill  12000
+        cold_bytes_read        884736000
+        resumed_bytes_read     786432000
+        bytes_saved            98304000
+        percent_saved          11.1
+        cold_opens             24060
+        resumed_opens          60
+        opens_saved            24000
+        groups_identical       True
+        cold_seconds           0.52
+
+pass  killed by SIGINT (what Ctrl+C sends)
+        rows_left_by_the_kill  12000
+        cold_bytes_read        884736000
+        resumed_bytes_read     786432000
+        bytes_saved            98304000
+        percent_saved          11.1
+        cold_opens             24060
+        resumed_opens          60
+        opens_saved            24000
+        groups_identical       True
+        cold_seconds           0.5
+
+pass  killed by SIGKILL (unhandleable)
+        rows_left_by_the_kill  12000
+        cold_bytes_read        884736000
+        resumed_bytes_read     786432000
+        bytes_saved            98304000
+        percent_saved          11.1
+        cold_opens             24060
+        resumed_opens          60
+        opens_saved            24000
+        groups_identical       True
+        cold_seconds           0.46
+
+3 case(s), 0 failed
+
+   exit 0

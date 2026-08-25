@@ -3334,3 +3334,391 @@ under `rust/target/m7/` with a target directory of its own and removed after
 use; no variant binary was produced in the checkout, and the tip binary's hash
 is unchanged either side of the round. No `conformance/`, `rbench/`, `bench/`
 or `xbench/` file was modified, no other branch was touched, no `sudo`.
+
+## M8 — the live scan — CLAIMED
+
+Branch `m8-live`, off `main@a362ffa`. Binding spec `M8-LIVE.md`; the maintainer
+review is BLOCKING (`rust/REVIEW-M8.md`).
+
+**The absolute fence is the item to attack first, so it is proved first and
+proved hardest.** M8-LIVE.md's one absolute fence is that `--list`, `--auto`,
+`--report-json`, piped runs and every conformance/bench invocation keep today's
+pipeline and today's bytes, byte for byte. That is enforced in code rather than
+promised in a comment: `live_wanted` in `main.rs` refuses the live path to any
+run carrying `--report-json`, and the conformance harness passes one on every
+invocation — so no gate can reach the streaming browser even if one were
+somehow run on a terminal.
+
+**Stage 5 is deferred on the live path, and that is what made this milestone
+small enough to build safely.** The live browser never runs the pivot sweep
+while anybody is browsing, so every hazard downstream of a paused sweep — its
+absolute running offset, `abandoned()`'s unsettled classes, the group-wide
+descriptor table compounding against `ulimit` — is a hazard about a sweep that
+is not running.
+
+**`ProvenGroups` did not move.** The live path has no `Scan` while the scan is
+running, and the temptation was a constructor. Instead the scan thread lends
+its records to a real `Scan` for the length of a request and takes them back
+after — a pointer swap, not a copy — so the token is minted exactly the way
+`--auto` mints one and `run_selected` cannot tell the two apart.
+
+**Two real defects were found by driving a terminal, not by reasoning**, and
+both are fixed here: the pulse was painting over the browser's alternate
+screen, and a list emptied by a failed proof lost the explanation of why. Four
+of my own tests were passing while testing nothing; each was mutated until it
+failed for the right reason. All of that is in LOG.md and in
+"Defects found and not fixed" below.
+
+### Why a streamed group is safe to show and unsafe to delete
+
+A group that streams in has survived the head, deep-head and sample stages.
+Nothing has compared its bytes. That is exactly what the existing `attested`
+flag already meant — "matched from remembered digests instead of being read
+this scan" — and it is already the flag `run_selected` keys on when it sends a
+group through `verify_attested` before removing anything from it. The deferral
+reuses that guard rather than introducing a second, weaker one.
+
+At apply, `prove_marked` reads every byte of exactly the marked groups. A group
+that survives whole is deleted from; a group the bytes disown is replaced on
+screen by its real byte-equality classes and **nothing from it is deleted**.
+That is the deletion-safety edge of the whole milestone and it has a test of
+its own whose corpus is built to fail — three files that agree through their
+ends and their entire deep head and differ in the middle, so every cheap stage
+calls them a group and only the comparison knows better.
+
+### The gate
+
+Captured to `evidence/m8-gate.txt`, quoted from the file:
+
+```text
+33 check(s), 0 failed
+gate all: green
+```
+
+```text
+gate green, mount table unchanged, no image left attached
+```
+
+The gate ran with no profile flag anywhere in it, in the `{stage}` form.
+
+### The freeze proof
+
+`evidence/scripts/m8_freeze_gate.sh` builds `main@a362ffa` from a fresh
+`git archive` — not from anything left lying in a worktree — captures every
+non-interactive surface from both binaries over six corpora, and diffs them.
+Eighty-four cases: `--list`, `--auto` into a scratch Trash, piped runs,
+`--quiet`, both profiles, `--no-cache`, `--stage size`, a cold/warm cache pair,
+and a parallel `-j4` twin of the scored shapes. Every case compares stdout,
+stderr, exit code and the whole protocol report including every effort counter.
+
+The corpora include the shapes a streaming design is worst at, not only the
+ones it is good at: a tree whose discovery order is not its reported order, a
+200-member widegroup with a decoy that shares its head, files astride every
+stage boundary, a tree with no duplicates at all, a hardlink cluster, and the
+same-ends shape that only the byte comparison can settle.
+
+Captured to `evidence/m8-freeze.txt`, quoted from the file:
+
+```text
+84 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+```
+
+**The gate is falsifiable and was falsified before it was trusted.** Letting
+the live path's deferred stage 5 leak onto the frozen path makes 56 of the 84
+cases differ, including `wide/decoy.bin` being reported inside a group it does
+not belong to.
+
+It also had to be made deterministic before it could be believed. Capturing the
+same binary twice differed on three cases until two causes were removed: `seeks`
+is counted across concurrent readers and interleaves differently every run, so
+every case is pinned to one reader and the parallel twins are compared on
+everything but `seeks`; and a corpus built and scanned inside one second is
+racily clean by `cache.rs`'s own rule, so every corpus is aged before use. Base
+against base now compares clean.
+
+### RBENCH-shaped flash parity
+
+The real harness keeps its corpora on the `dedupbench` volume, which this run's
+fence forbids it to touch, so this is an RBENCH-shaped rerun on the local SSD
+from `bench/corpus.py` — the same seeded generators, the same shapes. `rescan`
+is included, unlike M7's version of this evidence, because the cache is exactly
+what this milestone changed.
+
+Captured to `evidence/m8-flash-inert.txt`, quoted from the file:
+
+```text
+scenario       files   bytes_read         opens    groups ours/base
+needle         10000     24682520          9635        10   1.025x
+typical         1600      2812459           430        64   1.003x
+samesize         142      3702784           142         4   0.976x
+widegroup         70     14501888            84         8   0.969x
+photos            13     47846337            11         3   1.024x
+bigheader          8     32677888             8         1   0.994x
+prefixtrap        32     16973824            32         4   1.012x
+rescan          1600       351680             2         1   0.974x
+
+geomean over 8 scenarios: 0.997x
+noise floor (base against itself, same corpus, same rounds): 0.978x
+load average at the end: 4.50 3.67 3.38
+```
+
+The counters are the fact: identical, not close, on every scenario. The wall
+clock is not claimed — the geomean sits inside a noise floor measured on this
+same machine at the same time, and the load average says why a floor was
+needed.
+
+### The live browser
+
+The browser opens on an interactive launch before anything has been read. The
+scan runs behind it on its own thread and publishes each group as it stops
+narrowing. The browser draws the scan's progress itself, out of the same
+counters the stderr pulse reads — `Pulse::live` keeps the counters, starts no
+ticker, and writes nothing, so nothing fights the alternate screen.
+
+The list is ordered by what a group would give back, and insertion is stable:
+every ordering key is a property of the group itself, so arrival order cannot
+leak into what the list looks like, and a group inserted above the cursor does
+not move it. **Marks are keyed by the group's stable id rather than by its
+screen position** — that is the load-bearing change, because a scan publishing
+underneath a user shifts every position below an insertion, and a mark that
+followed a position would name a different file rather than an absent one.
+
+Captured to `evidence/m8-live-end-to-end.txt`, quoted from the file:
+
+```text
+pass  the browser opens before the scan ends  (1.1s)
+pass  groups stream in and say they are candidates  (1.1s)
+pass  mark-and-apply during a running scan  (2.1s)
+pass  quitting mid-scan restores the terminal  (3.0s)
+pass  a failed proof deletes nothing  (1.5s)
+
+5 case(s), 0 failed
+```
+
+Every case asserts on what is left on disk, not on a report the program wrote
+about itself: the live path takes no `--report-json`, and a deletion tool
+should be graded on what survived.
+
+### Terminal death with workers behind the browser
+
+M5's death tests asked whether the process leaves when its terminal does. M8
+makes that harder in a way those tests cannot see: the drop guard runs on the
+browser's thread, so the terminal can be restored perfectly while a scan thread
+carries on. A spinning worker cannot hide from the new test —
+`std::thread::scope` will not return until its threads do, so a scan that would
+not stop appears as a process that never leaves.
+
+Captured to `evidence/m8-live-death.txt`, quoted from the file:
+
+```text
+pass  the terminal closes and there is no SIGHUP to warn anyone
+        exit 1      left in 0.04s  scan still running: True
+pass  the terminal closes and SIGHUP arrives
+        exit -1     left in 0.01s  scan still running: True
+pass  Ctrl+C typed at the live browser
+        exit 0      left in 0.03s  scan still running: True
+        terminal afterwards: intact
+pass  SIGHUP while the browser is up and the scan is running
+        exit -1     left in 0.01s  scan still running: True
+        terminal afterwards: LEFT RAW (canonical=False echo=False)   (M5's, reported not fixed)
+pass  SIGTERM while the browser is up and the scan is running
+        exit -15    left in 0.01s  scan still running: True
+        terminal afterwards: LEFT RAW (canonical=False echo=False)   (M5's, reported not fixed)
+
+5 scenario(s), 0 failed
+```
+
+`scan still running: True` on every line is the claim's own precondition, and
+it is checked rather than assumed: it reads only the last few thousand bytes
+the browser drew, because the whole transcript still holds every frame since
+the browser opened. With a six-file corpus all five scenarios fail, which is
+what makes the passing run mean anything.
+
+The inherited `tui-terminal-death.py` still passes unchanged on this binary,
+including the browser leaving 0.05s after its terminal died with 0.00
+CPU-seconds.
+
+### The cache learns from partial scans
+
+Before this, everything a scan learned lived in a `HashMap` until `close` wrote
+it, so a scan killed at ninety per cent left a cache holding nothing. Now each
+volume's database is held open in WAL and what has been learned is committed at
+every stage boundary, after `FLUSH_EVERY` seconds or `FLUSH_ROWS` rows owed,
+whichever comes first. A torn write is impossible by construction rather than
+by care: the rows go down inside one sqlite transaction on a write-ahead log.
+Nothing catches a signal; there is nothing to catch.
+
+Both triggers are load-bearing. The clock alone throws away everything a fast
+scan learned before its first tick; the row count alone never fires on a small
+tree that runs for an hour.
+
+Captured to `evidence/m8-cache-kill-resume.txt`, quoted from the file:
+
+```text
+pass  killed by SIGTERM
+        rows_left_by_the_kill  12000
+        cold_bytes_read        884736000
+        resumed_bytes_read     786432000
+        bytes_saved            98304000
+        percent_saved          11.1
+        cold_opens             24060
+        resumed_opens          60
+        opens_saved            24000
+        groups_identical       True
+```
+
+All three kills the spec names pass — SIGTERM, SIGINT and SIGKILL. SIGKILL is
+the one that matters: nothing can handle it, so it is the only real test of
+"impossible by construction". The script also opens every database the killed
+scan left and runs `PRAGMA integrity_check` on it, because a cache the next run
+cannot open is a failed milestone and should be asked directly rather than
+inferred.
+
+The 11.1% figure is honest and scoped: the killed scan had committed the
+small-file stage's 12,000 rows but not the big pairs' whole-file digests, so
+the resumed run skips 24,000 of 24,060 opens and still re-reads the pairs. The
+opens are where a partial scan pays off most.
+
+### `--force`
+
+New in the FLAGS table, so `--help` inherits it and cannot drift from the
+parser. Captured to `evidence/m8-force.txt`, quoted from the file:
+
+```text
+run                                  bytes_read    opens   groups
+cold (nothing remembered)              67108864       16        8
+warm (the cache answers)                      0        0        8
+--force (believes nothing)             67108864       16        8
+--no-cache (reads and writes nothing)       67108864       16        8
+
+cache after the --force run:    16 rows, 16 with a whole-file digest
+cache after the --no-cache run: 0 rows, 0 with a whole-file digest
+```
+
+The counters alone cannot tell the two flags apart — both read exactly what a
+cold run reads. The difference is only visible in what the database says
+afterwards, so the script opens it and looks.
+
+### The tests are guards, not decoration
+
+Every guard in this milestone was mutated before it was believed, and two of
+them survived their first mutation:
+
+* The mark-keying test put its mark on the group at screen position 0, where a
+  position and an id are the same number, so keying marks by position passed
+  it. It marks a group at position 1 now, and asserts the fixture really put
+  it there. The mutant fails it.
+* Dropping `--force` from the menu's `FIELDS` fails
+  `every_flag_in_the_table_has_been_decided_about_for_the_form`.
+* Letting the deferred stage 5 leak onto the frozen path breaks 56 of the
+  freeze proof's 84 cases.
+* A six-file corpus makes all five death scenarios fail on their own
+  precondition.
+
+### What was not touched, and why
+
+`ProvenGroups`, `run_selected`, `run_auto`, `verify_attested`, the survivor
+guard, the trash placement, and every comparison function are unchanged. The
+live path reaches deletion through exactly the entry points `--auto` does. The
+non-live pipeline is the same straight line it was: the streaming hooks are
+`Option<&Live>` and are `None` there, the labelled block is never broken out
+of, and `cache.settle()` is timed and row-bounded so a scenario small enough to
+be scored commits once, at the end, as it always did.
+
+`compare.rs` was not edited at all. M7 finished measuring it two days ago and
+the live path has no reason to disturb it.
+
+### Standards
+
+Counts re-derived by building the base from a `git archive`, never copied.
+Captured to `evidence/m8-standards.txt`, quoted from the file:
+
+```text
+=== main@a362ffa, for the before-count and the clippy verdict that predates this branch ===
+$ cargo test
+
+test result: ok. 226 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+```
+
+```text
+=== this branch ===
+$ cargo test
+
+test result: ok. 250 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+```
+
+226 before, 250 after: twenty-four new tests, and the 226 all still green.
+clippy `--all-targets -- -D warnings` exits 0 on both sides; `cargo fmt
+--check` is clean.
+
+The binary every measurement above was taken with is the committed source,
+proved rather than assumed:
+
+```text
+$ shasum -a 256 target/release/dedup-rs
+ffb7be284856197dafd2a644480876a67293e080eba160dbecb4d90db72d256e  target/release/dedup-rs
+$ touch src/compare.rs src/consts.rs && cargo build --release
+    Finished `release` profile [optimized] target(s) in 13.01s
+$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
+ffb7be284856197dafd2a644480876a67293e080eba160dbecb4d90db72d256e  target/release/dedup-rs
+```
+
+### Defects found and not fixed
+
+* **A signal wrecks the terminal.** SIGHUP and SIGTERM kill without unwinding,
+  so neither the drop guard nor the panic hook runs. `m5_2_signals.py` already
+  records this as "browser/signal ... TERMINAL WRECKED ... M5's, reported not
+  fixed". `m8_live_death.py` prints it per scenario and does not grade it —
+  failing on it would be claiming a defect it did not find and is not fixing.
+* **A long stage 5 cannot flush mid-way.** The learned digests are handed back
+  after `compare_stage` returns, so a scan killed deep inside one comparison
+  loses that comparison. Every other stage commits as it goes. Fixing it means
+  threading the cache into the compare pool, which is a change to the code M7
+  has just finished measuring, and it is not this milestone's to make.
+* **The menu had no guard against a flag skipping it.** `--help` is generated
+  from `FLAGS` and cannot drift; the form's rows are hand-kept and nothing
+  checked them. This one I did close, because the spec asks for `--force` in
+  the menu and a demand without a guard is a demand that expires.
+
+### Open questions for the maintainer
+
+* The design fork the spec left open is settled in LOG.md: **apply pauses the
+  scan**, served at stage boundaries. The one reason is that the records a
+  deletion walks are the ones a stage rewrites. If interleaving was wanted
+  instead, it needs the records behind a lock and that is a bigger change than
+  this milestone should carry.
+* `live_wanted` excludes an explicit `--report-json`. That is the fence read
+  literally and it makes the gate unreachable from the live path, but it does
+  mean `dedup-rs /tree --report-json out.json` on a terminal browses the old
+  way rather than the new one. I read that as what the fence asks for; say if
+  it is not.
+* Time-to-first-group is the metric this milestone creates and I have not
+  scored it. Nothing here games it: groups are published at the moment a
+  bucket stops narrowing, which is the earliest a candidate honestly exists.
+
+### Fence conditions this run was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m8`, branch `m8-live`, based on
+`main@a362ffa`. No merges, no pushes, no other branch touched, no harness file
+edited, no `sudo`.
+
+`/Volumes` was listed before and after the conformance gate and the two
+listings were **diffed and asserted by the gate script itself**, not narrated:
+
+```text
+$ diff <(ls /Volumes before) <(ls /Volumes after)
+(no output: the mounted volumes are the ones that were there before)
+```
+
+The only `/Volumes` path this run touched is the ephemeral 80 MB APFS image the
+`m4-trashes` check creates at `/Volumes/dedupconf` and detaches itself, which
+is ruled in-fence; `hdiutil info | grep -c dedupconf` reported `0` afterwards.
+`dedupbench` was present throughout and was never read, written or mounted.
+
+Every corpus was generated under `/tmp` or under this worktree's `target/`, and
+every `--auto` and browser deletion in the evidence went to a scratch `HOME`'s
+Trash rather than the real one. Free disk on `/` at the end of the run: 13 GiB.
+The machine was shared with other agents throughout — the load average is
+printed beside every timing, which is why the only figures claimed as facts
+here are counters.
