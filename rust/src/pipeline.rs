@@ -308,8 +308,14 @@ pub fn find_duplicates(
             }
         }
 
-        // A safe point: nothing is half-decided here, so a request can be answered
-        // and a cancellation can be obeyed. Both are no-ops off the live path.
+        // A safe point: nothing is half-decided here, so what has been learned
+        // can be committed, a request can be answered, and a cancellation can
+        // be obeyed. `settle` is timed, so a scan short enough to finish
+        // inside one interval writes nothing extra and the frozen path stays
+        // frozen; the other two are no-ops off the live path.
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.settle();
+        }
         if let Some(live) = live {
             serve(
                 live,
@@ -382,8 +388,14 @@ pub fn find_duplicates(
         // sampler only at files bigger than a span. So it goes to the browser now.
         stream(&records, &pending, &|size| size <= HEAD_BYTES as u64);
 
-        // A safe point: nothing is half-decided here, so a request can be answered
-        // and a cancellation can be obeyed. Both are no-ops off the live path.
+        // A safe point: nothing is half-decided here, so what has been learned
+        // can be committed, a request can be answered, and a cancellation can
+        // be obeyed. `settle` is timed, so a scan short enough to finish
+        // inside one interval writes nothing extra and the frozen path stays
+        // frozen; the other two are no-ops off the live path.
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.settle();
+        }
         if let Some(live) = live {
             serve(
                 live,
@@ -436,8 +448,14 @@ pub fn find_duplicates(
         let sampling = profile != Profile::Spinning;
         stream(&records, &pending, &|size| !sampling || size <= SAMPLE_SPAN);
 
-        // A safe point: nothing is half-decided here, so a request can be answered
-        // and a cancellation can be obeyed. Both are no-ops off the live path.
+        // A safe point: nothing is half-decided here, so what has been learned
+        // can be committed, a request can be answered, and a cancellation can
+        // be obeyed. `settle` is timed, so a scan short enough to finish
+        // inside one interval writes nothing extra and the frozen path stays
+        // frozen; the other two are no-ops off the live path.
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.settle();
+        }
         if let Some(live) = live {
             serve(
                 live,
@@ -489,8 +507,14 @@ pub fn find_duplicates(
         // the browser hears about before stage 5 is deferred out from under it.
         stream(&records, &pending, &|_| true);
 
-        // A safe point: nothing is half-decided here, so a request can be answered
-        // and a cancellation can be obeyed. Both are no-ops off the live path.
+        // A safe point: nothing is half-decided here, so what has been learned
+        // can be committed, a request can be answered, and a cancellation can
+        // be obeyed. `settle` is timed, so a scan short enough to finish
+        // inside one interval writes nothing extra and the frozen path stays
+        // frozen; the other two are no-ops off the live path.
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.settle();
+        }
         if let Some(live) = live {
             serve(
                 live,
