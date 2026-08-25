@@ -297,33 +297,71 @@ fn key_for(mode: Mode, key: KeyEvent) -> Key {
     }
 }
 
-/// Turn the scan into what the screen needs, once, so the loop never touches a
-/// `FileRec` again.
-pub fn build(scan: &Scan, groups: &[DupGroup], root: &Path, hard: bool) -> Browser {
-    let offset = local_offset();
-    let cwd = std::env::current_dir().ok();
-    let groups = groups
-        .iter()
-        .enumerate()
-        .map(|(index, group)| Group {
-            index,
-            size: scan.records[group.members[0]].size,
-            members: group
-                .members
+/// What one group looks like on screen.
+///
+/// Split out of `build` because the live path needs exactly this and nothing
+/// else: the scan thread owns the records, so it is the side that turns a
+/// settled group into rows, and it does so one group at a time as they settle.
+///
+/// `id` is the group's stable identity — its position in the scan's own list
+/// for a finished scan, its arrival number for a live one. `proven` says
+/// whether the bytes behind it have really been compared.
+pub struct Shown {
+    pub offset: i64,
+    pub cwd: Option<std::path::PathBuf>,
+}
+
+impl Shown {
+    pub fn new() -> Shown {
+        Shown {
+            offset: local_offset(),
+            cwd: std::env::current_dir().ok(),
+        }
+    }
+
+    pub fn group(
+        &self,
+        records: &[FileRec],
+        members: &[usize],
+        root: &Path,
+        id: usize,
+        proven: bool,
+    ) -> Group {
+        Group {
+            index: id,
+            size: records[members[0]].size,
+            proven,
+            members: members
                 .iter()
                 .map(|&index| {
-                    let record = &scan.records[index];
+                    let record = &records[index];
                     Member {
                         record: index,
                         name: record.path().to_string(),
-                        path: display_path(root, record, cwd.as_deref()),
-                        date: date_of(record.mtime_ns, offset),
+                        path: display_path(root, record, self.cwd.as_deref()),
+                        date: date_of(record.mtime_ns, self.offset),
                         extra_links: record.names.len() - 1,
                         deletable: record.deletable(),
                         mtime: oracle_mtime(record),
                     }
                 })
                 .collect(),
+        }
+    }
+}
+
+/// Turn the scan into what the screen needs, once, so the loop never touches a
+/// `FileRec` again.
+pub fn build(scan: &Scan, groups: &[DupGroup], root: &Path, hard: bool) -> Browser {
+    let shown = Shown::new();
+    let groups = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            // A finished scan's groups have all been compared — that is what
+            // `Scan::proven` means — except the ones the cache attested,
+            // which `run_selected` re-reads before it removes anything.
+            shown.group(&scan.records, &group.members, root, index, !group.attested)
         })
         .collect();
     Browser::new(groups, root.to_string_lossy().into_owned(), hard)

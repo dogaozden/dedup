@@ -5,7 +5,7 @@
 //! be tested by calling functions instead of by driving a terminal. The paint
 //! layer reads this and never writes to it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::size::human_count;
 use crate::trash::Rule;
@@ -62,9 +62,57 @@ pub struct Group {
     /// Where this group sits in the scan's own list. It never changes, even
     /// once a round of deletion has renumbered what the browser shows, and it
     /// is half of what a mark names.
+    ///
+    /// On the live path it is assigned in the order groups settle, so it is
+    /// also the identity a streaming insertion is anchored to: a group that
+    /// arrives later may be drawn above this one, and neither the cursor nor
+    /// any mark may move because of it.
     pub index: usize,
     pub size: u64,
     pub members: Vec<Member>,
+    /// Whether the bytes behind this group have actually been compared.
+    ///
+    /// False means candidate: the narrowing stages agree, which is a very
+    /// strong hint and not a proof. M8-LIVE.md defers the byte proof to the
+    /// moment of deletion, so a candidate is shown honestly as one and is
+    /// proved — or split, and refused — before anything of it is trashed.
+    pub proven: bool,
+}
+
+impl Group {
+    /// What removing every freeable copy but one would give back.
+    ///
+    /// The live list is ordered by this rather than by size, because it is
+    /// what the user is actually shopping for: a hundred copies of a small
+    /// file is a better find than two copies of a slightly bigger one.
+    pub fn reclaimable(&self) -> u64 {
+        let freeable = self
+            .members
+            .iter()
+            .filter(|member| member.deletable)
+            .count();
+        self.size * freeable.saturating_sub(1) as u64
+    }
+
+    /// The total order the live list is kept in: most reclaimable first, then
+    /// the tie-breaks `pipeline::sort_groups` uses, so a streamed list and a
+    /// finished one agree about what comes first. Every key is a property of
+    /// the group itself — nothing here depends on arrival order, which is what
+    /// makes an insertion stable rather than merely appended.
+    fn order(&self) -> (std::cmp::Reverse<u64>, std::cmp::Reverse<u64>, &str, &str) {
+        let keeper = &self.members[0];
+        (
+            std::cmp::Reverse(self.reclaimable()),
+            std::cmp::Reverse(self.size),
+            basename(&keeper.name),
+            &keeper.name,
+        )
+    }
+}
+
+/// The last path component, for the ordering tie-break.
+fn basename(name: &str) -> &str {
+    name.rsplit_once('/').map_or(name, |(_, base)| base)
 }
 
 /// Which screen is in front. The overlays each read their own keys, so the
@@ -143,16 +191,50 @@ pub struct Browser {
     /// been read. Rather than let the model act on a screen that does not
     /// exist, it stops taking orders until there is one.
     legible: bool,
+    /// Marks, keyed by `(the group's stable id, the member's position in that
+    /// group)` — never by the group's position on screen.
+    ///
+    /// The live list inserts new groups above old ones, so a screen position
+    /// names a different group from one frame to the next. A group's id and a
+    /// member's position within it are both fixed for the group's whole life,
+    /// which is what lets a scan keep publishing underneath a user who is part
+    /// way through marking.
     marked: BTreeSet<(usize, usize)>,
+    /// Where each group id currently sits in `groups`. Rebuilt whenever the
+    /// list changes, which is the only time it can go stale.
+    at: HashMap<usize, usize>,
     pub applied_files: usize,
     pub applied_bytes: u64,
     pub refused: usize,
     pub failures: Vec<String>,
+    /// What the scan is doing, or `None` once it has stopped. Read from the
+    /// live scan's shared state; the browser never computes it.
+    pub progress: Option<Progress>,
+    /// True while a scan is still running behind the browser.
+    pub scanning: bool,
+    /// True when the scan stopped because the user asked it to.
+    pub cancelled: bool,
+}
+
+/// A snapshot of what the scan is doing, for the browser to draw.
+///
+/// Every number in here is read out of a counter the scan keeps anyway — the
+/// same counters the stderr pulse reads. Nothing is estimated, and nothing on
+/// this path touches the disk: M7's sweep is built on "one disk, one queue",
+/// and a progress bar that cost a read would be a second reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Progress {
+    pub label: &'static str,
+    pub done: u64,
+    pub total: u64,
+    /// Bytes the walk has seen, or bytes this reading stage has moved.
+    pub bytes: u64,
+    pub rate: u64,
 }
 
 impl Browser {
     pub fn new(groups: Vec<Group>, root: String, hard: bool) -> Self {
-        Browser {
+        let mut browser = Browser {
             groups,
             group: 0,
             member: 0,
@@ -164,15 +246,63 @@ impl Browser {
             // in a test behaves like one on a terminal anybody could use.
             legible: true,
             marked: BTreeSet::new(),
+            at: HashMap::new(),
             applied_files: 0,
             applied_bytes: 0,
             refused: 0,
             failures: Vec::new(),
+            progress: None,
+            scanning: false,
+            cancelled: false,
+        };
+        browser.reindex();
+        browser
+    }
+
+    /// Rebuild the id-to-position index. Called from everywhere `groups`
+    /// changes shape and nowhere else.
+    fn reindex(&mut self) {
+        self.at.clear();
+        for (position, group) in self.groups.iter().enumerate() {
+            self.at.insert(group.index, position);
         }
     }
 
+    /// The stable id of the group at a screen position.
+    fn id_at(&self, position: usize) -> usize {
+        self.groups[position].index
+    }
+
+    /// Add a group the scan has just settled, keeping the list in order and
+    /// the cursor on whatever it was already on.
+    ///
+    /// The cursor is re-found by identity afterwards rather than adjusted by
+    /// arithmetic: an insertion above it shifts every position below by one,
+    /// and "add one if the insertion was above me" is the kind of reasoning
+    /// that is right until a group is inserted at exactly the cursor.
+    pub fn insert(&mut self, group: Group) {
+        let anchor = self.groups.get(self.group).map(|group| group.index);
+        let at = self
+            .groups
+            .partition_point(|existing| existing.order() < group.order());
+        self.groups.insert(at, group);
+        self.reindex();
+        // Back onto the group the user was looking at. A cursor that had
+        // nothing under it (an empty list) stays where it was.
+        if let Some(anchor) = anchor {
+            if let Some(&position) = self.at.get(&anchor) {
+                self.group = position;
+            }
+        }
+    }
+
+    /// Whether every group on screen has had its bytes compared.
+    pub fn all_proven(&self) -> bool {
+        self.groups.iter().all(|group| group.proven)
+    }
+
     pub fn is_marked(&self, group: usize, member: usize) -> bool {
-        self.marked.contains(&(group, member))
+        self.marked.contains(&(self.id_at(group), member))
     }
 
     pub fn marked_count(&self) -> usize {
@@ -185,8 +315,20 @@ impl Browser {
     pub fn marked_bytes(&self) -> u64 {
         self.marked
             .iter()
-            .map(|&(group, _)| self.groups[group].size)
+            .filter_map(|&(id, _)| self.at.get(&id))
+            .map(|&position| self.groups[position].size)
             .sum()
+    }
+
+    /// The groups a deletion would have to prove first: the marked ones that
+    /// have not had their bytes compared.
+    pub fn unproven_marked(&self) -> usize {
+        self.marked
+            .iter()
+            .filter_map(|&(id, _)| self.at.get(&id))
+            .filter(|&&position| !self.groups[position].proven)
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     pub fn reclaimable(&self) -> u64 {
@@ -205,20 +347,26 @@ impl Browser {
     }
 
     fn marks_in(&self, group: usize) -> usize {
-        self.marked.range((group, 0)..(group + 1, 0)).count()
+        let id = self.id_at(group);
+        self.marked.range((id, 0)..(id + 1, 0)).count()
     }
 
     /// The marks as `(group in the scan, record in the scan)` pairs.
     ///
     /// Screen positions never leave this module. They move whenever a round of
-    /// deletion drops a group or a member, and a stale position handed to the
-    /// remover would name a different file rather than a missing one.
+    /// deletion drops a group or a member — and, on the live path, whenever
+    /// the scan inserts a group above the one being looked at. A stale
+    /// position handed to the remover would name a different file rather than
+    /// an absent one.
     pub fn selection(&self) -> Vec<Mark> {
         self.marked
             .iter()
-            .map(|&(group, member)| Mark {
-                group: self.groups[group].index,
-                record: self.groups[group].members[member].record,
+            .filter_map(|&(id, member)| {
+                let &position = self.at.get(&id)?;
+                Some(Mark {
+                    group: id,
+                    record: self.groups[position].members[member].record,
+                })
             })
             .collect()
     }
@@ -234,7 +382,7 @@ impl Browser {
     /// is checked before the mark goes in, so the count it compares is the
     /// count without it.
     pub fn toggle(&mut self) {
-        let key = (self.group, self.member);
+        let key = (self.id_at(self.group), self.member);
         if self.marked.remove(&key) {
             return;
         }
@@ -251,8 +399,9 @@ impl Browser {
 
     /// Keep the highlighted copy, mark every other one that can be freed.
     pub fn keep_only_current(&mut self) {
+        let id = self.id_at(self.group);
         for position in 0..self.current().members.len() {
-            let key = (self.group, position);
+            let key = (id, position);
             if position == self.member || !self.current().members[position].deletable {
                 self.marked.remove(&key);
             } else {
@@ -262,7 +411,8 @@ impl Browser {
     }
 
     pub fn clear_group(&mut self) {
-        self.marked.retain(|&(group, _)| group != self.group);
+        let id = self.id_at(self.group);
+        self.marked.retain(|&(group, _)| group != id);
     }
 
     /// Apply a keep rule across every group at once, replacing the marks.
@@ -274,7 +424,7 @@ impl Browser {
     /// than it did there. Sharing the function is not sharing the rule.
     pub fn apply_bulk(&mut self, rule: Rule) -> usize {
         self.marked.clear();
-        for (index, group) in self.groups.iter().enumerate() {
+        for group in self.groups.iter() {
             let members: Vec<(&str, f64)> = group
                 .members
                 .iter()
@@ -283,7 +433,7 @@ impl Browser {
             let keeper = rule.keeper_of(&members);
             for (position, member) in group.members.iter().enumerate() {
                 if position != keeper && member.deletable {
-                    self.marked.insert((index, position));
+                    self.marked.insert((group.index, position));
                 }
             }
         }
@@ -444,10 +594,12 @@ impl Browser {
                     index: group.index,
                     size: group.size,
                     members,
+                    proven: group.proven,
                 });
             }
         }
         self.groups = kept;
+        self.reindex();
         self.marked.clear();
         self.group = self.group.min(self.groups.len().saturating_sub(1));
         self.member = 0;
@@ -460,10 +612,41 @@ impl Browser {
             let verb = if self.hard { "deleted" } else { "moved" };
             format!("{verb} {} files", human_count(outcome.files as u64))
         };
-        if self.groups.is_empty() {
+        // An empty list ends the session — unless a scan is still running
+        // behind it, where empty only means "nothing found YET" and quitting
+        // would throw away the rest of the scan the user is waiting on.
+        if self.groups.is_empty() && !self.scanning {
             Step::Quit
         } else {
             Step::Stay
+        }
+    }
+
+    /// Fold a round of the scan's findings in.
+    ///
+    /// `replaced` says the scan rebuilt the list rather than adding to it,
+    /// which is what happens after a deletion: the scan owns the records, so
+    /// it is the side that decides what is left.
+    pub fn absorb_found(&mut self, found: Vec<Group>, replaced: bool) {
+        if replaced {
+            let anchor = self.groups.get(self.group).map(|group| group.index);
+            self.groups.clear();
+            self.reindex();
+            for group in found {
+                self.insert(group);
+            }
+            self.group = anchor
+                .and_then(|anchor| self.at.get(&anchor).copied())
+                .unwrap_or(0)
+                .min(self.groups.len().saturating_sub(1));
+            self.member = 0;
+            // A mark on a group that is gone is not a mark on anything.
+            let live: BTreeSet<usize> = self.groups.iter().map(|group| group.index).collect();
+            self.marked.retain(|(id, _)| live.contains(id));
+            return;
+        }
+        for group in found {
+            self.insert(group);
         }
     }
 }
@@ -523,6 +706,7 @@ mod tests {
                 Group {
                     index: 0,
                     size: 1000,
+                    proven: true,
                     members: vec![
                         member(0, "a.bin", 300.0),
                         member(1, "bb.bin", 100.0),
@@ -532,6 +716,7 @@ mod tests {
                 Group {
                     index: 1,
                     size: 10,
+                    proven: true,
                     members: vec![member(3, "d.bin", 5.0), member(4, "ee.bin", 9.0)],
                 },
             ],
@@ -680,6 +865,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members: vec![
                     shown_as(0, "b.bin", "/scratch/tree/b.bin", 1.0),
                     shown_as(1, "photos/aaaa.bin", "aaaa.bin", 2.0),
@@ -701,6 +887,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members: vec![
                     shown_as(0, "b.bin", "b.bin", 1.0),
                     shown_as(1, "photos/aaaa.bin", "photos/aaaa.bin", 2.0),
@@ -720,6 +907,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members: vec![
                     shown_as(0, "b.bin", "/scratch/tree/b.bin", 1.0),
                     shown_as(1, "photos/aaaa.bin", "aaaa.bin", 2.0),
@@ -1031,6 +1219,219 @@ mod tests {
         browser.groups[1].members[0].deletable = false;
         browser.groups[1].members[1].deletable = false;
         assert_eq!(browser.reclaimable(), 1000);
+    }
+
+    // ---------------------------------------------------------- the live list
+
+    /// A group of `copies` identical files of `size`, with a stable id.
+    fn streamed(id: usize, size: u64, copies: usize, proven: bool) -> Group {
+        Group {
+            index: id,
+            size,
+            proven,
+            members: (0..copies)
+                .map(|position| member(id * 100 + position, &format!("g{id}/m{position}.bin"), 1.0))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_streamed_list_is_ordered_by_what_it_would_give_back() {
+        // Arrival order is deliberately the reverse of the answer, so a list
+        // that merely appended would fail this outright.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 10, 2, false)); //  10 reclaimable
+        browser.insert(streamed(1, 100, 2, false)); // 100
+        browser.insert(streamed(2, 50, 4, false)); // 150
+        let order: Vec<usize> = browser.groups.iter().map(|group| group.index).collect();
+        assert_eq!(order, vec![2, 1, 0]);
+        assert_eq!(
+            browser.groups[0].reclaimable(),
+            150,
+            "a small file in many copies outranks a big one in two"
+        );
+    }
+
+    #[test]
+    fn a_group_arriving_above_the_cursor_does_not_move_the_cursor() {
+        // M8-LIVE.md: "a new group may insert above, the cursor must stay on
+        // the group it was on".
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 100, 2, false));
+        browser.insert(streamed(1, 50, 2, false));
+        browser.group = 1; // sitting on the smaller group, id 1
+        assert_eq!(browser.groups[browser.group].index, 1);
+
+        // Something bigger than both arrives and is drawn at the top.
+        browser.insert(streamed(2, 1000, 2, false));
+        assert_eq!(
+            browser.groups[0].index, 2,
+            "the big group was not drawn first"
+        );
+        assert_eq!(
+            browser.groups[browser.group].index, 1,
+            "the cursor slid off the group it was on"
+        );
+
+        // ...and one that sorts below the cursor does not move it either.
+        browser.insert(streamed(3, 1, 2, false));
+        assert_eq!(browser.groups[browser.group].index, 1);
+    }
+
+    #[test]
+    fn marks_survive_a_group_being_inserted_above_them() {
+        // The mark is keyed by the group's id, so an insertion that shifts
+        // every screen position below it must not repoint it. A mark that
+        // followed a position would name a different file here — and for this
+        // program that means deleting something nobody chose.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        // The group that gets marked must sit at a screen position that is
+        // NOT its own id, or a mark keyed the wrong way would still land on
+        // the right group by coincidence and this test would pass while
+        // testing nothing. Id 1 reclaims more, so id 0 is drawn second.
+        browser.insert(streamed(0, 100, 3, false));
+        browser.insert(streamed(1, 300, 2, false));
+        let marking = browser.at[&0];
+        assert_eq!(marking, 1, "the fixture stopped putting id 0 at position 1");
+        assert_ne!(
+            marking, 0,
+            "the marked group's position equals its id — the mis-keying this \
+             test exists for would be invisible"
+        );
+
+        browser.group = marking;
+        browser.member = 1;
+        browser.toggle();
+        let before = browser.selection();
+        assert_eq!(before.len(), 1);
+        assert_eq!(
+            before[0].group, 0,
+            "the mark named the group at the cursor's POSITION, not the group"
+        );
+
+        for id in 2..7 {
+            browser.insert(streamed(id, 10_000, 2, false));
+        }
+        assert_eq!(browser.groups.len(), 7);
+        assert_ne!(
+            browser.at[&0], marking,
+            "the marked group did not actually move on screen"
+        );
+        assert_eq!(
+            browser.selection(),
+            before,
+            "the mark followed a screen position instead of its group"
+        );
+        assert!(
+            browser.is_marked(browser.at[&0], 1),
+            "the mark is not on the row it was put on"
+        );
+        // ...and nothing else got marked in the shuffle.
+        assert_eq!(browser.marked_count(), 1);
+    }
+
+    #[test]
+    fn a_streamed_group_is_a_candidate_until_something_proves_it() {
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 100, 2, false));
+        browser.insert(streamed(1, 100, 2, true));
+        assert!(!browser.all_proven());
+        assert!(!browser.groups.iter().find(|g| g.index == 0).unwrap().proven);
+
+        // Marking the unproven one is what makes a proof owed at apply time.
+        browser.group = browser.at[&0];
+        browser.member = 0;
+        browser.toggle();
+        assert_eq!(browser.unproven_marked(), 1);
+        browser.group = browser.at[&1];
+        browser.member = 0;
+        browser.toggle();
+        assert_eq!(
+            browser.unproven_marked(),
+            1,
+            "a proven group was counted as owing a proof"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_ends_the_session_only_once_the_scan_has_stopped() {
+        // Mid-scan, "nothing found" means "nothing found yet"; quitting there
+        // would throw away the rest of the scan the user is waiting on.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 100, 2, true));
+        browser.scanning = true;
+        browser.member = 0;
+        browser.keep_only_current();
+        let step = browser.absorb(Outcome {
+            files: 1,
+            bytes: 100,
+            removed: vec![1],
+            refused: 0,
+            failures: Vec::new(),
+        });
+        assert_eq!(step, Step::Stay, "the browser quit while the scan ran");
+
+        browser.scanning = false;
+        browser.insert(streamed(1, 100, 2, true));
+        browser.group = 0;
+        browser.member = 0;
+        browser.keep_only_current();
+        let step = browser.absorb(Outcome {
+            files: 1,
+            bytes: 100,
+            removed: vec![100, 101],
+            refused: 0,
+            failures: Vec::new(),
+        });
+        assert_eq!(step, Step::Quit);
+    }
+
+    #[test]
+    fn a_rebuilt_list_keeps_the_cursor_and_drops_marks_on_groups_that_went() {
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        for id in 0..3 {
+            browser.insert(streamed(id, 100 * (id as u64 + 1), 2, false));
+        }
+        browser.group = browser.at[&1];
+        browser.member = 0;
+        browser.toggle();
+        assert_eq!(browser.marked_count(), 1);
+
+        // The scan rebuilt the list after a deletion and group 1 is gone.
+        browser.absorb_found(
+            vec![streamed(0, 100, 2, true), streamed(2, 300, 2, true)],
+            true,
+        );
+        assert_eq!(browser.groups.len(), 2);
+        assert_eq!(
+            browser.marked_count(),
+            0,
+            "a mark survived on a group that no longer exists"
+        );
+        assert!(browser.all_proven());
+        assert!(
+            browser.group < browser.groups.len(),
+            "the cursor points past the end"
+        );
+    }
+
+    #[test]
+    fn insertion_puts_a_group_in_the_same_place_however_it_arrived() {
+        // The list's order must be a property of the groups, not of the order
+        // the scan happened to settle them in — otherwise two runs of the same
+        // scan would draw different lists.
+        let shapes = [(0_usize, 100_u64, 2), (1, 50, 4), (2, 400, 2), (3, 10, 9)];
+        let mut forwards = Browser::new(Vec::new(), "/s".into(), false);
+        for &(id, size, copies) in shapes.iter() {
+            forwards.insert(streamed(id, size, copies, false));
+        }
+        let mut backwards = Browser::new(Vec::new(), "/s".into(), false);
+        for &(id, size, copies) in shapes.iter().rev() {
+            backwards.insert(streamed(id, size, copies, false));
+        }
+        let one: Vec<usize> = forwards.groups.iter().map(|g| g.index).collect();
+        let two: Vec<usize> = backwards.groups.iter().map(|g| g.index).collect();
+        assert_eq!(one, two, "arrival order leaked into the list order");
     }
 
     #[test]

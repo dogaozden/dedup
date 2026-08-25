@@ -430,6 +430,7 @@ mod tests {
                 Group {
                     index: 0,
                     size: 4096,
+                    proven: true,
                     members: vec![
                         member(0, "photos/beach.jpg", true, 0),
                         member(1, "backup/photos/beach.jpg", true, 2),
@@ -439,6 +440,7 @@ mod tests {
                 Group {
                     index: 1,
                     size: 512,
+                    proven: true,
                     members: vec![
                         member(3, "notes.txt", true, 0),
                         member(4, "archive/notes.txt", true, 0),
@@ -631,6 +633,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members,
             }],
             "/scratch".into(),
@@ -664,6 +667,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members: vec![member(0, &long, true, 0), member(1, "b.bin", true, 0)],
             }],
             "/scratch".into(),
