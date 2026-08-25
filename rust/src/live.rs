@@ -157,6 +157,16 @@ impl Drop for Leaving<'_> {
     }
 }
 
+/// Stops the scan when the scope holding the browser is left. See
+/// `Watch::stopping`.
+pub struct Stopping<'a>(&'a Watch);
+
+impl Drop for Stopping<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// A lock that a panicking peer cannot take away.
 ///
 /// The browser owns the terminal; if the scan thread panics holding this lock,
@@ -386,6 +396,23 @@ impl Watch {
             cancelled: body.cancelled,
             replaced,
         }
+    }
+
+    /// Stop the scan however the scope holding the browser is left —
+    /// returned, errored, or panicked through.
+    ///
+    /// The mirror of `Live::leaving`, and needed for the mirror-image reason.
+    /// `live_scan` runs the browser inside a `std::thread::scope`, which will
+    /// not return until the scan thread does, and the scan thread's serving
+    /// loop runs `while !self.cancelled()`. A panic on the browser thread
+    /// skips the `cancel()` after `run_live` and unwinds into the scope's
+    /// join — so the scan spins on, the join never finishes, and the panic is
+    /// never resumed. REVIEW-M8 item 1 measured that: the process was still
+    /// alive 25 seconds later and had to be killed. The panic hook restores
+    /// the terminal, so the user gets a working shell and a process that will
+    /// not die.
+    pub fn stopping(&self) -> Stopping<'_> {
+        Stopping(self)
     }
 
     /// Ask the scan to stop at its next safe point.

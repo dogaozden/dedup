@@ -353,6 +353,14 @@ impl Browser {
     /// the scan inserts a group above the one being looked at. A stale
     /// position handed to the remover would name a different file rather than
     /// an absent one.
+    /// A mark whose member position is past the end of its group names
+    /// nothing and is dropped rather than panicked on. That is a BACKSTOP and
+    /// not the guard: `absorb_found` clears every mark whenever the scan
+    /// rebuilds the list, so a mark can only be out of range if some future
+    /// path rebuilds without going through it. The guard is there; this is
+    /// here because the cost of being wrong on the deletion path is a panic on
+    /// the browser thread, and a panic on the browser thread used to hang the
+    /// process (REVIEW-M8 item 1, both halves).
     pub fn selection(&self) -> Vec<Mark> {
         self.marked
             .iter()
@@ -360,7 +368,7 @@ impl Browser {
                 let &position = self.at.get(&id)?;
                 Some(Mark {
                     group: id,
-                    record: self.groups[position].members[member].record,
+                    record: self.groups[position].members.get(member)?.record,
                 })
             })
             .collect()
@@ -635,9 +643,27 @@ impl Browser {
                 .unwrap_or(0)
                 .min(self.groups.len().saturating_sub(1));
             self.member = 0;
-            // A mark on a group that is gone is not a mark on anything.
-            let live: BTreeSet<usize> = self.groups.iter().map(|group| group.index).collect();
-            self.marked.retain(|(id, _)| live.contains(id));
+            // Every mark goes, which is the rule `absorb` already states two
+            // methods up: "forget every mark, including the ones a refused
+            // group still holds".
+            //
+            // Pruning by group id alone was not enough, and pruning by member
+            // position as well would not have been either. A rebuilt list only
+            // ever arrives after a proof or a deletion, and both REWRITE
+            // membership: a group that failed its proof comes back as its
+            // first real byte-equality class, so position 1 of the rebuilt
+            // group need not be the record the user marked at position 1. A
+            // mark that survived would be in range and name a different file,
+            // which is the same class of defect as keying marks by screen
+            // position — and on this path it is a file nobody chose being
+            // deleted.
+            //
+            // REVIEW-M8 item 1: the `Refused` answer was the one path that
+            // republished a shorter list without clearing, and `selection()`
+            // then indexed past the end of a group that had got smaller.
+            // Clearing here rather than at that one call site is what stops
+            // the next republishing path from having to remember.
+            self.marked.clear();
             return;
         }
         for group in found {
@@ -1407,6 +1433,94 @@ mod tests {
         assert!(
             browser.group < browser.groups.len(),
             "the cursor points past the end"
+        );
+    }
+
+    #[test]
+    fn a_mark_does_not_survive_a_group_being_rebuilt_smaller() {
+        // REVIEW-M8 item 1, the reviewer's own reproducer: mark member 3 of a
+        // four-member candidate, absorb a replaced list in which that group
+        // has two members, then ask for the selection.
+        //
+        // Before the fix this panicked — `absorb_found` pruned marks by group
+        // id only, the group was not GONE but SMALLER, and `selection()`
+        // indexed `members[3]` of a two-member group. On the browser thread,
+        // where that panic lands, it did not end the process; it hung it.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 1000, 4, false));
+        browser.group = 0;
+        browser.member = 3;
+        browser.toggle();
+        assert_eq!(
+            browser.marked_count(),
+            1,
+            "the fixture never marked anything"
+        );
+        assert_eq!(
+            browser.selection(),
+            vec![Mark {
+                group: 0,
+                record: 3
+            }],
+            "the fixture marked the wrong member"
+        );
+
+        // The proof failed and the scan republished the group as its first
+        // real byte-equality class: same id, two members.
+        browser.absorb_found(vec![streamed(0, 1000, 2, true)], true);
+        assert_eq!(browser.groups.len(), 1);
+        assert_eq!(browser.groups[0].members.len(), 2);
+
+        // The mark named a member that is no longer in the group. It is gone,
+        // and asking for the selection returns rather than panics.
+        assert_eq!(
+            browser.selection(),
+            Vec::new(),
+            "a mark survived a rebuild that changed what its group is made of"
+        );
+        assert_eq!(browser.marked_count(), 0);
+    }
+
+    #[test]
+    fn a_rebuild_clears_marks_on_groups_it_did_not_touch_either() {
+        // The rule is `absorb`'s — forget every mark — and not "forget the
+        // ones that stopped being valid". A rebuilt list only ever arrives
+        // after a proof or a deletion, and both rewrite membership: a mark
+        // left standing on an untouched group would be a mark the user set
+        // against a list that no longer exists.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 1000, 3, false));
+        browser.insert(streamed(1, 900, 3, false));
+        browser.group = browser.at[&1];
+        browser.member = 0;
+        browser.toggle();
+        assert_eq!(browser.marked_count(), 1);
+
+        // Group 0 came apart; group 1 was not touched.
+        browser.absorb_found(
+            vec![streamed(0, 1000, 2, true), streamed(1, 900, 3, false)],
+            true,
+        );
+        assert_eq!(browser.marked_count(), 0, "a mark outlived the rebuild");
+        assert_eq!(browser.groups.len(), 2, "the rebuild lost a group");
+    }
+
+    #[test]
+    fn a_mark_out_of_range_is_dropped_rather_than_panicked_on() {
+        // The backstop, reached directly. `absorb_found` makes this
+        // unreachable through the ordinary path, so it is provoked by
+        // shrinking a group underneath a mark — which is what any future
+        // republishing path that forgot to clear would do.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.insert(streamed(0, 1000, 4, false));
+        browser.group = 0;
+        browser.member = 3;
+        browser.toggle();
+        browser.groups[0].members.truncate(2);
+        assert_eq!(
+            browser.selection(),
+            Vec::new(),
+            "an out-of-range mark reached the deletion path"
         );
     }
 

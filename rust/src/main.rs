@@ -348,11 +348,19 @@ fn live_scan(
                 }
             }
         });
+        // Whatever the browser does — return, error, or panic on its way out —
+        // the scan is told to stop. It has to be a guard rather than the call
+        // below it: a panic here unwinds straight into this scope's join, and
+        // the scan thread it would be joining is looping on `!cancelled()`.
+        // The plain `watch.cancel()` that used to stand after `run_live` was
+        // skipped by exactly that unwind, and the process hung instead of
+        // dying (REVIEW-M8 item 1).
+        let stopping = watch.stopping();
         let code = tui::run_live(&watch, &seen, root, options.hard);
-        // Whatever the browser did, the scan is told to stop and joined before
-        // the cache is closed: a half-written row is impossible because the
-        // only thread that writes rows has stopped running.
-        watch.cancel();
+        // ...and on the ordinary path the scan is stopped and joined before
+        // the cache is closed, so a half-written row is impossible: the only
+        // thread that writes rows has stopped running.
+        drop(stopping);
         let _ = scanning.join();
         code
     });
