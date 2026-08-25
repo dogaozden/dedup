@@ -160,6 +160,24 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
             frame,
             Line::from(vec![Span::raw("  "), Span::styled(how, dim())]),
         );
+        // ...and whatever just happened, which is the whole reason the list is
+        // empty. Without this, a group whose proof failed at apply time takes
+        // its own explanation off the screen with it: the user marks copies,
+        // confirms, and is told "No duplicates left" with nothing said about
+        // the refusal. Found by `m8_live_end_to_end.py`.
+        if !browser.flash.is_empty() {
+            line(
+                rows[8],
+                frame,
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        browser.flash.clone(),
+                        Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            );
+        }
         return;
     }
 
@@ -771,6 +789,135 @@ mod tests {
         let body = render(&browser, 80, 14).join("\n");
         assert!(body.contains("No duplicates left."), "{body}");
         assert!(body.contains("q to quit"), "{body}");
+    }
+
+    #[test]
+    fn an_emptied_list_still_says_why_it_emptied() {
+        // The case that matters is a candidate whose proof failed at apply
+        // time: the group leaves the list, and if the screen loses the
+        // explanation with it the user is told "No duplicates left" and
+        // nothing about the refusal. A deletion tool that goes quiet at
+        // exactly the moment it declined to delete something is lying by
+        // omission.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.flash = "1 group(s) refused — their copies no longer match".into();
+        let body = render(&browser, 80, 14).join("\n");
+        assert!(body.contains("No duplicates left."), "{body}");
+        assert!(
+            body.contains("refused"),
+            "the refusal vanished with the group: {body}"
+        );
+    }
+
+    #[test]
+    fn a_scanning_browser_says_so_rather_than_claiming_there_is_nothing() {
+        // Mid-scan, an empty list means "nothing found YET".
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.scanning = true;
+        browser.progress = Some(crate::tui::model::Progress {
+            label: "Scanning",
+            done: 1234,
+            total: 0,
+            bytes: 5678,
+            rate: 0,
+        });
+        let body = render(&browser, 80, 14).join("\n");
+        assert!(body.contains("Scanning — nothing found yet."), "{body}");
+        assert!(body.contains("q to stop and quit"), "{body}");
+        // ...and the progress it is making is on the screen, from the scan's
+        // own counters.
+        assert!(body.contains("1,234 files"), "{body}");
+    }
+
+    #[test]
+    fn the_progress_row_draws_the_two_shapes_the_pulse_draws() {
+        // The walk has no total to be a fraction of; a reading stage does.
+        let walking = progress_line(
+            80,
+            &crate::tui::model::Progress {
+                label: "Scanning",
+                done: 1000,
+                total: 0,
+                bytes: 4 * 1024 * 1024 * 1024,
+                rate: 0,
+            },
+        );
+        let text: String = walking
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(text.contains("Scanning…"), "{text}");
+        assert!(text.contains("1,000 files · 4.0 GiB"), "{text}");
+
+        let reading = progress_line(
+            80,
+            &crate::tui::model::Progress {
+                label: "Comparing",
+                done: 50,
+                total: 100,
+                bytes: 1024 * 1024,
+                rate: 1024 * 1024,
+            },
+        );
+        let text: String = reading
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(text.contains(" 50%  50/100 · 1.0 MiB/s"), "{text}");
+        assert!(text.contains("████████░░░░░░░░"), "{text}");
+
+        // ...and it never wraps, whatever it is asked to fit into.
+        for width in [1_u16, 2, 10, 40, 80] {
+            let line = progress_line(
+                width,
+                &crate::tui::model::Progress {
+                    label: "Sampling deep",
+                    done: 7,
+                    total: 9999,
+                    bytes: 1 << 30,
+                    rate: 1 << 30,
+                },
+            );
+            let drawn: String = line.spans.iter().map(|span| span.content.clone()).collect();
+            assert!(
+                drawn.chars().count() < usize::from(width).max(1),
+                "{width} columns held {} characters",
+                drawn.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidate_says_so_and_a_proven_group_does_not() {
+        let mut browser = browser();
+        browser.groups[0].proven = false;
+        let body = render(&browser, 80, 16).join("\n");
+        assert!(body.contains("candidate"), "{body}");
+        browser.groups[0].proven = true;
+        let body = render(&browser, 80, 16).join("\n");
+        assert!(
+            !body.contains("candidate"),
+            "a proven group was labelled a guess: {body}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_says_what_the_proof_will_cost() {
+        let mut browser = browser();
+        browser.groups[0].proven = false;
+        browser.member = 0;
+        browser.keep_only_current();
+        let lines = confirmation(&browser).join("\n");
+        assert!(
+            lines.contains("1 group(s) will be read and proved first."),
+            "{lines}"
+        );
+        // A selection with nothing to prove does not threaten a read.
+        browser.groups[0].proven = true;
+        let lines = confirmation(&browser).join("\n");
+        assert!(!lines.contains("proved first"), "{lines}");
     }
 
     #[test]

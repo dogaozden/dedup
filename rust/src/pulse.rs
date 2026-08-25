@@ -77,6 +77,16 @@ struct Live {
     shared: Arc<Shared>,
     effort: Arc<Effort>,
     ticker: Option<JoinHandle<()>>,
+    /// Whether anything may be written to stderr.
+    ///
+    /// Not the same question as "is there a ticker": `stage` paints one frame
+    /// itself at every boundary, outside the ticker, so a stage that finishes
+    /// inside a single beat is still seen. In live mode that frame would land
+    /// on top of the browser's alternate screen — which is exactly the fight
+    /// M5.2 ended by clearing the line before the browser opened. Caught by
+    /// `m8_live_end_to_end.py`, which found the boundary frames on screen
+    /// behind the browser.
+    paints: bool,
 }
 
 /// The scan's handle on the progress line. `Pulse::off()` is a handle on
@@ -156,10 +166,10 @@ impl Pulse {
             Pulse(Some(Live {
                 shared,
                 effort: Arc::clone(effort),
-                // No thread: nothing here paints. `finish` returns straight
-                // away for the same reason, so no stray write can ever land
-                // on the alternate screen.
+                // No thread, and no boundary frames either: the browser is the
+                // progress display, and nothing may reach stderr behind it.
                 ticker: None,
+                paints: false,
             })),
             view,
         )
@@ -203,6 +213,7 @@ impl Pulse {
             shared,
             effort: Arc::clone(effort),
             ticker: Some(ticker),
+            paints: true,
         }))
     }
 
@@ -246,8 +257,11 @@ impl Pulse {
             }
             // One frame at the boundary, outside the lock the painter takes:
             // a stage that finishes inside a single beat — the parallel walk
-            // does, on any tree the page cache holds — is still seen.
-            paint(&live.shared, &live.effort);
+            // does, on any tree the page cache holds — is still seen. Not in
+            // live mode, where stderr is behind the browser's screen.
+            if live.paints {
+                paint(&live.shared, &live.effort);
+            }
         }
     }
 
@@ -355,6 +369,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_live_pulse_keeps_the_counters_and_writes_nothing() {
+        // The browser owns the terminal in live mode. `stage` paints a frame
+        // at every boundary on its own, outside the ticker, so "no ticker" is
+        // not enough on its own to keep stderr clear — that frame landed on
+        // top of the browser's alternate screen until `paints` existed.
+        let effort = Arc::new(Effort::default());
+        let (mut pulse, view) = Pulse::live(&effort);
+        let live = pulse.0.as_ref().expect("live");
+        assert!(!live.paints, "a live pulse would write to stderr");
+        assert!(live.ticker.is_none(), "a live pulse started a painter");
+
+        // ...and it still counts, which is the whole point of it.
+        assert!(
+            view.read().is_none(),
+            "a pulse that has not begun reported a stage"
+        );
+        pulse.stage(SCANNING, 0);
+        pulse.walked(4096);
+        pulse.walked(4096);
+        let seen = view.read().expect("a stage");
+        assert_eq!(seen.label, SCANNING);
+        assert_eq!(seen.done, 2);
+        assert_eq!(seen.bytes, 8192);
+        assert_eq!(seen.total, 0, "the walk has no total to be a fraction of");
+
+        pulse.stage(COMPARE, 10);
+        pulse.files(3);
+        let seen = view.read().expect("a stage");
+        assert_eq!((seen.label, seen.done, seen.total), (COMPARE, 3, 10));
+        // Finishing a live pulse joins nothing and clears nothing.
+        pulse.finish();
+    }
+
+    #[test]
     fn off_is_off() {
         // Nothing to join, nothing to clear, and every counter call a branch
         // that falls through. The whole inertness claim rests on this shape.
@@ -438,6 +486,7 @@ mod tests {
             effort: Arc::clone(&effort),
             // No thread: this is the bookkeeping, not the painting.
             ticker: None,
+            paints: false,
         }));
         pulse.stage(SCANNING, 0);
         pulse.walked(1024);
