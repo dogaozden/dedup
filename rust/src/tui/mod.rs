@@ -113,6 +113,173 @@ pub fn run(
     }
 }
 
+/// How often the live browser looks at the scan while it is running.
+///
+/// Short enough that a group found now is on screen now, long enough that an
+/// idle browser is not measurable beside a scan doing real work. It is only
+/// ever a lock and a handful of loads — see `pulse::View`.
+const WATCH_BEAT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The browser, opened before the scan has found anything.
+///
+/// M8-LIVE.md: "On an interactive launch the browser opens IMMEDIATELY. The
+/// scan runs on worker threads behind it." The scan is on the other end of
+/// `watch`; this side owns the terminal, the model and nothing else, and in
+/// particular never reads the disk or the cache.
+pub fn run_live(
+    watch: &crate::live::Watch,
+    view: &crate::pulse::View,
+    root: &Path,
+    hard: bool,
+) -> i32 {
+    let mut browser = Browser::new(Vec::new(), root.to_string_lossy().into_owned(), hard);
+    browser.scanning = true;
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        put_the_terminal_back();
+        previous(info);
+    }));
+
+    match live_loop(&mut browser, watch, view) {
+        Err(error) => {
+            eprintln!("dedup-rs: {error}");
+            1
+        }
+        Ok(Ended::TerminalGone) => 1,
+        Ok(Ended::Quit) => {
+            summarise_live(&browser);
+            0
+        }
+    }
+}
+
+/// The live loop, with the terminal held by the same guard the finished-scan
+/// browser uses.
+fn live_loop(
+    browser: &mut Browser,
+    watch: &crate::live::Watch,
+    view: &crate::pulse::View,
+) -> io::Result<Ended> {
+    enable_raw_mode()?;
+    let _restore = Restore(put_the_terminal_back);
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
+
+    let ended = loop {
+        // Whatever the scan has settled since the last look, folded into the
+        // list in order and under a cursor that does not move because of it.
+        let fresh = watch.fresh();
+        let ending = fresh.finished;
+        browser.absorb_found(fresh.groups, fresh.replaced);
+        browser.scanning = !ending;
+        browser.cancelled = fresh.cancelled;
+        browser.progress = if ending { None } else { view.read() };
+
+        let painted = match terminal.draw(|frame| view::draw(frame, browser)) {
+            Ok(frame) => frame.area,
+            Err(error) => {
+                if hung_up() {
+                    break Ended::TerminalGone;
+                }
+                return Err(error);
+            }
+        };
+        browser.resize(painted.width, painted.height);
+
+        // While the scan runs, wake often enough to draw what it finds; once
+        // it has stopped there is nothing to redraw for and the browser waits
+        // on the keyboard the way it always did.
+        let wait = if browser.scanning {
+            WATCH_BEAT
+        } else {
+            WAIT_FOR_KEY
+        };
+        match sys::wait_for_terminal_input(wait) {
+            sys::Input::Ready => {}
+            sys::Input::HungUp => break Ended::TerminalGone,
+            sys::Input::Waited => continue,
+        }
+        let event = event::read()?;
+        let Event::Key(key) = event else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        let step = browser.on_key(key_for(browser.mode, key));
+        let step = match step {
+            Step::Apply => {
+                // Say what is about to happen before it does: the proof reads
+                // every byte of every marked group, and on a big selection
+                // that is not instant.
+                browser.flash = "proving…".into();
+                terminal.draw(|frame| view::draw(frame, browser))?;
+                debug_assert!(browser.legible(), "confirmed on a screen nobody could read");
+                let marks = browser.selection();
+                match watch.apply(marks, browser.hard) {
+                    crate::live::Answer::Applied(outcome) => browser.absorb(*outcome),
+                    crate::live::Answer::Refused(why) => {
+                        browser.flash = why;
+                        Step::Stay
+                    }
+                }
+            }
+            other => other,
+        };
+        if step == Step::Quit {
+            // Tell the scan to stop at its next safe point. Whether it gets
+            // there before the process ends does not matter: every fact it has
+            // learned is already committed, so the cache a later run opens is
+            // valid either way. See `cache::ScanCache::flush`.
+            watch.cancel();
+            break Ended::Quit;
+        }
+    };
+
+    if matches!(ended, Ended::TerminalGone) {
+        watch.cancel();
+        std::mem::forget(terminal);
+    }
+    Ok(ended)
+}
+
+/// What the live session did, on the terminal the user gets back.
+///
+/// The finished-scan browser can list the groups a refusal left alone because
+/// it still has the scan's records; this side never had them. It says the
+/// count, which is what the user needs to know, and the paths are on the
+/// screen they just left.
+fn summarise_live(browser: &Browser) {
+    if browser.applied_files > 0 {
+        let where_to = if browser.hard {
+            "deleted"
+        } else {
+            "moved to Trash"
+        };
+        println!(
+            "\n  {} files {where_to} · {} reclaimed\n",
+            human_count(browser.applied_files as u64),
+            human_size(browser.applied_bytes)
+        );
+    }
+    if browser.refused > 0 {
+        eprintln!(
+            "  {} group(s) were left alone: their copies did not match when the \
+             bytes were read.",
+            human_count(browser.refused as u64)
+        );
+    }
+    if !browser.failures.is_empty() {
+        eprintln!(
+            "  {} could not be removed:",
+            human_count(browser.failures.len() as u64)
+        );
+        for line in browser.failures.iter().take(10) {
+            eprintln!("    {line}");
+        }
+    }
+}
+
 /// How the loop ended. The two are told apart only so the caller knows whether
 /// there is still anybody to print the summary to.
 enum Ended {

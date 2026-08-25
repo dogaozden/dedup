@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::effort::Effort;
 use crate::size::{human_count, human_size};
+use crate::tui::model::Progress;
 
 /// The longest the line may go without being repainted, and the shortest it
 /// may go between two repaints.
@@ -82,9 +83,86 @@ struct Live {
 /// nothing, and every method on it is a branch that falls straight through.
 pub struct Pulse(Option<Live>);
 
+/// A read-only handle on the very counters the ticker paints from.
+///
+/// M8-LIVE.md: in live mode the browser IS the progress display, drawing
+/// "from the same shared state the pulse reads". This is that state, and
+/// reading it is a lock, five loads and an unlock — no thread, no syscall, and
+/// above all no disk, because a progress bar that cost a read would be a
+/// second reader on a platter M7 spent a milestone giving one queue.
+pub struct View {
+    shared: Arc<Shared>,
+    effort: Arc<Effort>,
+}
+
+impl View {
+    /// What the scan is doing right now, or `None` before it has begun.
+    pub fn read(&self) -> Option<Progress> {
+        let stage = self.shared.stage();
+        if stage.label.is_empty() {
+            return None;
+        }
+        let done = self.shared.files.load(Ordering::Relaxed);
+        let elapsed = stage.started.elapsed();
+        let (total, bytes) = if stage.label == SCANNING {
+            (0, self.shared.bytes.load(Ordering::Relaxed))
+        } else {
+            (
+                stage.total,
+                self.effort
+                    .bytes_read()
+                    .saturating_sub(stage.bytes_at_start),
+            )
+        };
+        Some(Progress {
+            label: stage.label,
+            done,
+            total,
+            bytes,
+            rate: (bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64,
+        })
+    }
+}
+
 impl Pulse {
     pub fn off() -> Pulse {
         Pulse(None)
+    }
+
+    /// Counters kept, but no ticker and nothing written to stderr.
+    ///
+    /// The browser owns the terminal in live mode; a second painter putting a
+    /// line on stderr would fight the alternate screen for it, which is
+    /// exactly the mess M5.2 finished by clearing the line before the browser
+    /// opened. So the scan keeps feeding the same numbers and the browser
+    /// draws them itself.
+    pub fn live(effort: &Arc<Effort>) -> (Pulse, View) {
+        let shared = Arc::new(Shared {
+            files: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            stage: Mutex::new(Stage {
+                label: "",
+                total: 0,
+                started: Instant::now(),
+                bytes_at_start: 0,
+            }),
+            stop: AtomicBool::new(false),
+        });
+        let view = View {
+            shared: Arc::clone(&shared),
+            effort: Arc::clone(effort),
+        };
+        (
+            Pulse(Some(Live {
+                shared,
+                effort: Arc::clone(effort),
+                // No thread: nothing here paints. `finish` returns straight
+                // away for the same reason, so no stray write can ever land
+                // on the alternate screen.
+                ticker: None,
+            })),
+            view,
+        )
     }
 
     /// On, if there is a terminal on stderr to paint to and nobody asked for

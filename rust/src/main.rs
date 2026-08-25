@@ -75,6 +75,25 @@ fn menu_wanted(options: &Options) -> bool {
     tui::has_terminal() && browsing_flags(options)
 }
 
+/// Whether this run opens the browser before the scan rather than after it.
+///
+/// M8-LIVE.md's absolute fence decides most of this. `--list` and `--auto` are
+/// already excluded by `browsing_flags`; the other two exclusions are here:
+///
+/// * An explicit `--report-json` keeps today's pipeline whatever else is true
+///   of the run. That is the fence read literally, and it has a second effect
+///   worth having: the conformance harness passes `--report-json` on every
+///   invocation, so no gate can reach the live path even if one were somehow
+///   run on a terminal.
+/// * `--stage size` has read nothing, so it has nothing to stream, nothing to
+///   prove and nothing anybody may delete.
+fn live_wanted(options: &Options) -> bool {
+    tui::has_terminal()
+        && browsing_flags(options)
+        && options.report_json.is_none()
+        && options.stage.is_empty()
+}
+
 fn print_report(groups: &[Vec<&str>]) {
     if groups.is_empty() {
         println!("\n  No duplicates found.\n");
@@ -149,6 +168,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // writing: the rate on the line is bytes that really moved, not an
     // estimate kept beside them.
     let effort = Arc::new(Effort::default());
+
+    // The live scan: a browser opened before anything has been read, with the
+    // scan behind it. Everything below this point is the path every other run
+    // has always taken, unchanged.
+    if live_wanted(&options) {
+        return live_scan(&options, &root, filters, &effort);
+    }
     // After the menu, which owns the terminal until it hands it back, and
     // before anything is read.
     let mut pulse = Pulse::start(options.quiet, &effort);
@@ -168,6 +194,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             cache.as_mut(),
             options.profile,
             &pulse,
+            // Not live: this is the path every non-interactive run takes.
+            None,
         )
     };
     // The line goes before anything else is said, so nothing of it is left in
@@ -237,6 +265,86 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             }
         },
     };
+    if let Some(cache) = cache.as_mut() {
+        cache.close();
+    }
+    Ok(code)
+}
+
+/// The live scan: the browser opens now, the scan runs behind it.
+///
+/// The two threads are scoped rather than detached so every borrow they share
+/// — the root, the filters, the counters, the cache — is checked rather than
+/// cloned. The scan thread owns the records and does all the reading; the
+/// browser thread owns the terminal and does none.
+fn live_scan(
+    options: &Options,
+    root: &std::path::Path,
+    filters: Filters,
+    effort: &Arc<Effort>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let (live, watch) = live::channel(root);
+    // Counters without a painter: in live mode the browser is the progress
+    // display, so nothing may write to stderr behind the alternate screen.
+    let (pulse, seen) = Pulse::live(effort);
+    let mut probe = VolumeProbe::start(root, options.jobs);
+    let mut cache = (!options.no_cache).then(ScanCache::new);
+
+    let code = std::thread::scope(|scope| {
+        // The borrows the scan needs are taken here and MOVED into it, rather
+        // than being captured by reference. `Live` holds a `RefCell` and so is
+        // deliberately not `Sync`: only one thread may ever publish, and this
+        // is how the compiler is told which one.
+        let probing = &mut probe;
+        let caching = cache.as_mut();
+        let scanning = scope.spawn(move || {
+            // Whatever happens in here — a clean finish, or a panic on the way
+            // through — the browser is released rather than left blocked on a
+            // thread that has stopped running.
+            let _leaving = live.leaving();
+            let mut caching = caching;
+            let mut scan = find_duplicates(
+                root,
+                filters,
+                probing,
+                effort,
+                caching.as_deref_mut(),
+                options.profile,
+                &pulse,
+                Some(&live),
+            );
+            // The list is complete; the progress display goes away. The thread
+            // stays to answer, because a user who waited for the scan to
+            // finish before marking anything is the ordinary case.
+            live.finished();
+            let context = Compare {
+                root,
+                effort,
+                profile: scan.profile,
+                solid: probing.device().all_solid_state(),
+                learn: caching.is_some(),
+            };
+            while !live.cancelled() {
+                if !pipeline::serve(
+                    &live,
+                    &mut scan.records,
+                    &context,
+                    caching.as_deref_mut(),
+                    &mut scan.unreadable,
+                ) {
+                    live.idle(std::time::Duration::from_millis(100));
+                }
+            }
+        });
+        let code = tui::run_live(&watch, &seen, root, options.hard);
+        // Whatever the browser did, the scan is told to stop and joined before
+        // the cache is closed: a half-written row is impossible because the
+        // only thread that writes rows has stopped running.
+        watch.cancel();
+        let _ = scanning.join();
+        code
+    });
+
     if let Some(cache) = cache.as_mut() {
         cache.close();
     }

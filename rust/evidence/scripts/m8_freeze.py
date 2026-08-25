@@ -32,6 +32,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 
 HEAD, DEEP, TAIL, SPAN = 4096, 65536, 4096, 8 * 1024 * 1024
 
@@ -145,7 +146,15 @@ INVOCATIONS = [
     ("stage-size", ["--list", "--stage", "size"], False),
     ("auto-shortest", ["--auto", "shortest", "--yes"], True),
     ("auto-oldest", ["--auto", "oldest", "--yes"], True),
+    # The concurrent path. Compared on everything but `seeks`, which is
+    # genuinely nondeterministic with several readers in flight and is the
+    # honest answer for one set of heads serving all of them.
+    ("parallel-list", ["--list", "--jobs", "4"], False),
+    ("parallel-spinning", ["--list", "--jobs", "4", "--profile", "spinning"], False),
 ]
+
+# Cases whose `seeks` are not compared: see the note beside them above.
+SEEKS_VARY = "parallel-"
 
 
 def build_corpus(scratch, name):
@@ -154,7 +163,29 @@ def build_corpus(scratch, name):
         shutil.rmtree(root)
     os.makedirs(root)
     CORPORA[name](root)
+    age(root)
     return root
+
+
+def age(root):
+    """Push every mtime ten seconds into the past.
+
+    Without this the whole capture is a coin flip. The cache trusts a row only
+    while the file's mtime tick is STRICTLY older than the second the scan that
+    wrote it started in — git's racily-clean rule, cache.rs's `get`. A corpus
+    built and scanned inside one second is racily clean, its rows are dropped,
+    and the warm-cache cases read everything again... unless the build happens
+    to straddle a second boundary, in which case they do not. That is a
+    property of the clock, not of the binary, and a gate that reports it as a
+    difference is a gate nobody will believe. Measured, not assumed: before
+    this call, capturing the SAME binary twice differed on three cases.
+    """
+    when = time.time() - 10
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            if os.path.exists(path):
+                os.utime(path, (when, when))
 
 
 def run_case(binary, scratch, corpus, label, flags, destructive, cache_dir):
@@ -178,6 +209,14 @@ def run_case(binary, scratch, corpus, label, flags, destructive, cache_dir):
     argv = [binary, root, "--report-json", report] + flags
     if "--min-size" not in flags:
         argv += ["--min-size", "1"]
+    if "--jobs" not in flags:
+        # One reader, so the seek count is a property of the pipeline rather
+        # than of how the OS happened to schedule two readers. `seeks` counts
+        # reads that did not continue where the last one stopped, ACROSS
+        # readers (effort.rs) — with several in flight they interleave
+        # differently every run. The `parallel-*` cases below cover the
+        # concurrent path with `seeks` excluded.
+        argv += ["--jobs", "1"]
     done = subprocess.run(argv, capture_output=True, env=env)
     body = {
         "exit": done.returncode,
@@ -231,6 +270,26 @@ def capture(binary, outdir, scratch):
     return captured
 
 
+def brief(value, width=160):
+    """A value short enough to read. A widegroup's `groups` field is two
+    hundred paths long and printing both sides of it whole buries the one
+    number that actually differed."""
+    text = repr(value)
+    if len(text) <= width:
+        return text
+    return "{}… ({} chars)".format(text[:width], len(text))
+
+
+def _same_but_seeks(one, two):
+    """True when two captures agree on everything except the seek count."""
+    if {k: v for k, v in one.items() if k != "report"} != \
+       {k: v for k, v in two.items() if k != "report"}:
+        return False
+    ra = {k: v for k, v in one.get("report", {}).items() if k != "seeks"}
+    rb = {k: v for k, v in two.get("report", {}).items() if k != "seeks"}
+    return ra == rb
+
+
 def compare(dir_a, dir_b):
     with open(os.path.join(dir_a, "capture.json")) as fh:
         a = json.load(fh)
@@ -249,17 +308,20 @@ def compare(dir_a, dir_b):
             continue
         if a[key] == b[key]:
             continue
+        if SEEKS_VARY in key and _same_but_seeks(a[key], b[key]):
+            continue
         bad += 1
         print("DIFFERS: {}".format(key))
         for field in ("exit", "stdout", "stderr"):
             if a[key].get(field) != b[key].get(field):
-                print("    {}: {!r} != {!r}".format(
-                    field, a[key].get(field), b[key].get(field)))
+                print("    {}: {} != {}".format(
+                    field, brief(a[key].get(field)), brief(b[key].get(field))))
         ra, rb = a[key].get("report", {}), b[key].get("report", {})
-        for field in sorted(set(ra) | set(rb)):
+        skip = {"seeks"} if SEEKS_VARY in key else set()
+        for field in sorted((set(ra) | set(rb)) - skip):
             if ra.get(field) != rb.get(field):
-                print("    report.{}: {!r} != {!r}".format(
-                    field, ra.get(field), rb.get(field)))
+                print("    report.{}: {} != {}".format(
+                    field, brief(ra.get(field)), brief(rb.get(field))))
     print()
     print("{} cases compared, {} differing".format(len(keys), bad))
     if bad:

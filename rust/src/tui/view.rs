@@ -134,19 +134,31 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
         spread(width, 2, vec![Span::styled(summary, bold())], marked),
     );
 
+    // The progress the scan is making, drawn where the gap is once there is a
+    // scan to draw. This is the whole of M8's "the browser draws the scan's
+    // progress itself": the numbers come from `Browser::progress`, which the
+    // loop reads out of the same counters the stderr pulse reads.
+    if let Some(progress) = &browser.progress {
+        line(rows[3], frame, progress_line(width, progress));
+    }
+
     if browser.groups.is_empty() {
+        let (said, how) = if browser.scanning {
+            ("Scanning — nothing found yet.", "q to stop and quit")
+        } else if browser.cancelled {
+            ("Scan stopped.", "q to quit")
+        } else {
+            ("No duplicates left.", "q to quit")
+        };
         line(
             rows[4],
             frame,
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("No duplicates left.", bold()),
-            ]),
+            Line::from(vec![Span::raw("  "), Span::styled(said, bold())]),
         );
         line(
             rows[6],
             frame,
-            Line::from(vec![Span::raw("  "), Span::styled("q to quit", dim())]),
+            Line::from(vec![Span::raw("  "), Span::styled(how, dim())]),
         );
         return;
     }
@@ -169,14 +181,28 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
                     ),
                     accent(),
                 )],
-                vec![Span::styled(
-                    format!(
-                        "{} × {} copies",
-                        human_size(group.size),
-                        human_count(group.members.len() as u64)
+                vec![
+                    Span::styled(
+                        format!(
+                            "{} × {} copies",
+                            human_size(group.size),
+                            human_count(group.members.len() as u64)
+                        ),
+                        dim(),
                     ),
-                    dim(),
-                )],
+                    // Said plainly, because it is the difference between what
+                    // the tool knows and what it has guessed. A candidate is
+                    // proved before anything of it is deleted, never after.
+                    //
+                    // Only the guess is labelled. A finished scan's groups are
+                    // all proven, and a screen that said so on every row would
+                    // be saying nothing on every row.
+                    if group.proven {
+                        Span::raw("")
+                    } else {
+                        Span::styled("  candidate", Style::default().fg(WARN))
+                    },
+                ],
             ),
         );
         line(rows[5], frame, rule(width));
@@ -221,6 +247,43 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
     }
 }
 
+/// Cells in the progress bar. The stderr pulse draws 24; the browser has a
+/// header to share the row with, so it draws fewer.
+const LIVE_BAR: usize = 16;
+
+/// The scan's progress, in the browser's own row.
+///
+/// The two shapes are the pulse's two shapes, for the same reason: the walk
+/// has no total to be a fraction of, so it says what it has seen, and a
+/// reading stage says how far through it is. Nothing here is estimated — every
+/// number arrives from a counter the scan keeps anyway.
+pub fn progress_line(width: u16, progress: &crate::tui::model::Progress) -> Line<'static> {
+    let body = if progress.total == 0 {
+        format!(
+            "{} files · {}",
+            human_count(progress.done),
+            human_size(progress.bytes)
+        )
+    } else {
+        let done = progress.done.min(progress.total);
+        let percent = done as f64 / progress.total as f64 * 100.0;
+        let filled = (LIVE_BAR as f64 * percent / 100.0) as usize;
+        format!(
+            "{}{} {percent:3.0}%  {}/{} · {}/s",
+            "█".repeat(filled),
+            "░".repeat(LIVE_BAR - filled),
+            human_count(done),
+            human_count(progress.total),
+            human_size(progress.rate)
+        )
+    };
+    let text: String = format!("  {}…  {body}", progress.label)
+        .chars()
+        .take(usize::from(width).saturating_sub(1))
+        .collect();
+    Line::from(vec![Span::styled(text, Style::default().fg(ACCENT))])
+}
+
 /// Exactly what is about to happen, in the words the user needs to judge it:
 /// how many, how much, and whether it can be taken back.
 pub fn confirmation(browser: &Browser) -> Vec<String> {
@@ -236,6 +299,18 @@ pub fn confirmation(browser: &Browser) -> Vec<String> {
         ),
         format!("Reclaims {}", human_size(browser.marked_bytes())),
     ];
+    // What the user is agreeing to pay for. The proof reads every byte of
+    // every candidate group before anything is trashed, and on a big selection
+    // that is the slow part of the whole session — so it is said in the
+    // dialog rather than discovered afterwards.
+    let owed = browser.unproven_marked();
+    if owed > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} group(s) will be read and proved first.",
+            human_count(owed as u64)
+        ));
+    }
     if browser.hard {
         lines.push(String::new());
         lines.push("This cannot be undone.".into());
