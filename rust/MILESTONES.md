@@ -3696,6 +3696,18 @@ ffb7be284856197dafd2a644480876a67293e080eba160dbecb4d90db72d256e  target/release
 * Time-to-first-group is the metric this milestone creates and I have not
   scored it. Nothing here games it: groups are published at the moment a
   bucket stops narrowing, which is the earliest a candidate honestly exists.
+* **Idle-time promotion is not implemented.** M8-LIVE.md makes it the
+  builder's choice — "background stage 5 continuing to promote candidates to
+  proven while the user browses is welcome, if cleanly cancellable;
+  correctness never depends on it" — and I declined it. It would put a second
+  reader on the disk while the narrowing stages are still using it, which is
+  the interleaving M7 spent a milestone removing, and its whole benefit is
+  paying early for proofs the user may never ask for. The apply-time proof is
+  not slow: the confirmation dialog says how many groups will be read first,
+  so the cost is disclosed before it is paid rather than hidden in a
+  background thread. If it is wanted, the safe shape is to run it only once
+  the scan thread has no stages left, where it is the sole reader — that is a
+  small addition to the serving loop and not a redesign.
 
 ### Fence conditions this run was made under
 
