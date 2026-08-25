@@ -156,6 +156,11 @@ fn pool_of(jobs: usize) -> ThreadPool {
 /// bytes, so the live path may not cost them an instruction it can avoid.
 pub type Streaming<'a> = Option<&'a crate::live::Live>;
 
+/// Eight arguments, and each is a different thing the scan needs to be told:
+/// where, what to keep, what disk, what to count, what to remember, which
+/// profile, where to report progress, and whether anybody is watching. A
+/// struct to carry them would be a struct with one caller.
+#[allow(clippy::too_many_arguments)]
 pub fn find_duplicates(
     root: &Path,
     filters: Filters,
@@ -589,7 +594,7 @@ pub fn find_duplicates(
         // The bytes went past anyway, so a group read here is also a group
         // learned. The digests come back from the pool rather than being
         // written from inside it, so the cache never needs a lock.
-        if let Some(cache) = cache.as_deref_mut() {
+        if let Some(cache) = cache {
             for (index, digest) in compared.learned {
                 cache.remember(&records[index], crate::cache::Field::Full, digest);
             }
@@ -696,8 +701,7 @@ pub fn serve(
         Err(String::new())
     } else {
         match lent.proven() {
-            Some(token) => crate::trash::run_selected(&lent, token, &keeping, hard, context, cache)
-                .map_err(|why| why),
+            Some(token) => crate::trash::run_selected(&lent, token, &keeping, hard, context, cache),
             None => Err("these groups were never compared byte for byte".to_string()),
         }
     };

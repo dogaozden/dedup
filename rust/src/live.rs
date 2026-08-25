@@ -425,18 +425,6 @@ impl Watch {
                 .unwrap_or_else(|held| held.into_inner());
         }
     }
-
-    /// Wait until something happens or the timeout runs out.
-    ///
-    /// The browser uses this only when it has nothing else to do; a keystroke
-    /// wakes it through the terminal instead.
-    pub fn settle(&self, timeout: std::time::Duration) {
-        let guard = body(&self.0);
-        if guard.finished {
-            return;
-        }
-        let _ = self.0.stirred.wait_timeout(guard, timeout);
-    }
 }
 
 #[cfg(test)]
@@ -562,7 +550,7 @@ mod tests {
         let scan = std::thread::spawn(move || {
             for _ in 0..2000 {
                 if live.taken_ask().is_some() {
-                    live.answer(Answer::Applied(Box::new(Outcome::default())));
+                    live.answer(Answer::Applied(Box::default()));
                     return true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -613,16 +601,5 @@ mod tests {
         assert_eq!(fresh.groups.len(), 1);
         assert_eq!(fresh.groups[0].index, 1);
         assert!(fresh.groups[0].proven);
-    }
-
-    #[test]
-    fn settling_returns_at_once_once_the_scan_has_finished() {
-        // Otherwise a browser with nothing to draw would wait out the whole
-        // timeout after every scan, on every frame.
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
-        live.finished();
-        let began = std::time::Instant::now();
-        watch.settle(std::time::Duration::from_secs(5));
-        assert!(began.elapsed() < std::time::Duration::from_secs(1));
     }
 }

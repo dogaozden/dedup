@@ -296,11 +296,6 @@ impl Browser {
         }
     }
 
-    /// Whether every group on screen has had its bytes compared.
-    pub fn all_proven(&self) -> bool {
-        self.groups.iter().all(|group| group.proven)
-    }
-
     pub fn is_marked(&self, group: usize, member: usize) -> bool {
         self.marked.contains(&(self.id_at(group), member))
     }
@@ -1335,8 +1330,8 @@ mod tests {
         let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
         browser.insert(streamed(0, 100, 2, false));
         browser.insert(streamed(1, 100, 2, true));
-        assert!(!browser.all_proven());
         assert!(!browser.groups.iter().find(|g| g.index == 0).unwrap().proven);
+        assert!(browser.groups.iter().find(|g| g.index == 1).unwrap().proven);
 
         // Marking the unproven one is what makes a proof owed at apply time.
         browser.group = browser.at[&0];
@@ -1408,7 +1403,7 @@ mod tests {
             0,
             "a mark survived on a group that no longer exists"
         );
-        assert!(browser.all_proven());
+        assert!(browser.groups.iter().all(|group| group.proven));
         assert!(
             browser.group < browser.groups.len(),
             "the cursor points past the end"

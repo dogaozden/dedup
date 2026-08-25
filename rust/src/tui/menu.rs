@@ -55,6 +55,7 @@ const FIELDS: [&str; 8] = [
 /// entries are the flags the form has no business carrying — the ones that
 /// decide what happens to the scan rather than what the scan is, and which
 /// M5_1-MENU.md keeps off the form because it runs before any scan exists.
+#[cfg(test)]
 const MENU_EXPOSURE: [(&str, bool); 17] = [
     ("--min-size", true),
     ("--ext", true),
