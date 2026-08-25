@@ -26,9 +26,17 @@ use std::io::{self, Write};
 use crate::cli::{flag_named, Flag, Takes};
 
 /// The flags the form offers, in the order it shows them. Which flags belong
-/// here is M5_1-MENU.md's list; what each of them means, what it defaults to
-/// and whether it takes a value all come from the flag table.
-const FIELDS: [&str; 7] = [
+/// here is M5_1-MENU.md's list plus M8-LIVE.md's `--force`; what each of them
+/// means, what it defaults to and whether it takes a value all come from the
+/// flag table.
+///
+/// This list is hand-kept, and that is the drift surface: `--help` is
+/// generated from `FLAGS` and so cannot fall behind it, but nothing generates
+/// the form. A flag added to the table and forgotten here is simply invisible
+/// to anyone who uses the menu — safe, but not what was intended. So the list
+/// is guarded from the other side as well: `EXPECTED_FIELDS` below names every
+/// flag the form is MEANT to carry, and a test fails if the two disagree.
+const FIELDS: [&str; 8] = [
     "--min-size",
     "--ext",
     "--skip-ext",
@@ -36,6 +44,38 @@ const FIELDS: [&str; 7] = [
     "--jobs",
     "--profile",
     "--no-cache",
+    "--force",
+];
+
+/// Every flag in the table, and whether the form is meant to offer it.
+///
+/// Deliberately exhaustive rather than a filter: adding a flag to `FLAGS`
+/// without deciding, here, in writing, whether a person editing the form
+/// should see it now fails a test instead of passing unnoticed. The `false`
+/// entries are the flags the form has no business carrying — the ones that
+/// decide what happens to the scan rather than what the scan is, and which
+/// M5_1-MENU.md keeps off the form because it runs before any scan exists.
+const MENU_EXPOSURE: [(&str, bool); 17] = [
+    ("--min-size", true),
+    ("--ext", true),
+    ("--skip-ext", true),
+    ("--exclude", true),
+    ("--jobs", true),
+    ("--profile", true),
+    ("--no-cache", true),
+    ("--force", true),
+    // Below: what to DO about what is found, or how to report it. The form is
+    // the front door to the browser, so a form offering `--list` or `--auto`
+    // would be offering to close the door it just opened.
+    ("--list", false),
+    ("--interactive", false),
+    ("--auto", false),
+    ("--yes", false),
+    ("--hard", false),
+    ("--report-json", false),
+    ("--stage", false),
+    ("--quiet", false),
+    ("--verify", false),
 ];
 
 /// The narrowest screen the form can be read on: the widest label and value
@@ -521,6 +561,70 @@ mod tests {
         assert_eq!(straight.profile, through.profile);
         assert_eq!(straight.jobs, through.jobs);
         assert!(!through.no_cache);
+    }
+
+    #[test]
+    fn every_flag_in_the_table_has_been_decided_about_for_the_form() {
+        // The one-table rule covers `--help`, which is generated from `FLAGS`
+        // and so cannot drift from it. The form is NOT generated: its rows are
+        // a hand-kept list, and REVIEW-M5_1 noted that an unexposed flag is
+        // safe but invisible. Nothing failed when a new flag never got a
+        // widget — so `--force` could have been added to the table, inherited
+        // by `--help`, and silently missing from the menu the spec asks to
+        // carry it.
+        //
+        // This is that missing test. It fails in both directions: a flag in
+        // the table with no entry here, and an entry here for a flag the table
+        // has dropped.
+        let table: Vec<&str> = crate::cli::FLAGS.iter().map(|flag| flag.long).collect();
+        for name in &table {
+            assert!(
+                MENU_EXPOSURE.iter().any(|(flag, _)| flag == name),
+                "{name} is in the flag table and nobody has said whether the \
+                 form should offer it — add it to MENU_EXPOSURE"
+            );
+        }
+        for (name, _) in MENU_EXPOSURE {
+            assert!(
+                table.contains(&name),
+                "MENU_EXPOSURE names {name}, which the flag table does not have"
+            );
+        }
+
+        // ...and the form really carries exactly what was decided.
+        for (name, offered) in MENU_EXPOSURE {
+            assert_eq!(
+                FIELDS.contains(&name),
+                offered,
+                "the form and MENU_EXPOSURE disagree about {name}"
+            );
+        }
+        assert_eq!(
+            FIELDS.len(),
+            MENU_EXPOSURE.iter().filter(|(_, offered)| *offered).count()
+        );
+    }
+
+    #[test]
+    fn the_form_offers_force_and_it_reaches_the_options() {
+        // M8-LIVE.md puts `--force` in the menu as well as in `--help`.
+        let mut form = form(&["/tmp/tree"]);
+        let row = row_of(&form, "--force");
+        assert!(!form.rows[row].on, "force was on before anybody asked");
+        assert!(!options(&form.to_arguments()).force);
+
+        form.cursor = row;
+        assert_eq!(form.rows[form.cursor].shown().0, "off");
+        form.on_key(Key::Edit);
+        assert_eq!(form.rows[form.cursor].shown().0, "on");
+        let chosen = options(&form.to_arguments());
+        assert!(chosen.force, "the form's force did not reach the options");
+        // ...and it is not the same setting as --no-cache, which is the whole
+        // point of there being two flags.
+        assert!(
+            !chosen.no_cache,
+            "turning force on turned the cache off as well"
+        );
     }
 
     #[test]

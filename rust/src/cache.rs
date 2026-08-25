@@ -100,6 +100,13 @@ pub struct ScanCache {
     /// When the last flush happened. What makes a killed scan's cache worth
     /// having: see `ScanCache::settle`.
     flushed: std::time::Instant,
+    /// Whether anything remembered may be believed this run.
+    ///
+    /// `--force` turns this off. Writing is unaffected: the point of the flag
+    /// is to re-read a tree and REPLACE what is remembered about it, which is
+    /// what makes it different from `--no-cache` — that one neither reads nor
+    /// writes, and leaves whatever was there alone.
+    reads: bool,
 }
 
 /// Where the per-volume databases live.
@@ -130,6 +137,15 @@ impl ScanCache {
             cached_at: now_seconds(),
             warned: false,
             flushed: std::time::Instant::now(),
+            reads: true,
+        }
+    }
+
+    /// A cache that answers nothing and records everything — `--force`.
+    pub fn forced() -> Self {
+        ScanCache {
+            reads: false,
+            ..ScanCache::new()
         }
     }
 
@@ -201,6 +217,12 @@ impl ScanCache {
 
     /// The remembered digest for this file, or None if there is not one.
     pub fn get(&mut self, record: &FileRec, field: Field) -> Option<Digest> {
+        if !self.reads {
+            // `--force`: nothing remembered is believed, so every stage reads
+            // its bytes and every digest it computes is written fresh over
+            // whatever was there.
+            return None;
+        }
         let volume = self.volumes.get_mut(&record.dev)?;
         let row = volume.rows.get(&record.ino)?;
         if row.size != record.size || row.mtime_ns != record.mtime_ns {
@@ -517,6 +539,7 @@ mod tests {
             cached_at,
             warned: false,
             flushed: std::time::Instant::now(),
+            reads: true,
         };
         cache.volumes.insert(1, Volume::default());
         cache

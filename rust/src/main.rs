@@ -182,7 +182,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // Started rather than answered: what kind of disk this is takes a
     // subprocess to find out, and nothing needs it until the pools are sized.
     let mut probe = VolumeProbe::start(&root, options.jobs);
-    let mut cache = (!options.no_cache && options.stage != "size").then(ScanCache::new);
+    let mut cache = (!options.no_cache && options.stage != "size").then(|| {
+        if options.force {
+            ScanCache::forced()
+        } else {
+            ScanCache::new()
+        }
+    });
     let mut scan = if options.stage == "size" {
         size_stage(&root, filters, &pulse)
     } else {
@@ -288,7 +294,13 @@ fn live_scan(
     // display, so nothing may write to stderr behind the alternate screen.
     let (pulse, seen) = Pulse::live(effort);
     let mut probe = VolumeProbe::start(root, options.jobs);
-    let mut cache = (!options.no_cache).then(ScanCache::new);
+    let mut cache = (!options.no_cache).then(|| {
+        if options.force {
+            ScanCache::forced()
+        } else {
+            ScanCache::new()
+        }
+    });
 
     let code = std::thread::scope(|scope| {
         // The borrows the scan needs are taken here and MOVED into it, rather
