@@ -2506,3 +2506,243 @@ re-synced the claim, which is REVIEW-M5_2's note 1 happening to me while I was
 writing about REVIEW-M5_2's note 1. It reports four unbacked blocks in older
 claims, which are other milestones' and left alone. `m7_gate.sh` now diffs its
 two `/Volumes` listings instead of narrating them.
+
+## 2026-08-24 — M8, the live scan
+
+Four things at once, and the risk in all of them is the same: this program
+deletes files, and everything M8 adds sits between the user and that.
+
+### The design fork the spec left open, and why apply pauses the scan
+
+M8-LIVE.md: "The apply flow may run while the walk/stages continue or pause
+them — builder's design call, stated in LOG.md with one reason."
+
+**It pauses.** The reason: the records the proof reads and the deletion walks
+are the scan's own, and a stage mutates them — `release` drops retained bytes,
+a split rewrites bucket membership. Letting a deletion walk that while a stage
+rewrites it is a data race the type system would have to be talked out of, and
+the only thing gained would be a second reader on a platter M7 spent a whole
+milestone giving one queue. The user is answering a confirmation dialog they
+just typed `y` into; there is nothing on screen a paused scan makes worse.
+
+So requests are served at STAGE BOUNDARIES, where nothing is half-decided: no
+group's class is part-way through being settled, and no pivot cursor can be
+perturbed by a pause. Between boundaries the scan checks one atomic for
+cancellation and nothing else.
+
+### The thing that made this small enough to build safely
+
+Stage 5 is deferred on the live path, which the spec asks for — and the
+consequence is that the live browser NEVER RUNS THE PIVOT SWEEP while anybody
+is browsing. Every hazard I was warned about downstream of that (a paused
+sweep's absolute running offset, `abandoned()`'s unsettled classes, the
+group-wide descriptor table compounding against `ulimit`) is a hazard about a
+sweep that is not running. That is not luck; it is the reason the spec's own
+structure works.
+
+The second economy: a streamed group is exactly `attested` — "matched without
+reading the bytes this scan" — which is a flag that already existed, already
+meant precisely that, and was already the flag `run_selected` keys on when it
+sends a group through `verify_attested` before removing anything from it. The
+deferral reuses the guard rather than introducing a second, weaker one.
+
+### `ProvenGroups` did not have to move, and did not
+
+The live path has no `Scan` while the scan is running, and `ProvenGroups` can
+only be minted by `Scan::proven`. The temptation was a constructor. Instead
+the scan thread LENDS its records to a real `Scan` for the length of a request
+and takes them back after — a pointer swap, not a copy — so the token is
+minted exactly the way `--auto` mints one and `run_selected` cannot tell the
+two apart. `proven: true` on that lent scan is honest for the same reason it
+is honest for a scan full of cache attestations: every group it carries has
+either been compared this scan or is flagged `attested`, and an attested group
+is read whole before anything of it is deleted.
+
+### Where the fence is enforced, and why it is there and not in a comment
+
+`live_wanted` refuses the live path to any run carrying `--report-json`. That
+is M8-LIVE.md's fence read literally, and it has a second effect worth more
+than the first: the conformance harness passes `--report-json` on every
+invocation, so no gate can reach the streaming browser even if one were
+somehow run on a terminal. The gate grades the frozen pipeline because it
+cannot do anything else.
+
+### Two flush triggers, because one of each is wrong
+
+The cache commits after `FLUSH_EVERY` seconds OR `FLUSH_ROWS` rows owed. The
+clock alone throws away everything a fast scan learned before its first tick —
+the first draft of the kill/resume evidence showed exactly that, a fifty-file
+corpus finishing in 0.2 seconds with nothing ever committed. The row count
+alone never fires on a small tree that runs for an hour. Together they bound
+what a kill costs by time and by work, and a scenario small enough to be
+scored by RBENCH trips neither and commits once, at the end, as it always did.
+
+### What the tests caught that I had not thought about
+
+Two real defects, both found by driving a real terminal rather than by
+reasoning:
+
+* `Pulse::stage` paints a frame itself at every stage boundary, outside the
+  ticker. "No ticker" was therefore not enough to keep stderr clear in live
+  mode, and the boundary frames were landing on top of the browser's alternate
+  screen — the exact fight M5.2 ended. `paints` now says whether anything may
+  be written at all.
+* A list emptied by a failed proof lost its own explanation: `view::draw`
+  returns early on an empty list, before the flash row. The user marked
+  copies, confirmed, and was told "No duplicates left" with nothing said about
+  the refusal. A deletion tool that goes quiet at the moment it declined to
+  delete something is lying by omission.
+
+### And four tests that were passing while testing nothing
+
+Recorded because the pattern is the point, not the instances:
+
+* The first mark-keying test put its mark on the group at position 0, where a
+  position and an id are the same number. The mis-keying it existed to catch
+  was invisible; a mutant survived it. It marks a group at position 1 now.
+* Three pty cases sent their first key at the first alternate screen they saw
+  — which is the pre-flight MENU. One of them reported that quitting mid-scan
+  restored the terminal, for a scan that had never started.
+* The death tests asked "is the scan still running" of the whole transcript,
+  which holds every frame since the browser opened. Once a stage label had
+  appeared once the answer was yes for ever, including for scenarios whose
+  scan had finished a second earlier. They ask a recent window now, and a
+  six-file corpus makes all five fail, which is what makes the passing run
+  mean anything.
+* The kill/resume script killed at half the cold wall time; the cold wall time
+  was 0.2 seconds, and every case silently reported the scan had already
+  finished. It kills on evidence of a commit now.
+
+**The rule, again:** a test that cannot fail is not evidence. Every guard in
+this milestone was mutated before it was believed.
+
+### Defects found and not fixed
+
+* SIGHUP and SIGTERM kill without unwinding, so neither the drop guard nor the
+  panic hook runs and the terminal is left raw. `m5_2_signals.py` already
+  records this as "browser/signal ... TERMINAL WRECKED ... M5's, reported not
+  fixed". `m8_live_death.py` prints it per scenario and does not grade it.
+* The menu's rows are a hand-kept list and nothing generated them, so a flag
+  added to `FLAGS` could reach `--help` and never reach the form. That one I
+  did close, because the spec asks for `--force` in the menu and a demand
+  without a guard is a demand that expires: `MENU_EXPOSURE` names every flag
+  and says whether the form should offer it.
+* A long stage 5 cannot flush mid-way — the learned digests are handed back
+  after `compare_stage` returns, so a scan killed deep inside one comparison
+  loses that comparison. The narrowing stages and the small-file stage all
+  commit as they go. Not fixed: it needs the cache threaded into the compare
+  pool, which is a change to the code M7 just finished measuring.
+
+## 2026-08-25 — REVIEW-M8, the fix round
+
+Four binding items, no design objections. Every call the claim flagged was
+ratified. What follows is what the four were really about.
+
+### The one that could have deleted the wrong file
+
+Item 1(a). `serve`'s `Refused` arm was the only answer that republished a list
+without clearing the marks against it. Every other answer goes through
+`absorb`, whose comment already states the rule — "forget every mark, including
+the ones a refused group still holds" — and `absorb_found` pruned by group id
+only, on the reasoning that "a mark on a group that is gone is not a mark on
+anything". True, and not the case that bit: a resplit group is not *gone*, it
+is *smaller*. `selection()` then indexed `members[3]` of a two-member group.
+
+The reviewer offered two fixes and I took neither literally. Clearing on the
+`Refused` path fixes the instance; pruning by member position fixes the range
+error but not the real one. A rebuilt list only ever arrives after a proof or a
+deletion, and **both rewrite membership** — a group that failed its proof comes
+back as its first byte-equality class, so position 1 of the rebuilt group need
+not be the record the user marked at position 1. A mark pruned only for range
+would be in range and name a different file. That is keying marks by screen
+position again, wearing a different hat, on the path where being wrong deletes
+something nobody chose.
+
+So every mark goes whenever the scan rebuilds the list, in `absorb_found`,
+which is the one place a rebuilt list arrives. Not at the call site: the next
+republishing path would have to remember, and this one did not.
+
+**The rule:** when a guard is stated in a comment on one method, put it where
+every path must pass through it, not where the paths that currently exist
+happen to go.
+
+### A panic that was a hang
+
+Item 1(b). `live_scan` called `watch.cancel()` after `tui::run_live` returned,
+so a panic on the browser thread skipped it and unwound into a `thread::scope`
+join whose scan thread was looping `while !live.cancelled()`. The scan spun on,
+the join never finished, the panic was never resumed. The panic hook restored
+the terminal, so the user got a working shell and a process that would not die.
+
+The fix is the guard the scan thread already had — `Live::leaving` — mirrored
+onto the browser side as `Watch::stopping`. What is worth writing down is that
+I had written the scan-side guard *for exactly this reason* and did not think
+to ask whether the other end needed one. A symmetric mechanism with one guard
+is a mechanism with a hole.
+
+### Two tests that did not exist, and why they should have
+
+Items 2 and 3 are the same lesson from two directions: **a guard is only as
+good as the suite that can fail because of it.**
+
+`prove_marked`'s `whole` decides whether a candidate may be deleted from.
+Inverting it either way left all 250 tests green; only the pty battery noticed.
+The pty battery is real and it does bite — the reviewer proved that
+independently — but it is not what someone editing `pipeline.rs` runs. Three
+terminal-free tests now fail on each inversion.
+
+`live_wanted` is where the claim says the absolute fence "is enforced in code
+rather than promised in a comment". It was — and two of its four clauses were
+reachable by no test at any level, because every freeze case is
+non-interactive and `has_terminal()` short-circuits first. I had built an
+84-case gate, falsified it, and then put half the guard it was supposed to
+protect behind a condition the gate can never satisfy. Splitting `live_flags`
+out makes the flag half decidable without a terminal, and `m8_fence_clauses.py`
+deletes each clause in turn and requires a failure.
+
+**The rule:** when a guard sits behind a short-circuit, ask which half of it
+the tests can actually reach. "The gate is green" is not the same claim as
+"the gate covers this line".
+
+### Where the deletion-honesty guard actually lives
+
+Non-binding note 1, and worth its own heading because the next person will
+want it. The end-to-end proof that a failed candidate loses nothing lives in
+`m8_live_end_to_end.py`, on a pty, in the case named `a failed proof deletes
+nothing` — not in `cargo test`. Item 2 added terminal-free guards on
+`prove_marked`'s verdict, and those are the ones an editor of `pipeline.rs`
+will trip; but the whole path from a keystroke through the proof to what is
+left on disk is only ever exercised by the pty battery. A green `cargo test`
+does not cover it. M5.2 learned the same thing about `pulse-is-never-off`, and
+writing it down is what made it cheap the second time.
+
+### A comment that promised promptness the code does not have
+
+Non-binding note 3. `live.rs` said `cancel` was read "in the scan's innermost
+per-file loop" and `taken_ask` "between files in a reading stage". Neither was
+ever true — both are polled at the four stage boundaries and in the serving
+loop, which is a consequence of the apply-pauses-scan design and correct. The
+harm was not in the code but in what a reader would conclude from it: that
+cancellation is prompt on a tree of any size. The reviewer measured 0.21s on
+3 GiB. On a tree far larger than that it will not be, and the comment now says
+where the poll really is so the next person can judge for themselves.
+
+### And a comment that was simply wrong
+
+Item 4. `main.rs` said "`--list` and `--auto` are already excluded by
+`browsing_flags`". `--auto` is; `--list` is excluded only when `--interactive`
+is absent, because the expression is `auto.is_none() && (interactive || !list)`.
+`--list --interactive` on a terminal is an interactive run and takes the live
+path — which is what `-i` has always meant, and what `main` already did with
+it. The behaviour is right and stays; the comment claimed a guard the code does
+not have, on the one subject the milestone called absolute. Corrected, measured
+in `m8_tty_matrix.py`, and recorded in the claim.
+
+### Dead state
+
+Non-binding note 2. `Watch::fresh` carried a `taken` cursor and a comment about
+slots that stay behind. Neither was real: `groups` is a plain `Vec<Group>`,
+`drain` empties it, `taken` was permanently zero and the `.min()` guarding it
+was dead. The behaviour was correct and the description was not, which is the
+worse of the two ways to be wrong — a reader trusts the comment. Dropped rather
+than implemented, as the reviewer preferred.

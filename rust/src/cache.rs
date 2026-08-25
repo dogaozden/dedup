@@ -31,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 
-use crate::consts::{CACHE_SCHEMA, CACHE_TICK_NS, CACHE_TTL_DAYS};
+use crate::consts::{CACHE_SCHEMA, CACHE_TICK_NS, CACHE_TTL_DAYS, FLUSH_EVERY, FLUSH_ROWS};
 use crate::device::volume_uuid;
 use crate::ordered::Ordered;
 use crate::stages::Digest;
@@ -78,8 +78,15 @@ struct Volume {
     /// Inodes whose row changed, and inodes this scan recognised. Both are
     /// written back: a tree nobody edits would otherwise age out of its own
     /// cache and pay for a cold scan it never earned.
+    ///
+    /// Both are cleared by a flush, because a flush has written them. A row
+    /// changed again afterwards puts its inode straight back.
     touched: HashSet<u64>,
     seen: HashSet<u64>,
+    /// Held open across the scan so a flush is a transaction rather than an
+    /// open, a transaction and a close. `None` when the database could not be
+    /// opened at all, which is a slow scan and not a failed one.
+    connection: Option<Connection>,
 }
 
 pub struct ScanCache {
@@ -90,6 +97,16 @@ pub struct ScanCache {
     /// tick could have changed behind the read.
     cached_at: i64,
     warned: bool,
+    /// When the last flush happened. What makes a killed scan's cache worth
+    /// having: see `ScanCache::settle`.
+    flushed: std::time::Instant,
+    /// Whether anything remembered may be believed this run.
+    ///
+    /// `--force` turns this off. Writing is unaffected: the point of the flag
+    /// is to re-read a tree and REPLACE what is remembered about it, which is
+    /// what makes it different from `--no-cache` — that one neither reads nor
+    /// writes, and leaves whatever was there alone.
+    reads: bool,
 }
 
 /// Where the per-volume databases live.
@@ -119,6 +136,16 @@ impl ScanCache {
             volumes: HashMap::new(),
             cached_at: now_seconds(),
             warned: false,
+            flushed: std::time::Instant::now(),
+            reads: true,
+        }
+    }
+
+    /// A cache that answers nothing and records everything — `--force`.
+    pub fn forced() -> Self {
+        ScanCache {
+            reads: false,
+            ..ScanCache::new()
         }
     }
 
@@ -159,18 +186,30 @@ impl ScanCache {
         let database = self.directory.join(format!("{name}.db"));
         match std::fs::create_dir_all(&self.directory)
             .map_err(|e| e.to_string())
-            .and_then(|()| {
-                read_rows(&database)
-                    .map(|rows| volume.rows = rows)
+            .and_then(|()| open_database(&database).map_err(|e| e.to_string()))
+            .and_then(|connection| {
+                read_rows(&connection)
+                    .map(|rows| {
+                        volume.rows = rows;
+                        connection
+                    })
                     .map_err(|e| e.to_string())
             }) {
-            Ok(()) => volume.database = Some(database),
+            Ok(connection) => {
+                volume.database = Some(database);
+                volume.connection = Some(connection);
+            }
             Err(error) => {
                 self.warn(&format!("the scan cache could not be read ({error})"));
                 volume.rows.clear();
                 // A file sqlite cannot make sense of is not worth repairing.
-                // Clear the way so close() can lay down a fresh one instead.
-                volume.database = std::fs::remove_file(&database).ok().map(|()| database);
+                // Clear the way for a fresh one instead.
+                if std::fs::remove_file(&database).is_ok() {
+                    if let Ok(connection) = open_database(&database) {
+                        volume.database = Some(database);
+                        volume.connection = Some(connection);
+                    }
+                }
             }
         }
         self.volumes.insert(dev, volume);
@@ -178,6 +217,12 @@ impl ScanCache {
 
     /// The remembered digest for this file, or None if there is not one.
     pub fn get(&mut self, record: &FileRec, field: Field) -> Option<Digest> {
+        if !self.reads {
+            // `--force`: nothing remembered is believed, so every stage reads
+            // its bytes and every digest it computes is written fresh over
+            // whatever was there.
+            return None;
+        }
         let volume = self.volumes.get_mut(&record.dev)?;
         let row = volume.rows.get(&record.ino)?;
         if row.size != record.size || row.mtime_ns != record.mtime_ns {
@@ -273,17 +318,81 @@ impl ScanCache {
         (pending, matched)
     }
 
-    /// Write back what changed and drop what has not been seen in months.
-    pub fn close(&mut self) {
+    /// Commit what has been learned since the last time, if it has been long
+    /// enough to be worth a transaction.
+    ///
+    /// This is what M8-LIVE.md means by "persisted AS THEY ARE LEARNED".
+    /// Before it, everything a scan learned lived in a `HashMap` until
+    /// `close`, so a scan killed at ninety per cent left a cache holding
+    /// nothing and the next run paid for the whole tree again.
+    ///
+    /// Timed rather than counted, because the cost has to fall on the runs
+    /// that can afford it. Every conformance corpus and every bench scenario
+    /// finishes inside one interval and so pays for exactly zero extra
+    /// transactions; an hour-long scan of a real disk pays one every few
+    /// seconds, which is nothing beside what it is doing anyway, and bounds
+    /// what a kill can throw away to that same few seconds.
+    ///
+    /// A torn write is impossible by construction rather than by care: the
+    /// rows go down inside one sqlite transaction on a WAL database, so a
+    /// process that dies mid-flush leaves the last committed state and never
+    /// a half-written one.
+    pub fn settle(&mut self) {
+        if self.flushed.elapsed() < FLUSH_EVERY && self.owed() < FLUSH_ROWS {
+            return;
+        }
+        self.flush();
+    }
+
+    /// How many rows are waiting to be written.
+    fn owed(&self) -> usize {
+        self.volumes
+            .values()
+            .map(|volume| volume.touched.len() + volume.seen.len())
+            .sum()
+    }
+
+    /// Commit what has been learned, whatever the clock says.
+    fn flush(&mut self) {
         let now = now_seconds();
-        let cutoff = now - CACHE_TTL_DAYS * 86_400;
         let mut failure = None;
-        for volume in self.volumes.values() {
-            let Some(database) = &volume.database else {
+        for volume in self.volumes.values_mut() {
+            if volume.touched.is_empty() && volume.seen.is_empty() {
+                continue;
+            }
+            let Some(connection) = volume.connection.take() else {
                 continue;
             };
             let writing: Vec<u64> = volume.touched.union(&volume.seen).copied().collect();
-            if let Err(error) = write_rows(database, volume, &writing, now, cutoff) {
+            match write_rows(&connection, volume, &writing, now) {
+                Ok(()) => {
+                    // Written, so not owed any more. Anything changed after
+                    // this puts its inode straight back.
+                    volume.touched.clear();
+                    volume.seen.clear();
+                }
+                Err(error) => failure = Some(error.to_string()),
+            }
+            volume.connection = Some(connection);
+        }
+        self.flushed = std::time::Instant::now();
+        if let Some(error) = failure {
+            self.warn(&format!("the scan cache could not be written ({error})"));
+        }
+    }
+
+    /// Write back what changed and drop what has not been seen in months.
+    pub fn close(&mut self) {
+        self.flush();
+        let cutoff = now_seconds() - CACHE_TTL_DAYS * 86_400;
+        let mut failure = None;
+        for volume in self.volumes.values() {
+            let Some(connection) = &volume.connection else {
+                continue;
+            };
+            if let Err(error) =
+                connection.execute("DELETE FROM files WHERE last_seen < ?1", [cutoff])
+            {
                 failure = Some(error.to_string());
             }
         }
@@ -305,17 +414,36 @@ fn prepare(connection: &Connection) -> rusqlite::Result<()> {
     ))
 }
 
-fn read_rows(database: &Path) -> rusqlite::Result<HashMap<u64, Row>> {
+/// Open one volume's database in WAL, which is what makes a killed scan's
+/// cache safe to reuse.
+///
+/// Write-ahead logging is the whole durability story: a committed transaction
+/// is in the log before it is anywhere else, and a process that dies at any
+/// instant leaves either the last committed state or a log the next opener
+/// replays. There is no window in which the file is half a row.
+fn open_database(database: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open(database)?;
+    // `query_row` rather than `execute`: the pragma answers with the mode it
+    // settled on, and sqlite refuses to run it as a statement with no result.
+    let _: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    // Enough to guarantee a committed transaction survives the process dying,
+    // which is the failure this milestone is about; a machine losing power
+    // mid-flush can still lose the last commit, and that is the ordinary
+    // sqlite bargain rather than something this cache can improve on.
+    connection.execute_batch("PRAGMA synchronous=NORMAL")?;
+    Ok(connection)
+}
+
+fn read_rows(connection: &Connection) -> rusqlite::Result<HashMap<u64, Row>> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CACHE_SCHEMA {
         // Another version's columns do not mean what this one thinks they
         // mean. Start over rather than interpret them.
         connection.execute_batch("DROP TABLE IF EXISTS files")?;
-        prepare(&connection)?;
+        prepare(connection)?;
         return Ok(HashMap::new());
     }
-    prepare(&connection)?;
+    prepare(connection)?;
     let mut statement = connection.prepare(&format!(
         "SELECT ino, size, mtime_ns, {}, cached_at FROM files",
         COLUMNS.join(", ")
@@ -348,16 +476,14 @@ fn read_rows(database: &Path) -> rusqlite::Result<HashMap<u64, Row>> {
     Ok(rows)
 }
 
+/// Commit one volume's outstanding rows, as one transaction.
 fn write_rows(
-    database: &Path,
+    connection: &Connection,
     volume: &Volume,
     writing: &[u64],
     now: i64,
-    cutoff: i64,
 ) -> rusqlite::Result<()> {
-    let mut connection = Connection::open(database)?;
-    prepare(&connection)?;
-    let transaction = connection.transaction()?;
+    let transaction = connection.unchecked_transaction()?;
     {
         let mut insert = transaction.prepare(&format!(
             "INSERT OR REPLACE INTO files (ino, size, mtime_ns, {}, cached_at, last_seen)
@@ -386,7 +512,6 @@ fn write_rows(
                 }
             }
         }
-        transaction.execute("DELETE FROM files WHERE last_seen < ?1", [cutoff])?;
     }
     transaction.commit()
 }
@@ -413,6 +538,8 @@ mod tests {
             volumes: HashMap::new(),
             cached_at,
             warned: false,
+            flushed: std::time::Instant::now(),
+            reads: true,
         };
         cache.volumes.insert(1, Volume::default());
         cache

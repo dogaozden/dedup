@@ -1,0 +1,14 @@
+$ python3 rust/evidence/scripts/m8_tty_matrix.py rust/target/release/dedup-rs /tmp/m8-tty
+
+case                         exit   alt  candidate   report   verdict
+bare interactive                0     2       True    False   as the fence requires
+--list                          0     0      False    False   as the fence requires
+--list --interactive            0     2       True    False   as the fence requires
+--report-json                   0     2      False     True   as the fence requires
+--stage size                    2     1      False    False   as the fence requires
+--auto shortest --yes           0     0      False    False   as the fence requires
+
+pass  --list, --auto, --report-json and --stage size stay on the frozen path on a terminal;
+      --list --interactive is an interactive run and takes the live path, as -i has always meant.
+
+   exit 0

@@ -700,6 +700,7 @@ mod selection {
                 None,
                 wanted,
                 &crate::pulse::Pulse::off(),
+                None,
             )
         }
 

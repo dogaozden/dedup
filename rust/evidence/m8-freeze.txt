@@ -1,0 +1,27 @@
+$ git rev-parse HEAD   (the branch under test)
+68ab101f739aa414b88a30610d5406b128a678f1
+
+$ git rev-parse a362ffa   (the base it must match)
+a362ffa17af7da4d063b6dc68c0ff4c84089ee4f
+
+$ rm -rf /tmp/m8-freeze-base-checkout && git archive a362ffa | tar -x -C /tmp/m8-freeze-base-checkout
+$ (cd /tmp/m8-freeze-base-checkout/rust && cargo build --release)
+    Finished `release` profile [optimized] target(s) in 1m 26s
+
+$ cargo build --release   (the branch)
+    Finished `release` profile [optimized] target(s) in 0.21s
+
+$ m8_freeze.py capture /tmp/m8-freeze-base-checkout/rust/target/release/dedup-rs /tmp/m8-freeze-cap-base
+captured 84 cases from /tmp/m8-freeze-base-checkout/rust/target/release/dedup-rs
+  -> /tmp/m8-freeze-cap-base/capture.json
+
+$ m8_freeze.py capture rust/target/release/dedup-rs /tmp/m8-freeze-cap-ours
+captured 84 cases from /Users/dogaozden/AI_Projects/dedup-m8/rust/target/release/dedup-rs
+  -> /tmp/m8-freeze-cap-ours/capture.json
+
+$ m8_freeze.py compare /tmp/m8-freeze-cap-base /tmp/m8-freeze-cap-ours
+
+84 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+
+the fence held

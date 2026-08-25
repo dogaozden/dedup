@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::effort::Effort;
 use crate::size::{human_count, human_size};
+use crate::tui::model::Progress;
 
 /// The longest the line may go without being repainted, and the shortest it
 /// may go between two repaints.
@@ -76,15 +77,102 @@ struct Live {
     shared: Arc<Shared>,
     effort: Arc<Effort>,
     ticker: Option<JoinHandle<()>>,
+    /// Whether anything may be written to stderr.
+    ///
+    /// Not the same question as "is there a ticker": `stage` paints one frame
+    /// itself at every boundary, outside the ticker, so a stage that finishes
+    /// inside a single beat is still seen. In live mode that frame would land
+    /// on top of the browser's alternate screen — which is exactly the fight
+    /// M5.2 ended by clearing the line before the browser opened. Caught by
+    /// `m8_live_end_to_end.py`, which found the boundary frames on screen
+    /// behind the browser.
+    paints: bool,
 }
 
 /// The scan's handle on the progress line. `Pulse::off()` is a handle on
 /// nothing, and every method on it is a branch that falls straight through.
 pub struct Pulse(Option<Live>);
 
+/// A read-only handle on the very counters the ticker paints from.
+///
+/// M8-LIVE.md: in live mode the browser IS the progress display, drawing
+/// "from the same shared state the pulse reads". This is that state, and
+/// reading it is a lock, five loads and an unlock — no thread, no syscall, and
+/// above all no disk, because a progress bar that cost a read would be a
+/// second reader on a platter M7 spent a milestone giving one queue.
+pub struct View {
+    shared: Arc<Shared>,
+    effort: Arc<Effort>,
+}
+
+impl View {
+    /// What the scan is doing right now, or `None` before it has begun.
+    pub fn read(&self) -> Option<Progress> {
+        let stage = self.shared.stage();
+        if stage.label.is_empty() {
+            return None;
+        }
+        let done = self.shared.files.load(Ordering::Relaxed);
+        let elapsed = stage.started.elapsed();
+        let (total, bytes) = if stage.label == SCANNING {
+            (0, self.shared.bytes.load(Ordering::Relaxed))
+        } else {
+            (
+                stage.total,
+                self.effort
+                    .bytes_read()
+                    .saturating_sub(stage.bytes_at_start),
+            )
+        };
+        Some(Progress {
+            label: stage.label,
+            done,
+            total,
+            bytes,
+            rate: (bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64,
+        })
+    }
+}
+
 impl Pulse {
     pub fn off() -> Pulse {
         Pulse(None)
+    }
+
+    /// Counters kept, but no ticker and nothing written to stderr.
+    ///
+    /// The browser owns the terminal in live mode; a second painter putting a
+    /// line on stderr would fight the alternate screen for it, which is
+    /// exactly the mess M5.2 finished by clearing the line before the browser
+    /// opened. So the scan keeps feeding the same numbers and the browser
+    /// draws them itself.
+    pub fn live(effort: &Arc<Effort>) -> (Pulse, View) {
+        let shared = Arc::new(Shared {
+            files: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            stage: Mutex::new(Stage {
+                label: "",
+                total: 0,
+                started: Instant::now(),
+                bytes_at_start: 0,
+            }),
+            stop: AtomicBool::new(false),
+        });
+        let view = View {
+            shared: Arc::clone(&shared),
+            effort: Arc::clone(effort),
+        };
+        (
+            Pulse(Some(Live {
+                shared,
+                effort: Arc::clone(effort),
+                // No thread, and no boundary frames either: the browser is the
+                // progress display, and nothing may reach stderr behind it.
+                ticker: None,
+                paints: false,
+            })),
+            view,
+        )
     }
 
     /// On, if there is a terminal on stderr to paint to and nobody asked for
@@ -125,6 +213,7 @@ impl Pulse {
             shared,
             effort: Arc::clone(effort),
             ticker: Some(ticker),
+            paints: true,
         }))
     }
 
@@ -168,8 +257,11 @@ impl Pulse {
             }
             // One frame at the boundary, outside the lock the painter takes:
             // a stage that finishes inside a single beat — the parallel walk
-            // does, on any tree the page cache holds — is still seen.
-            paint(&live.shared, &live.effort);
+            // does, on any tree the page cache holds — is still seen. Not in
+            // live mode, where stderr is behind the browser's screen.
+            if live.paints {
+                paint(&live.shared, &live.effort);
+            }
         }
     }
 
@@ -277,6 +369,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_live_pulse_keeps_the_counters_and_writes_nothing() {
+        // The browser owns the terminal in live mode. `stage` paints a frame
+        // at every boundary on its own, outside the ticker, so "no ticker" is
+        // not enough on its own to keep stderr clear — that frame landed on
+        // top of the browser's alternate screen until `paints` existed.
+        let effort = Arc::new(Effort::default());
+        let (mut pulse, view) = Pulse::live(&effort);
+        let live = pulse.0.as_ref().expect("live");
+        assert!(!live.paints, "a live pulse would write to stderr");
+        assert!(live.ticker.is_none(), "a live pulse started a painter");
+
+        // ...and it still counts, which is the whole point of it.
+        assert!(
+            view.read().is_none(),
+            "a pulse that has not begun reported a stage"
+        );
+        pulse.stage(SCANNING, 0);
+        pulse.walked(4096);
+        pulse.walked(4096);
+        let seen = view.read().expect("a stage");
+        assert_eq!(seen.label, SCANNING);
+        assert_eq!(seen.done, 2);
+        assert_eq!(seen.bytes, 8192);
+        assert_eq!(seen.total, 0, "the walk has no total to be a fraction of");
+
+        pulse.stage(COMPARE, 10);
+        pulse.files(3);
+        let seen = view.read().expect("a stage");
+        assert_eq!((seen.label, seen.done, seen.total), (COMPARE, 3, 10));
+        // Finishing a live pulse joins nothing and clears nothing.
+        pulse.finish();
+    }
+
+    #[test]
     fn off_is_off() {
         // Nothing to join, nothing to clear, and every counter call a branch
         // that falls through. The whole inertness claim rests on this shape.
@@ -360,6 +486,7 @@ mod tests {
             effort: Arc::clone(&effort),
             // No thread: this is the bookkeeping, not the painting.
             ticker: None,
+            paints: false,
         }));
         pulse.stage(SCANNING, 0);
         pulse.walked(1024);

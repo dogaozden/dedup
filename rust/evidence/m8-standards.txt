@@ -1,0 +1,32 @@
+=== main@a362ffa, for the before-count and the clippy verdict that predates this branch ===
+$ cargo test
+
+test result: ok. 226 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+   exit 0
+
+=== this branch ===
+$ cargo test
+
+test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m8/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.05s
+   exit 0
+
+$ cargo fmt --check
+(no output: clean)
+
+=== the binary the evidence was measured with is the committed source ===
+    Finished `release` profile [optimized] target(s) in 0.16s
+$ shasum -a 256 target/release/dedup-rs
+c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1  target/release/dedup-rs
+$ touch src/compare.rs src/consts.rs && cargo build --release
+    Finished `release` profile [optimized] target(s) in 32.79s
+$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
+c4c73df3d668dc79442c41c50a2281d49da178777f93e720a18b96fe27861ff1  target/release/dedup-rs

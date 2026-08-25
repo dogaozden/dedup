@@ -1,0 +1,19 @@
+$ python3 rust/evidence/scripts/m8_live_death.py rust/target/release/dedup-rs
+
+pass  the terminal closes and there is no SIGHUP to warn anyone
+        exit 1      left in 0.02s  scan still running: True
+pass  the terminal closes and SIGHUP arrives
+        exit -1     left in 0.01s  scan still running: True
+pass  Ctrl+C typed at the live browser
+        exit 0      left in 0.04s  scan still running: True
+        terminal afterwards: intact
+pass  SIGHUP while the browser is up and the scan is running
+        exit -1     left in 0.01s  scan still running: True
+        terminal afterwards: LEFT RAW (canonical=False echo=False)   (M5's, reported not fixed)
+pass  SIGTERM while the browser is up and the scan is running
+        exit -15    left in 0.01s  scan still running: True
+        terminal afterwards: LEFT RAW (canonical=False echo=False)   (M5's, reported not fixed)
+
+5 scenario(s), 0 failed
+
+   exit 0

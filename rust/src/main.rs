@@ -12,6 +12,7 @@ mod consts;
 mod device;
 mod effort;
 mod filters;
+mod live;
 mod ordered;
 mod pipeline;
 mod pulse;
@@ -72,6 +73,41 @@ fn browsing_flags(options: &Options) -> bool {
 /// and is byte-for-byte what it has always been.
 fn menu_wanted(options: &Options) -> bool {
     tui::has_terminal() && browsing_flags(options)
+}
+
+/// Whether the FLAGS on this run ask for the live path, leaving aside whether
+/// there is a terminal to browse in.
+///
+/// Split out of `live_wanted` so it can be decided without a terminal, and so
+/// tested. REVIEW-M8 item 3: every case in the freeze proof is a run with no
+/// terminal, so `has_terminal()` is already false and the clauses behind it are
+/// never evaluated — deleting two of them left `cargo test` at 250 passed and
+/// the freeze proof blind. The milestone whose whole premise is one absolute
+/// fence should not have half of that fence guarded by nothing.
+///
+/// The four exclusions, and what each is for:
+///
+/// * `--auto` is excluded by `browsing_flags`: a run that deletes without
+///   asking has nobody to browse for.
+/// * `--list` is excluded by `browsing_flags` ONLY when `--interactive` is
+///   absent — the expression is `auto.is_none() && (interactive || !list)`.
+///   `--list --interactive` on a terminal is an interactive run and takes the
+///   live path, which is what `-i` has always meant and what `main` already
+///   did with it. See the note in the M8 claim.
+/// * An explicit `--report-json` keeps today's pipeline whatever else is true
+///   of the run. That is the fence read literally, and it has a second effect
+///   worth having: the conformance harness passes `--report-json` on every
+///   invocation, so no gate can reach the live path even if one were somehow
+///   run on a terminal.
+/// * `--stage size` has read nothing, so it has nothing to stream, nothing to
+///   prove and nothing anybody may delete.
+fn live_flags(options: &Options) -> bool {
+    browsing_flags(options) && options.report_json.is_none() && options.stage.is_empty()
+}
+
+/// Whether this run opens the browser before the scan rather than after it.
+fn live_wanted(options: &Options) -> bool {
+    tui::has_terminal() && live_flags(options)
 }
 
 fn print_report(groups: &[Vec<&str>]) {
@@ -148,6 +184,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // writing: the rate on the line is bytes that really moved, not an
     // estimate kept beside them.
     let effort = Arc::new(Effort::default());
+
+    // The live scan: a browser opened before anything has been read, with the
+    // scan behind it. Everything below this point is the path every other run
+    // has always taken, unchanged.
+    if live_wanted(&options) {
+        return live_scan(&options, &root, filters, &effort);
+    }
     // After the menu, which owns the terminal until it hands it back, and
     // before anything is read.
     let mut pulse = Pulse::start(options.quiet, &effort);
@@ -155,7 +198,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // Started rather than answered: what kind of disk this is takes a
     // subprocess to find out, and nothing needs it until the pools are sized.
     let mut probe = VolumeProbe::start(&root, options.jobs);
-    let mut cache = (!options.no_cache && options.stage != "size").then(ScanCache::new);
+    let mut cache = (!options.no_cache && options.stage != "size").then(|| {
+        if options.force {
+            ScanCache::forced()
+        } else {
+            ScanCache::new()
+        }
+    });
     let mut scan = if options.stage == "size" {
         size_stage(&root, filters, &pulse)
     } else {
@@ -167,6 +216,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             cache.as_mut(),
             options.profile,
             &pulse,
+            // Not live: this is the path every non-interactive run takes.
+            None,
         )
     };
     // The line goes before anything else is said, so nothing of it is left in
@@ -236,6 +287,100 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             }
         },
     };
+    if let Some(cache) = cache.as_mut() {
+        cache.close();
+    }
+    Ok(code)
+}
+
+/// The live scan: the browser opens now, the scan runs behind it.
+///
+/// The two threads are scoped rather than detached so every borrow they share
+/// — the root, the filters, the counters, the cache — is checked rather than
+/// cloned. The scan thread owns the records and does all the reading; the
+/// browser thread owns the terminal and does none.
+fn live_scan(
+    options: &Options,
+    root: &std::path::Path,
+    filters: Filters,
+    effort: &Arc<Effort>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let (live, watch) = live::channel(root);
+    // Counters without a painter: in live mode the browser is the progress
+    // display, so nothing may write to stderr behind the alternate screen.
+    let (pulse, seen) = Pulse::live(effort);
+    let mut probe = VolumeProbe::start(root, options.jobs);
+    let mut cache = (!options.no_cache).then(|| {
+        if options.force {
+            ScanCache::forced()
+        } else {
+            ScanCache::new()
+        }
+    });
+
+    let code = std::thread::scope(|scope| {
+        // The borrows the scan needs are taken here and MOVED into it, rather
+        // than being captured by reference. `Live` holds a `RefCell` and so is
+        // deliberately not `Sync`: only one thread may ever publish, and this
+        // is how the compiler is told which one.
+        let probing = &mut probe;
+        let caching = cache.as_mut();
+        let scanning = scope.spawn(move || {
+            // Whatever happens in here — a clean finish, or a panic on the way
+            // through — the browser is released rather than left blocked on a
+            // thread that has stopped running.
+            let _leaving = live.leaving();
+            let mut caching = caching;
+            let mut scan = find_duplicates(
+                root,
+                filters,
+                probing,
+                effort,
+                caching.as_deref_mut(),
+                options.profile,
+                &pulse,
+                Some(&live),
+            );
+            // The list is complete; the progress display goes away. The thread
+            // stays to answer, because a user who waited for the scan to
+            // finish before marking anything is the ordinary case.
+            live.finished();
+            let context = Compare {
+                root,
+                effort,
+                profile: scan.profile,
+                solid: probing.device().all_solid_state(),
+                learn: caching.is_some(),
+            };
+            while !live.cancelled() {
+                if !pipeline::serve(
+                    &live,
+                    &mut scan.records,
+                    &context,
+                    caching.as_deref_mut(),
+                    &mut scan.unreadable,
+                ) {
+                    live.idle(std::time::Duration::from_millis(100));
+                }
+            }
+        });
+        // Whatever the browser does — return, error, or panic on its way out —
+        // the scan is told to stop. It has to be a guard rather than the call
+        // below it: a panic here unwinds straight into this scope's join, and
+        // the scan thread it would be joining is looping on `!cancelled()`.
+        // The plain `watch.cancel()` that used to stand after `run_live` was
+        // skipped by exactly that unwind, and the process hung instead of
+        // dying (REVIEW-M8 item 1).
+        let stopping = watch.stopping();
+        let code = tui::run_live(&watch, &seen, root, options.hard);
+        // ...and on the ordinary path the scan is stopped and joined before
+        // the cache is closed, so a half-written row is impossible: the only
+        // thread that writes rows has stopped running.
+        drop(stopping);
+        let _ = scanning.join();
+        code
+    });
+
     if let Some(cache) = cache.as_mut() {
         cache.close();
     }
@@ -317,6 +462,97 @@ mod tests {
     fn the_default_report_path_is_a_file_not_a_directory() {
         assert!(default_report_path().file_name().is_some());
         assert!(default_report_path().starts_with(Path::new(&std::env::temp_dir())));
+    }
+
+    /// Options as a command line would build them, so a case here is a case
+    /// somebody could type.
+    fn flags(argv: &[&str]) -> Options {
+        let mut given: Vec<String> = vec!["/scratch".to_string()];
+        given.extend(argv.iter().map(|word| word.to_string()));
+        match parse_arguments_from(given.into_iter()).expect("a valid command line") {
+            Parsed::Scan(options) => *options,
+            Parsed::Help => panic!("the fixture asked for help"),
+        }
+    }
+
+    #[test]
+    fn the_fence_decides_the_live_path_by_flags_alone() {
+        // REVIEW-M8 item 3. This is the milestone's one absolute fence, and
+        // until this test existed two of its four clauses were guarded by
+        // nothing at any level: the freeze proof is 84 non-interactive cases,
+        // so `has_terminal()` short-circuits before the flags are ever looked
+        // at, and deleting `report_json.is_none()` and `stage.is_empty()` left
+        // the whole suite green.
+        //
+        // Every clause is pinned by at least one case that flips when it goes.
+        let cases: [(&[&str], bool, &str); 9] = [
+            (&[], true, "a bare interactive run is the live path"),
+            (
+                &["--report-json", "/tmp/r.json"],
+                false,
+                "an explicit --report-json keeps today's pipeline — this is \
+                 the clause every conformance invocation relies on",
+            ),
+            (
+                &["--stage", "size"],
+                false,
+                "--stage size has read nothing, so there is nothing to stream \
+                 and nothing anybody may delete",
+            ),
+            (
+                &["--auto", "shortest"],
+                false,
+                "--auto has nobody to browse for",
+            ),
+            (&["--list"], false, "--list prints and stops"),
+            (
+                &["--list", "--interactive"],
+                true,
+                "-i means browse them, and it has always overruled --list; \
+                 this row is the behaviour REVIEW-M8 item 4 records",
+            ),
+            (&["--interactive"], true, "-i on its own is the live path"),
+            (
+                &["--auto", "shortest", "--interactive"],
+                false,
+                "--auto wins over -i: there is nothing to browse afterwards",
+            ),
+            (
+                &["--quiet", "--hard"],
+                true,
+                "flags that say nothing about browsing do not change the path",
+            ),
+        ];
+        for (argv, wanted, why) in cases {
+            assert_eq!(
+                live_flags(&flags(argv)),
+                wanted,
+                "dedup-rs /scratch {}: {why}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_path_is_the_flags_and_a_terminal_and_nothing_else() {
+        // `live_wanted` may add the terminal to `live_flags` and may not add
+        // anything else — otherwise the test above would be pinning a
+        // different function from the one that decides.
+        for argv in [
+            &[][..],
+            &["--list"],
+            &["--list", "--interactive"],
+            &["--report-json", "/tmp/r.json"],
+            &["--stage", "size"],
+            &["--auto", "shortest"],
+        ] {
+            let options = flags(argv);
+            assert_eq!(
+                live_wanted(&options),
+                tui::has_terminal() && live_flags(&options),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

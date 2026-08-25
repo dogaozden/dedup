@@ -134,20 +134,50 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
         spread(width, 2, vec![Span::styled(summary, bold())], marked),
     );
 
+    // The progress the scan is making, drawn where the gap is once there is a
+    // scan to draw. This is the whole of M8's "the browser draws the scan's
+    // progress itself": the numbers come from `Browser::progress`, which the
+    // loop reads out of the same counters the stderr pulse reads.
+    if let Some(progress) = &browser.progress {
+        line(rows[3], frame, progress_line(width, progress));
+    }
+
     if browser.groups.is_empty() {
+        let (said, how) = if browser.scanning {
+            ("Scanning — nothing found yet.", "q to stop and quit")
+        } else if browser.cancelled {
+            ("Scan stopped.", "q to quit")
+        } else {
+            ("No duplicates left.", "q to quit")
+        };
         line(
             rows[4],
             frame,
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("No duplicates left.", bold()),
-            ]),
+            Line::from(vec![Span::raw("  "), Span::styled(said, bold())]),
         );
         line(
             rows[6],
             frame,
-            Line::from(vec![Span::raw("  "), Span::styled("q to quit", dim())]),
+            Line::from(vec![Span::raw("  "), Span::styled(how, dim())]),
         );
+        // ...and whatever just happened, which is the whole reason the list is
+        // empty. Without this, a group whose proof failed at apply time takes
+        // its own explanation off the screen with it: the user marks copies,
+        // confirms, and is told "No duplicates left" with nothing said about
+        // the refusal. Found by `m8_live_end_to_end.py`.
+        if !browser.flash.is_empty() {
+            line(
+                rows[8],
+                frame,
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        browser.flash.clone(),
+                        Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            );
+        }
         return;
     }
 
@@ -169,14 +199,28 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
                     ),
                     accent(),
                 )],
-                vec![Span::styled(
-                    format!(
-                        "{} × {} copies",
-                        human_size(group.size),
-                        human_count(group.members.len() as u64)
+                vec![
+                    Span::styled(
+                        format!(
+                            "{} × {} copies",
+                            human_size(group.size),
+                            human_count(group.members.len() as u64)
+                        ),
+                        dim(),
                     ),
-                    dim(),
-                )],
+                    // Said plainly, because it is the difference between what
+                    // the tool knows and what it has guessed. A candidate is
+                    // proved before anything of it is deleted, never after.
+                    //
+                    // Only the guess is labelled. A finished scan's groups are
+                    // all proven, and a screen that said so on every row would
+                    // be saying nothing on every row.
+                    if group.proven {
+                        Span::raw("")
+                    } else {
+                        Span::styled("  candidate", Style::default().fg(WARN))
+                    },
+                ],
             ),
         );
         line(rows[5], frame, rule(width));
@@ -221,6 +265,43 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
     }
 }
 
+/// Cells in the progress bar. The stderr pulse draws 24; the browser has a
+/// header to share the row with, so it draws fewer.
+const LIVE_BAR: usize = 16;
+
+/// The scan's progress, in the browser's own row.
+///
+/// The two shapes are the pulse's two shapes, for the same reason: the walk
+/// has no total to be a fraction of, so it says what it has seen, and a
+/// reading stage says how far through it is. Nothing here is estimated — every
+/// number arrives from a counter the scan keeps anyway.
+pub fn progress_line(width: u16, progress: &crate::tui::model::Progress) -> Line<'static> {
+    let body = if progress.total == 0 {
+        format!(
+            "{} files · {}",
+            human_count(progress.done),
+            human_size(progress.bytes)
+        )
+    } else {
+        let done = progress.done.min(progress.total);
+        let percent = done as f64 / progress.total as f64 * 100.0;
+        let filled = (LIVE_BAR as f64 * percent / 100.0) as usize;
+        format!(
+            "{}{} {percent:3.0}%  {}/{} · {}/s",
+            "█".repeat(filled),
+            "░".repeat(LIVE_BAR - filled),
+            human_count(done),
+            human_count(progress.total),
+            human_size(progress.rate)
+        )
+    };
+    let text: String = format!("  {}…  {body}", progress.label)
+        .chars()
+        .take(usize::from(width).saturating_sub(1))
+        .collect();
+    Line::from(vec![Span::styled(text, Style::default().fg(ACCENT))])
+}
+
 /// Exactly what is about to happen, in the words the user needs to judge it:
 /// how many, how much, and whether it can be taken back.
 pub fn confirmation(browser: &Browser) -> Vec<String> {
@@ -236,6 +317,18 @@ pub fn confirmation(browser: &Browser) -> Vec<String> {
         ),
         format!("Reclaims {}", human_size(browser.marked_bytes())),
     ];
+    // What the user is agreeing to pay for. The proof reads every byte of
+    // every candidate group before anything is trashed, and on a big selection
+    // that is the slow part of the whole session — so it is said in the
+    // dialog rather than discovered afterwards.
+    let owed = browser.unproven_marked();
+    if owed > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} group(s) will be read and proved first.",
+            human_count(owed as u64)
+        ));
+    }
     if browser.hard {
         lines.push(String::new());
         lines.push("This cannot be undone.".into());
@@ -430,6 +523,7 @@ mod tests {
                 Group {
                     index: 0,
                     size: 4096,
+                    proven: true,
                     members: vec![
                         member(0, "photos/beach.jpg", true, 0),
                         member(1, "backup/photos/beach.jpg", true, 2),
@@ -439,6 +533,7 @@ mod tests {
                 Group {
                     index: 1,
                     size: 512,
+                    proven: true,
                     members: vec![
                         member(3, "notes.txt", true, 0),
                         member(4, "archive/notes.txt", true, 0),
@@ -631,6 +726,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members,
             }],
             "/scratch".into(),
@@ -664,6 +760,7 @@ mod tests {
             vec![Group {
                 index: 0,
                 size: 100,
+                proven: true,
                 members: vec![member(0, &long, true, 0), member(1, "b.bin", true, 0)],
             }],
             "/scratch".into(),
@@ -692,6 +789,176 @@ mod tests {
         let body = render(&browser, 80, 14).join("\n");
         assert!(body.contains("No duplicates left."), "{body}");
         assert!(body.contains("q to quit"), "{body}");
+    }
+
+    #[test]
+    fn the_live_screen_shows_progress_and_a_partial_list_at_once() {
+        // The screen M8 exists to produce: a scan still running, some of what
+        // it has found already on the list, and the group under the cursor
+        // saying honestly that nothing has compared its bytes.
+        let mut browser = browser();
+        browser.scanning = true;
+        browser.groups[0].proven = false;
+        browser.progress = Some(crate::tui::model::Progress {
+            label: "Sampling",
+            done: 640,
+            total: 1000,
+            bytes: 32 * 1024 * 1024,
+            rate: 8 * 1024 * 1024,
+        });
+        let screen = render(&browser, 80, 16);
+        let body = screen.join("\n");
+
+        // The list is there...
+        assert!(body.contains("2 groups"), "{body}");
+        assert!(body.contains("photos/beach.jpg"), "{body}");
+        // ...the scan is there, on its own row, with real numbers...
+        assert!(body.contains("Sampling…"), "{body}");
+        assert!(body.contains("64%  640/1,000 · 8.0 MiB/s"), "{body}");
+        // ...and the group under the cursor is not pretending to be proven.
+        assert!(body.contains("candidate"), "{body}");
+
+        // The progress row is the one below the summary, and it does not
+        // displace anything: the members are still where they were.
+        assert!(screen[3].contains("Sampling…"), "{:?}", screen[3]);
+        assert!(screen[2].contains("groups"), "{:?}", screen[2]);
+        assert!(screen[6].contains("photos/beach.jpg"), "{:?}", screen[6]);
+
+        // Once the scan stops, the row goes and the list stays.
+        browser.scanning = false;
+        browser.progress = None;
+        let after = render(&browser, 80, 16);
+        assert!(!after.join("\n").contains("Sampling…"), "{after:?}");
+        assert!(after[6].contains("photos/beach.jpg"), "{:?}", after[6]);
+    }
+
+    #[test]
+    fn an_emptied_list_still_says_why_it_emptied() {
+        // The case that matters is a candidate whose proof failed at apply
+        // time: the group leaves the list, and if the screen loses the
+        // explanation with it the user is told "No duplicates left" and
+        // nothing about the refusal. A deletion tool that goes quiet at
+        // exactly the moment it declined to delete something is lying by
+        // omission.
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.flash = "1 group(s) refused — their copies no longer match".into();
+        let body = render(&browser, 80, 14).join("\n");
+        assert!(body.contains("No duplicates left."), "{body}");
+        assert!(
+            body.contains("refused"),
+            "the refusal vanished with the group: {body}"
+        );
+    }
+
+    #[test]
+    fn a_scanning_browser_says_so_rather_than_claiming_there_is_nothing() {
+        // Mid-scan, an empty list means "nothing found YET".
+        let mut browser = Browser::new(Vec::new(), "/scratch".into(), false);
+        browser.scanning = true;
+        browser.progress = Some(crate::tui::model::Progress {
+            label: "Scanning",
+            done: 1234,
+            total: 0,
+            bytes: 5678,
+            rate: 0,
+        });
+        let body = render(&browser, 80, 14).join("\n");
+        assert!(body.contains("Scanning — nothing found yet."), "{body}");
+        assert!(body.contains("q to stop and quit"), "{body}");
+        // ...and the progress it is making is on the screen, from the scan's
+        // own counters.
+        assert!(body.contains("1,234 files"), "{body}");
+    }
+
+    #[test]
+    fn the_progress_row_draws_the_two_shapes_the_pulse_draws() {
+        // The walk has no total to be a fraction of; a reading stage does.
+        let walking = progress_line(
+            80,
+            &crate::tui::model::Progress {
+                label: "Scanning",
+                done: 1000,
+                total: 0,
+                bytes: 4 * 1024 * 1024 * 1024,
+                rate: 0,
+            },
+        );
+        let text: String = walking
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(text.contains("Scanning…"), "{text}");
+        assert!(text.contains("1,000 files · 4.0 GiB"), "{text}");
+
+        let reading = progress_line(
+            80,
+            &crate::tui::model::Progress {
+                label: "Comparing",
+                done: 50,
+                total: 100,
+                bytes: 1024 * 1024,
+                rate: 1024 * 1024,
+            },
+        );
+        let text: String = reading
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(text.contains(" 50%  50/100 · 1.0 MiB/s"), "{text}");
+        assert!(text.contains("████████░░░░░░░░"), "{text}");
+
+        // ...and it never wraps, whatever it is asked to fit into.
+        for width in [1_u16, 2, 10, 40, 80] {
+            let line = progress_line(
+                width,
+                &crate::tui::model::Progress {
+                    label: "Sampling deep",
+                    done: 7,
+                    total: 9999,
+                    bytes: 1 << 30,
+                    rate: 1 << 30,
+                },
+            );
+            let drawn: String = line.spans.iter().map(|span| span.content.clone()).collect();
+            assert!(
+                drawn.chars().count() < usize::from(width).max(1),
+                "{width} columns held {} characters",
+                drawn.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidate_says_so_and_a_proven_group_does_not() {
+        let mut browser = browser();
+        browser.groups[0].proven = false;
+        let body = render(&browser, 80, 16).join("\n");
+        assert!(body.contains("candidate"), "{body}");
+        browser.groups[0].proven = true;
+        let body = render(&browser, 80, 16).join("\n");
+        assert!(
+            !body.contains("candidate"),
+            "a proven group was labelled a guess: {body}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_says_what_the_proof_will_cost() {
+        let mut browser = browser();
+        browser.groups[0].proven = false;
+        browser.member = 0;
+        browser.keep_only_current();
+        let lines = confirmation(&browser).join("\n");
+        assert!(
+            lines.contains("1 group(s) will be read and proved first."),
+            "{lines}"
+        );
+        // A selection with nothing to prove does not threaten a read.
+        browser.groups[0].proven = true;
+        let lines = confirmation(&browser).join("\n");
+        assert!(!lines.contains("proved first"), "{lines}");
     }
 
     #[test]

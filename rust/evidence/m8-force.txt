@@ -1,0 +1,15 @@
+$ python3 rust/evidence/scripts/m8_force.py rust/target/release/dedup-rs /tmp/m8-force
+
+run                                  bytes_read    opens   groups
+cold (nothing remembered)              67108864       16        8
+warm (the cache answers)                      0        0        8
+--force (believes nothing)             67108864       16        8
+--no-cache (reads and writes nothing)       67108864       16        8
+
+cache after the --force run:    16 rows, 16 with a whole-file digest
+cache after the --no-cache run: 0 rows, 0 with a whole-file digest
+
+pass  --force reads like a cold run and writes like a warm one;
+      --no-cache reads like a cold run and writes nothing.
+
+   exit 0

@@ -120,5 +120,24 @@ pub const CACHE_TTL_DAYS: i64 = 180;
 /// stores whole seconds — so racily-clean is judged at whole seconds on every
 /// volume, rather than asking each one how fine its clock is.
 pub const CACHE_TICK_NS: i64 = 1_000_000_000;
+/// The longest a scan may go without committing what it has learned.
+///
+/// This is the bound on what killing a scan throws away: everything settled
+/// more than one interval before the kill is on disk and the next run will not
+/// pay for it again. Timed rather than counted so the cost lands only on runs
+/// long enough to afford it — every conformance corpus and every bench
+/// scenario finishes inside one interval and pays for no extra transaction at
+/// all, which is what keeps M8-LIVE.md's frozen path frozen.
+pub const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// ...or this many rows owed, whichever comes first.
+///
+/// The clock alone is not enough: a scan can learn a great deal in under two
+/// seconds, and a kill just before the first tick would throw all of it away.
+/// This bounds the loss by work done as well as by time. In WAL with
+/// `synchronous=NORMAL` a commit does not fsync — it appends to the log and
+/// lets a checkpoint do the syncing — so the cost of a few extra transactions
+/// is small enough to stay inside the noise the frozen path is measured
+/// against.
+pub const FLUSH_ROWS: usize = 4096;
 
 pub const DEFAULT_MIN_SIZE: u64 = 10 * 1024 * 1024;

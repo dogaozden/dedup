@@ -34,6 +34,9 @@ pub struct Options {
     pub yes: bool,
     pub hard: bool,
     pub no_cache: bool,
+    /// Read no verdicts from the cache this run, but still write what the
+    /// scan learns. Distinct from `no_cache`, which neither reads nor writes.
+    pub force: bool,
     /// No progress line, whatever stderr turns out to be attached to.
     pub quiet: bool,
     /// "size" stops after the walk and size grouping. Only the M1 gate asks
@@ -129,6 +132,7 @@ impl Flag {
             "--yes" => options.yes = true,
             "--hard" => options.hard = true,
             "--no-cache" => options.no_cache = true,
+            "--force" => options.force = true,
             "--quiet" => options.quiet = true,
             // Accepted so a command line written for the Python tool still
             // runs. This build verifies every group it deletes from
@@ -206,7 +210,14 @@ pub const FLAGS: &[Flag] = &[
         long: "--no-cache",
         short: None,
         takes: Takes::Nothing,
-        help: "read everything, remembering nothing",
+        help: "neither read nor write the scan cache",
+        default: "use the scan cache",
+    },
+    Flag {
+        long: "--force",
+        short: None,
+        takes: Takes::Nothing,
+        help: "read nothing the cache remembers, but write what this scan learns",
         default: "use the scan cache",
     },
     Flag {
