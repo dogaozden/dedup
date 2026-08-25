@@ -1,10 +1,16 @@
 # REVIEW-M8.md — maintainer review of the M8 claim
 
-**Verdict: CHANGES — four binding items, none of them a design objection.**
-The design is right, the fence holds under a harder corpus than the branch's
-own, and the deletion path is guarded the way the claim says it is. Three of
-the four items are one-line fixes; the fourth is a test that does not exist yet
-for the milestone's one absolute fence.
+**Verdict: APPROVED at `4810ffd`.** See the re-review at the end of this file.
+All four binding items below are discharged and all three non-binding notes
+were taken.
+
+---
+
+**First round — verdict: CHANGES — four binding items, none of them a design
+objection.** The design is right, the fence holds under a harder corpus than
+the branch's own, and the deletion path is guarded the way the claim says it
+is. Three of the four items are one-line fixes; the fourth is a test that does
+not exist yet for the milestone's one absolute fence.
 
 M8 is claimed at `be65b8a` on `m8-live`, off `main@a362ffa` — both verified by
 `git merge-base`, not taken from the claim. The binding spec is `M8-LIVE.md`.
@@ -830,3 +836,297 @@ Nothing here is a design objection. The shape of this milestone — defer stage 
 reuse `attested`, lend the records, one reader on the disk, commit at stage
 boundaries — is right, and the parts of it I tried hardest to break did not
 break.
+
+---
+
+# Re-review — 2026-08-25, at `4810ffd`
+
+**Verdict: APPROVED.**
+
+Four commits on top of `be65b8a`, no history rewrite (`be65b8a` is still an
+ancestor) and the base is still `a362ffa` — both checked with `git merge-base`
+rather than taken from the hand-off. Everything below I ran myself in a fresh
+`git archive` extraction of `4810ffd` built beside my `main@a362ffa` build;
+where I re-ran a builder script I say so and treat it as a reproduction. My
+build of the tip hashes `dedd36e9…`, and after every mutant in this round the
+source was restored, proved identical to `git show 4810ffd:…`, and rebuilt back
+to that same hash.
+
+All four binding items are discharged, each by the recipe I wrote in the first
+round rather than by the builder's own script. One new observation is recorded
+as a non-binding note; it does not hold up the merge, and I explain below why
+not.
+
+## Item 1 — discharged, both halves
+
+**1a.** My own reproducer, re-run verbatim from my recipe — mark member 3 of a
+four-member candidate, absorb a replaced list in which that group has two
+members, call `selection()`:
+
+```text
+$ cargo test rv_recheck_stale_member_position_after_a_rebuild
+running 1 test
+test tui::model::tests::rv_recheck_stale_member_position_after_a_rebuild ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 258 filtered out
+```
+
+It returns instead of panicking, and my probe additionally asserts that no
+surviving mark names a record absent from its group. It survives nothing at
+all: `absorb_found` now clears every mark on every rebuilt list.
+
+**The builder solved this differently from either option I offered, and the
+choice is better than mine.** I suggested clearing on the `Refused` path *or*
+pruning by member as well as by group. The second would have been a latent
+bug: a rebuilt list only ever arrives after a proof or a deletion, and both
+*rewrite* membership — a group that failed its proof comes back as its first
+byte-equality class, whose position 1 need not be the record the user marked at
+position 1. A member-pruned mark would have been **in range and naming a
+different file**, which on this path is a file nobody chose being deleted.
+Clearing everything, at the one place every rebuild passes through, is the
+correct rule, and it is the rule `absorb` already stated two methods up. The
+`members.get(member)?` backstop is documented as a backstop and not as the
+guard, which is the right way round.
+
+**1b.** My panic probe, re-run: a `panic!` injected into `live_loop` after
+`fresh.finished`, on a pty.
+
+```text
+=== probe ON — browser panics once the scan has finished ===
+    exited=101  after 0.55s  still_alive_at_limit=False
+    saw: thread 'main' panicked at src/tui/mod.rs:178:13
+    RESULT: the process left on its own with status 101
+```
+
+0.55s and exit 101, against "still alive after 25 seconds" in the first round.
+
+I did not take the new guard's word for it either. Neutering `Stopping::drop`
+to a no-op — the guard present, doing nothing — brings the hang straight back:
+
+```text
+=== guard neutered ===
+    exited=None  after 25.03s  still_alive_at_limit=True
+    RESULT: THE PROCESS NEVER LEFT
+```
+
+So `Watch::stopping()` is load-bearing rather than decorative. It is the exact
+mirror of `Live::leaving()`, which is the right shape: the scope has two
+threads and each now releases the other however it leaves.
+
+## Item 2 — discharged
+
+My recipe: apply both mutants, require `cargo test` to fail on each, naming a
+test that is about the proof. Mine, in my own checkout:
+
+```text
+mutant                                        verdict   failing test
+the proof always PASSES  (whole = true)       caught    pipeline::tests::the_proof_refuses_a_group_
+                                                        whose_middles_differ_however_its_ends_look
+the proof always FAILS   (whole = false)      caught    pipeline::tests::the_proof_accepts_a_group_
+                                                        that_really_is_identical
+an already-proven group is re-read            caught    pipeline::tests::a_group_already_proven_is_
+                                                        not_read_a_second_time
+```
+
+Named for the proof, not for something incidental. The third is the builder's
+own addition and it is the best of the three: it pins the `proven`
+short-circuit on `Effort::bytes_read()` being zero — on what the code did,
+rather than on what it says about itself. The fixture is the "same ends,
+different middles" corpus the claim describes, built in a scratch directory
+with a `Drop` that takes it away, and it needs no terminal.
+
+After the mutants, `cargo test` is 258 green and the release binary is back to
+`dedd36e9…`.
+
+## Item 3 — discharged
+
+My recipe: delete each clause of the flag half in turn, require a failure on
+every one. I wrote my own mutant list rather than running theirs, and I added
+clauses their script does not cover:
+
+```text
+mutant                                                  verdict    caught by
+live_flags loses report_json.is_none()                  caught     the_fence_decides_the_live_path_by_flags_alone
+live_flags loses stage.is_empty()                       caught     the_fence_decides_the_live_path_by_flags_alone
+live_flags loses browsing_flags()                       caught     the_fence_decides_the_live_path_by_flags_alone
+browsing_flags loses auto.is_none()                     caught     the_fence_decides… + the_menu_opens… (+1)
+browsing_flags loses the list/interactive clause        caught     the_fence_decides… + the_menu_opens… (+1)
+live_wanted stops consulting live_flags                 SURVIVED   nothing, in cargo test
+```
+
+Five of six caught where in the first round none were. The sixth is non-binding
+note 4 below — and I escalated it rather than leaving it as a bare survival.
+
+The fence itself, re-verified end to end. My own 190-case differential, ten
+corpora, against my `main@a362ffa` build — re-run because `live_wanted` was
+edited in this round and a fence proof from the previous tip would not have
+covered it:
+
+```text
+$ python3 rv_fence.py compare fence/base1 fence/fix
+base-vs-fix-tip (the fence, re-verified)
+190 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+```
+
+And my own tty matrix on the clean tip, which is the half the freeze proof
+structurally cannot see:
+
+```text
+case                        exit  alt  candidate?  report?  verdict
+bare interactive            0     2    True        False    LIVE
+--list                      0     0    False       False    frozen, no screen
+--list --interactive        0     2    True        False    LIVE
+--report-json               0     2    False       True     browser/menu only
+--stage size                2     1    False       False    browser/menu only
+--auto shortest --yes       0     0    False       False    frozen, no screen
+```
+
+Row for row what I measured in the first round, and row for row what the
+branch's `m8-tty-matrix.txt` records.
+
+## Item 4 — discharged
+
+`main.rs` now quotes the expression rather than summarising it wrongly, and
+names `--list --interactive` explicitly as an interactive run that takes the
+live path. The claim carries the paragraph I asked for, and it says the thing
+that matters in as many words: "a reader of `MILESTONES.md` cannot conclude
+that no run carrying `--list` defers stage 5. One does." Accepted as written.
+
+## Non-binding notes 1, 2 and 3 — all taken
+
+Note 1 got its own heading in `LOG.md` ("Where the deletion-honesty guard
+actually lives"), which is more than I asked for and the right call. Note 2:
+the `taken` cursor is gone rather than implemented, and `fresh()` is now a
+`std::mem::take` with a comment that describes what it does — the builder
+records that the behaviour was right and the description was not, "which is the
+worse of the two ways to be wrong". Note 3: the per-file claims in `live.rs`
+are replaced with a module note stating the four stage boundaries and the
+serving loop, and citing my 0.21s/0.05s measurement for what the latency
+actually costs.
+
+## The other checks
+
+All re-run by me on the tip, in my own checkout:
+
+```text
+$ cargo test                                258 passed; 0 failed        TEST_EXIT=0
+$ cargo clippy --all-targets -- -D warnings  clean                      CLIPPY_EXIT=0
+$ cargo fmt --check                          clean                      FMT_EXIT=0
+$ conformance/run.py --gate all              33 check(s), 0 failed      gate all: green
+                                             mount table unchanged, 0 images left attached
+$ m8_live_end_to_end.py                      5 case(s), 0 failed
+$ m8_live_death.py                           5 scenario(s), 0 failed
+$ m8_cache_kill_resume.py                    3 case(s), 0 failed   (24060 -> 60 opens)
+$ rv_live_kill.py            (mine)          4 case(s), 0 failed   (live path; integrity ok
+                                             under SIGKILL; 0 opens vs 24000; groups identical)
+$ m8_force.py                                pass
+$ m8_deletion_mutants.py     (new)           pass — 3 guards, each proved by breaking it
+$ m8_fence_clauses.py        (new)           pass — 5 clauses, each proved by breaking it
+$ m8_panic_probe.py          (new)           pass — exit 101 in 0.37s
+$ claim_audit.py M8                          9 block(s), 0 untraced
+```
+
+250 → 258 reconciles exactly: the diff adds eight `#[test]` attributes and
+nothing is removed. Three of the new scripts are the kind of evidence I like —
+each one breaks the thing it is claiming to guard, and each checks the
+stale-mutant rule on its own release binary rather than asserting it.
+
+Flash parity, re-run against my own base build:
+
+```text
+scenario       files   bytes_read         opens    groups ours/base
+needle         10000     24682520          9635        10   0.981x
+typical         1600      2812459           430        64   1.009x
+samesize         142      3702784           142         4   0.987x
+widegroup         70     14501888            84         8   0.985x
+photos            13     47846337            11         3   1.004x
+bigheader          8     32677888             8         1   1.026x
+prefixtrap        32     16973824            32         4   1.055x
+rescan          1600       351680             2         1   1.036x
+
+geomean over 8 scenarios: 1.010x
+noise floor (base against itself, same corpus, same rounds): 1.003x
+load average at the end: 1.87 4.78 9.41
+```
+
+Every counter column is identical to what I measured at `be65b8a` and to the
+claim's own table. The wall clock is not claimed by anybody: my geomean sits
+inside my noise floor, and the fifteen-minute load average of 9.48 says why a
+floor was needed.
+
+## Non-binding note from this round
+
+4. **`the_live_path_is_the_flags_and_a_terminal_and_nothing_else` cannot fail
+   under `cargo test`.** It asserts `live_wanted(&o) == tui::has_terminal() &&
+   live_flags(&o)`. Under `cargo test` there is no terminal, so both sides are
+   `false && …` and the assertion holds whatever `live_wanted` does with the
+   flags. I proved it: replacing `live_wanted`'s body with `has_terminal() &&
+   browsing_flags(options)` — dropping the `--report-json` and `--stage`
+   exclusions back out of the deciding function — leaves all 258 green. That
+   test's own comment says it exists so "the test above" is not "pinning a
+   different function from the one that decides", and it does not do that.
+
+   Following M5.2's precedent I escalated rather than stopping at the survival,
+   and the escalation is why this is a note and not a fifth binding item. On a
+   real pty the mutant is loud:
+
+   ```text
+   case                        exit  alt  candidate?  report?
+   --report-json               0     2    True        False     <- live, and NO report written
+   --stage size                0     2    True        False     <- live, exit 0 not 2
+   ```
+
+   So the link **is** guarded — by `m8_tty_matrix.py`, which is committed
+   evidence, which the claim explicitly nominates for this job ("a unit test
+   asks the function what it thinks, so `m8_tty_matrix.py` asks the binary what
+   it does"), and which I independently confirmed catches it. The claim does
+   not cite the vacuous unit test as covering the link, so the written record
+   is not overstating anything; only that one test's comment is. That is the
+   same class of defect as my first-round note 2, and it is not a coverage gap
+   in the argument.
+
+   It is also partly mine: my item 3 recipe offered two shapes — "take the
+   terminal-ness as an argument, or split the flag half into a helper" — and
+   the second, which the builder took faithfully, is the one that leaves this
+   residue. If you want it closed, the first shape closes it: give `live_wanted`
+   the terminal-ness as a parameter and assert both values. One line and one
+   test, whenever that file is next open.
+
+## Defects still open, and still not M8's
+
+SIGHUP and SIGTERM leave the terminal raw — M5's, recorded by `m5_2_signals.py`
+as M5's, confirmed by me on `main@a362ffa`, printed but ungraded by
+`m8_live_death.py`. Ctrl+C at the menu is ignored — M5.1's. A long stage 5
+cannot flush mid-way — inherited M7 territory, honestly characterised, and a
+loss rather than a corruption.
+
+## Fence conditions this round was made under
+
+Same worktree, `/Users/dogaozden/AI_Projects/dedup-m8-review` on `m8-review`;
+all verification in a fresh scratch extraction of `4810ffd`. The builder's
+worktree was neither read from nor written to. No pushes, no branch deleted, no
+`sudo`, `main` and `m8-live` untouched.
+
+Every mutant this round was applied to the scratch extraction, reverted, and
+proved reverted by diffing against `git show 4810ffd:…` before the next ran;
+the release binary was rebuilt to `dedd36e9…` afterwards each time, and the
+whole `src` tree was diffed against the committed source at the end.
+
+`/Volumes` was `\]` and `dedupbench` before and after, `hdiutil info | grep -c
+dedupconf` reported `0`, and `dedupbench` was never read, written or mounted.
+Corpora under my scratch root only; every deletion went to a scratch `HOME`'s
+Trash. Load average ran between 1.6 and 9.5 on a shared machine — counters are
+the only figures claimed as facts.
+
+## Disposition
+
+**M8 is APPROVED at `4810ffd`.** The one absolute fence holds, measured on my
+own corpora and on a real terminal, and it is now falsifiable in `cargo test`
+as well as at the pty. `ProvenGroups` is still the only key to deletion and the
+line that decides has a terminal-free guard in both directions. The cache
+survives all four kills on the live path with `integrity_check` clean. The two
+defects I found in the first round are fixed, and the fix to the first one is
+better than what I proposed.
+
+Non-binding note 4 is worth an hour whenever `main.rs` is next open, and is not
+a condition of the merge.
