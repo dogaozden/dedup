@@ -379,6 +379,14 @@ fn child_relative(prefix: &str, name: &[u8]) -> String {
 }
 
 /// The portable walk, for a directory `getattrlistbulk` would not describe.
+///
+/// Nothing here is ever dataless, and there is no `cloud` parameter to say so
+/// with. `fs::Metadata` does carry `st_flags` on macOS, but this path exists
+/// precisely for the directories the bulk call would not describe completely —
+/// a filesystem that will not answer an attribute request is not one that has
+/// cloud placeholders on it. On a platform without `SF_DATALESS` at all this
+/// is the only path there is, `--cloud` changes nothing, and the skip count
+/// stays zero, which is the honest answer rather than a silent one.
 #[allow(clippy::too_many_arguments)]
 fn gather_portable(
     root: &Path,

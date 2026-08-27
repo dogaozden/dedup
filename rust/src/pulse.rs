@@ -638,7 +638,8 @@ mod tests {
             "reading steadily should read about 3 MiB/s, got {last}"
         );
 
-        // ...and then nothing moves at all. `moved` never changes again.
+        // ...and then nothing moves at all. `moved` never changes again, and
+        // this asks what the display would be showing `ms` into the stall.
         let stalled_for = |ms: u64| {
             let mut copy = Rate::default();
             let mut total = 0_u64;
@@ -647,27 +648,42 @@ mod tests {
                 copy.observe(at(tick * 100), total);
             }
             let mut answer = 0;
-            for tick in 100..(100 + ms / 100) {
+            for tick in 100..=(100 + ms / 100) {
                 answer = copy.observe(at(tick * 100), total);
             }
             answer
         };
+        let window_ms = crate::consts::RATE_WINDOW.as_millis() as u64;
+
         // One window later there is no reading left inside it that moved, so
         // the subtraction is zero — exactly zero, not approaching it.
-        let window_ms = crate::consts::RATE_WINDOW.as_millis() as u64;
         assert_eq!(
-            stalled_for(window_ms + 200),
+            stalled_for(window_ms + 400),
             0,
             "a stall must read 0 one window after the last byte"
         );
         assert_eq!(stalled_for(window_ms * 3), 0, "and stay there");
-        // Before the window is out it is already collapsing, which is the
-        // half-truth an average could not tell either: at half a window the
-        // window still holds half its bytes.
-        let half = stalled_for(window_ms / 2);
+
+        // ...and it must take a WHOLE window to get there, which is what says
+        // the window is `RATE_WINDOW` wide and not merely some window. A
+        // moment before it expires the window still holds the tail of the real
+        // reading, so the rate is small and NOT yet zero.
+        let nearly = stalled_for(window_ms - 400);
         assert!(
-            half < 3 * 1024 * 1024,
-            "the rate should be falling inside the window, got {half}"
+            nearly > 0,
+            "the rate hit zero before a window had passed — the window is \
+             narrower than RATE_WINDOW says it is"
+        );
+
+        // Half a window in, half the window is still real reading, so the rate
+        // is about half. This is the shape a person can learn to read: it
+        // falls in proportion to how much of the window is still moving.
+        let half = stalled_for(window_ms / 2);
+        let steady = 3 * 1024 * 1024;
+        assert!(
+            half > steady * 2 / 5 && half < steady * 3 / 5,
+            "half a window into a stall should read about half of {steady}, \
+             got {half}"
         );
 
         // The 1/t signature, spelled out: a lifetime average over the same
@@ -700,13 +716,21 @@ mod tests {
             last.abs_diff(10 * 1024 * 1024) * 20 < 10 * 1024 * 1024 * 3,
             "a minute in, the window should still read about 10 MiB/s, got {last}"
         );
-        // ...and it holds a bounded number of readings while doing it.
+        // ...and it holds the number of readings the window and the spacing
+        // between them imply — bounded above, so a long stage cannot grow it,
+        // and bounded BELOW, so a window quietly narrowed to a beat or two
+        // fails here as well as in the stall test above.
+        let span = crate::consts::RATE_WINDOW.as_millis() as usize / SPACING.as_millis() as usize;
         assert!(
-            rate.readings.len()
-                <= (crate::consts::RATE_WINDOW.as_millis() as usize / SPACING.as_millis() as usize)
-                    + 2,
+            rate.readings.len() <= span + 2,
             "the window grew to {} readings",
             rate.readings.len()
+        );
+        assert!(
+            rate.readings.len() >= span - 1,
+            "the window holds only {} readings, so it is not {:?} wide",
+            rate.readings.len(),
+            crate::consts::RATE_WINDOW
         );
     }
 
