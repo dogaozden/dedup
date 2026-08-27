@@ -132,6 +132,16 @@ MUTANTS = [
         "the skips become silent, which is what the spec forbids",
     ),
     (
+        "live-wanted-forgets-two-of-its-clauses",
+        "rust/src/main.rs",
+        "    terminal && live_flags(options)",
+        "    terminal && browsing_flags(options)",
+        "test",
+        "REVIEW-M8's non-binding note 4, and the reviewer's own mutant: this "
+        "left all 258 tests green on main, because `has_terminal()` was asked "
+        "for rather than passed in and is false in every test process",
+    ),
+    (
         "the-detector-is-the-size-heuristic",
         "rust/src/cloud.rs",
         "    flags & SF_DATALESS != 0\n",
@@ -301,11 +311,19 @@ def main():
         for one in survived:
             print(f"  - {one}")
         return 1
+    # Counted rather than written down: the numbers drifted the first time a
+    # mutant was added to the table, which is the same class of mistake as a
+    # comment that describes code it no longer matches.
+    tally = {}
+    for _, _, _, _, harness, _ in MUTANTS:
+        tally[harness] = tally.get(harness, 0) + 1
+    blind = tally.get("walk", 0) + tally.get("pty", 0)
     print(
-        "every mutant was caught by the harness it was paired with: four by "
-        "`cargo test`, three by the dataless harness and two by the pty "
-        "battery — and the record above shows the suite staying green for "
-        "all five of the ones it cannot reach"
+        "every mutant was caught by the harness it was paired with: "
+        f"{tally.get('test', 0)} by `cargo test`, {tally.get('walk', 0)} by "
+        f"the dataless harness and {tally.get('pty', 0)} by the pty battery "
+        f"— and the record above shows the suite staying green for all "
+        f"{blind} of the ones it cannot reach"
     )
     return 0
 

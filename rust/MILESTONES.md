@@ -4008,3 +4008,403 @@ rather than the real one. Free disk on `/` at the end: 14 GiB. The machine was
 shared with other agents throughout and the load average reached 16.6 during
 the flash-parity run, which is why the only figures claimed as facts here are
 counters, exit codes and hashes.
+
+---
+
+## M9 — cloud placeholders and the windowed rate — CLAIMED
+
+Branch `m9-cloud`, based on `main@644c66f`. The maintainer scanned a home
+directory, watched "8 KiB/s" on an SSD, and read it as a scan that was dying.
+It was not: it had wandered into `~/Library/CloudStorage/GoogleDrive-…` and put
+a 470 MB `.MOV` with 12 MB actually on disk at the head of the queue, and the
+rate display — a scan-lifetime average — decayed like 1/t while one file was
+fetched over a network. Both halves are fixed here: the scan no longer reads
+cloud placeholders at all, and no rate on any display is a lifetime average
+any more.
+
+### A. Cloud placeholders are skipped by default
+
+A dataless file is dropped in `gather_bulk` before it becomes a `FileRec` —
+upstream of grouping, sampling and any proof at apply, so no later stage can
+reach one. The walk already made a `getattrlistbulk` call, so `ATTR_CMN_FLAGS`
+was added to the attributes it asks for: no extra syscall, no extra pass over
+the catalog.
+
+`SF_DATALESS` is the detector and the allocated-vs-logical heuristic
+deliberately is not: sparse files and `UF_COMPRESSED` files legitimately
+under-allocate, and treating those as cloud would silently drop real local
+duplicates out of every scan. `cloud::dataless` takes a flags word rather than
+a path, which is what makes the rule testable at all — see §D.
+
+Defence in depth: the process asks the kernel to fail rather than materialize
+(`IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES`, which is **3**, taken from the
+SDK header on this machine and not from memory). `refuse_materialization` sets
+the policy and then asks `getiopolicy_np` what the policy actually is, because
+"the call did not fail" and "the policy is in force" are different claims and
+only the second is the one the law rests on.
+
+A file EVICTED mid-scan cannot be caught by any amount of walk-time care. That
+path needed no new code: every read failure in this program already turns into
+`None`, drops the file from its group and names it in `unreadable`, and a
+kernel refusing to materialize is just another read failure. What was added is
+only the explanation — `cloud::in_cloud` asks which of the files that failed
+are dataless now, and names them.
+
+New flag `--cloud` includes them, with help text that says comparing one
+downloads it. The pre-flight menu carries the row, and `MENU_EXPOSURE`'s
+exhaustive list makes forgetting it a test failure rather than an omission.
+
+### B. The progress display stops averaging away stalls
+
+Every rate on every display — the live browser and the stderr pulse — is now
+bytes moved inside `RATE_WINDOW` divided by the span of that window. A ring of
+readings, not an EWMA, and the reason is in LOG.md: an exponential average has
+the same shape as the bug, approaching zero without arriving. A window
+subtracts one reading from another, so a stall reads exactly 0 one window
+after the last byte.
+
+`Stage::started` is deleted. It was the only ingredient a lifetime average
+needed, so the old behaviour is now unrepresentable rather than merely not
+written.
+
+The progress area names the file being read, path middle-truncated — the tail
+of a path is the half that identifies the file, so the tail is the half that
+survives. On a row too narrow for a useful name the numbers stay and the name
+goes.
+
+### The fence
+
+M8's fence, restated for M9: on any tree with no dataless files, every
+non-interactive output and every effort counter is byte-identical to main.
+Measured with `m8_freeze.py` **unchanged and deliberately not forked** — the
+fence did not change, so neither did the thing that measures it, and re-running
+a harness written before this code existed is a stronger claim than running one
+written beside it. `main@644c66f` was built from a fresh `git archive` into a
+target directory of its own.
+
+From `evidence/m9-freeze.txt`:
+
+```text
+$ m8_freeze.py compare /tmp/m9-freeze-cap-base /tmp/m9-freeze-cap-ours
+
+84 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+```
+
+That sentence is worth nothing unless the gate would have said something else,
+so it was falsified. `--report-json` gains a `skipped_cloud` key that must be
+ABSENT rather than zero on a clean tree — one `.then_some()`, and the easiest
+thing in this milestone to write the obvious wrong way. Emitting it always,
+from `evidence/m9-fence-teeth.txt`:
+
+```text
+84 cases compared, 84 differing
+FENCE BROKEN
+
+THE GATE HAS TEETH: the mutant was caught, so "0 differing" means something
+```
+
+Conformance, from `evidence/m9-gate.txt`:
+
+```text
+33 check(s), 0 failed
+gate all: green
+```
+
+```text
+gate green, mount table unchanged, no image left attached
+```
+
+### C. What the walk actually does, on a real tree
+
+A real cloud placeholder cannot be fabricated. `SF_DATALESS` is one of the
+`SF_SYNTHETIC` flags, which `<sys/stat.h>` keeps out of `SF_SUPPORTED` so that
+no userland process — root included — can set it; only a File Provider makes
+one. So `m9_dataless_walk.py` swaps the one constant that says WHICH flag means
+"in the cloud" for `UF_HIDDEN`, which `chflags` will set, and runs the real
+binary over a real tree with a real flag set by the real kernel. Everything
+between the flag and the user is exercised.
+
+One member of a group of four, flagged. From `evidence/m9-dataless-walk.txt`:
+
+```text
+=== 2. one member of the group is a placeholder ===
+$ chflags hidden media/reel_2.mov
+  groups:        [3]
+  members:       ['media/reel_0.mov', 'media/reel_1.mov', 'media/reel_3.mov']
+  files_seen:    5   (was 6)
+  bytes_read:    9453568   (was 12599296)
+  skipped_cloud: 1
+  unreadable:    []
+  stderr:        '1 file in cloud — not scanned (--cloud to include)'
+```
+
+`bytes_read` fell by 3,145,728 — exactly the size of the file that was skipped.
+That is the law, measured: not one byte of it was read. It is also absent from
+`unreadable`, because it was excluded rather than failed.
+
+And the degenerate case, where every file in the tree is a placeholder:
+
+```text
+=== 5. the whole tree is placeholders ===
+  groups:        []
+  files_seen:    0
+  bytes_read:    0
+  skipped_cloud: 6
+  exit:          0
+  stderr:        '6 files in cloud — not scanned (--cloud to include)'
+```
+
+The substitution is licensed by a test rather than assumed:
+`the_bulk_read_agrees_with_lstat_field_by_field` sets `UF_HIDDEN` with
+`chflags` and finds it in the very field the swap reinterprets, so both flags
+travel the same path from kernel to walk. What this cannot show is that
+`0x40000000` is the right number, and that is checked separately against the
+SDK header.
+
+**Not proven here, and stated as such:** this tool has never met a real Google
+Drive placeholder. `tools/cloud-validate.sh` is for the maintainer to run on a
+real cloud folder — it prints the skip count and `du` before and after, deletes
+nothing, and is guarded like `tools/passport-measure.sh`. Until somebody runs
+it, the no-materialization law is proven against a substituted flag and a
+kernel policy, not against Google.
+
+### D. What the terminal sees
+
+`cargo test` has no terminal, so three of M9's claims are out of its reach.
+From `evidence/m9-pulse.txt`:
+
+```text
+the pulse names the file being read: ok
+  8 frames painted, 2 named a file, 2 of those during the comparison
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 5.1 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
+```
+
+Named during the COMPARISON specifically, which is the point: that stage hands
+its descriptors forward and opens no files of its own. Recording the name in
+`Effort::open` — the obvious one-line version, and the one the spec's wording
+suggests — left it blank for the whole of the longest stage. See LOG.md.
+
+`--quiet` and pipes are as inert as M5.2 left them, re-proved rather than
+assumed, and the menu row is checked in both positions so that a row which
+could not change is not mistaken for a row that works:
+
+```text
+--quiet paints nothing, terminal or not: ok
+  no repaint, no frame, on a real terminal
+
+a pipe is silent and says nothing about the cloud: ok
+  stderr empty, stdout free of escapes, 1 group(s) found, no skipped_cloud key
+
+the pre-flight menu offers --cloud, off: ok
+      default: ...profileautocloudoffno-cacheonforceoffign...
+      with --cloud: ...profileautocloudonno-cacheonforceoffigno...
+      the row tracks the flag: off by default, on with --cloud given
+
+all 4 cases held
+```
+
+### E. Ten mutants, and which harness each one dies in
+
+`m9_mutants.py` pairs every plausible edit with the harness meant to catch it
+and requires a failure. Five of the ten leave `cargo test` green, and the
+script prints that fact beside each rather than hiding it. From
+`evidence/m9-mutants.txt`:
+
+```text
+=== the-walk-stops-skipping ===
+    the law itself: a cloud placeholder becomes a record and gets read
+    rust/src/walk.rs, caught by: walk
+    $ m9_dataless_walk.py
+      - the placeholder was not dropped from its group
+      - the placeholder is still in a group
+      - skipped_cloud is None, want 1
+      - files_seen counted a file the scan never looked at
+      - skipping a file did not read fewer bytes
+      - the run did not say a file was in the cloud
+    $ cargo test --release
+      test result: ok. 275 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+      (green — no test can make a dataless file, which is why the harness above is the guard)
+    caught
+```
+
+```text
+=== the-window-becomes-the-lifetime ===
+    the 1/t bug, exactly: nothing ever leaves the window
+    rust/src/pulse.rs, caught by: test
+```
+
+```text
+=== the-comparison-forgets-the-file ===
+    the long stage goes back to naming nothing — the bug this milestone already made once
+    rust/src/compare.rs, caught by: pty
+```
+
+```text
+every mutant was caught by the harness it was paired with: 5 by `cargo test`, 3 by the dataless harness and 2 by the pty battery — and the record above shows the suite staying green for all 5 of the ones it cannot reach
+```
+
+Those counts are computed from the mutant table rather than written into the
+sentence. They were written in at first and drifted the moment a mutant was
+added — the same class of mistake as a comment describing code it no longer
+matches, which is a thing this project has an opinion about.
+
+One of them got away on the first run, and it was mine: narrowing the window
+from `RATE_WINDOW` to one beat left all 275 tests green, because every
+assertion I had written was about the rate reaching zero and a 100 ms window
+reaches zero too — sooner. The tests now pin the width from both directions.
+LOG.md records that and three more tests of mine that were passing while
+testing nothing.
+
+The stale-mutant rule, which has burned two people on this project: every
+mutant is reverted, each revert is proved by comparing the file's bytes against
+the bytes read before it went in, and the release binary is rebuilt to the
+pre-mutant hash before anything else measures it.
+
+```text
+$ cargo build --release
+  ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+  identical to the pre-mutant binary
+```
+
+### Standards
+
+From `evidence/m9-standards.txt` — main first, then this branch:
+
+```text
+=== main@644c66f, for the before-count and the clippy verdict that predates this branch ===
+$ cargo test
+
+test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+```
+
+```text
+=== this branch ===
+$ cargo test
+
+test result: ok. 275 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+```
+
+258 to 275 is 17 new `#[test]` attributes and none removed, which is exactly
+what `git diff 644c66f..HEAD -- rust/src` contains. Clippy is clean at
+`-D warnings --all-targets` on both sides, `cargo fmt --check` is clean, and
+the release binary rebuilds to the same hash after a `touch`, so nothing here
+was measured with a stale one:
+
+```text
+$ cargo fmt --check
+(no output: clean)
+```
+
+```text
+$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
+ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+```
+
+### RBENCH-shaped flash parity
+
+The real harness keeps its corpora on the `dedupbench` volume, which this run's
+fence forbids it to touch, so this is an RBENCH-shaped rerun on the local SSD —
+`m8_flash_inert.py` unchanged, the same seeded generators from
+`bench/corpus.py`. From `evidence/m9-flash-inert.txt`:
+
+```text
+scenario       files   bytes_read         opens    groups ours/base
+needle         10000     24682520          9635        10   1.003x
+typical         1600      2812459           430        64   1.005x
+samesize         142      3702784           142         4   0.999x
+widegroup         70     14501888            84         8   1.013x
+photos            13     47846337            11         3   1.018x
+bigheader          8     32677888             8         1   0.997x
+prefixtrap        32     16973824            32         4   1.002x
+rescan          1600       351680             2         1   1.005x
+
+geomean over 8 scenarios: 1.005x
+noise floor (base against itself, same corpus, same rounds): 1.003x
+```
+
+The counters are the fact: `bytes_read`, `opens`, `files_seen`, `bytes_seen`
+and the groups are identical, not close, on every scenario. The wall clock is
+not claimed — the geomean sits at the noise floor measured on this same machine
+at the same time, and this machine is shared.
+
+### Deletion, the cache, and what did not move
+
+`ProvenGroups` is untouched. The deletion path cannot reach a cloud file at all
+on a default scan, because a skipped file never became a record and so is in no
+group for anything to be proven about. Under `--cloud` a proof that reads one
+is a deliberate, flagged act.
+
+No verdict is ever recorded for a file that was not read: a skipped file is
+dropped before `FileRec` exists, so there is nothing for the cache to be keyed
+on. `CACHE_SCHEMA` does not move.
+
+### Also in this branch
+
+REVIEW-M8's non-binding note 4, taken as part of M9 because the file was open.
+`live_wanted` takes terminal-ness as a parameter, so
+`the_live_path_is_the_flags_and_a_terminal_and_nothing_else` can run both
+values instead of comparing `false && …` against `false && …`. It is the
+`terminal = true` half that does the work: with no terminal every row is false
+on both sides whatever the flags say.
+
+The reviewer's own mutant — dropping the `--report-json` and `--stage`
+exclusions back out of the deciding function — left all 258 tests green on
+main. It is the tenth mutant in `evidence/m9-mutants.txt`, and it now fails
+that test and only that test:
+
+```text
+=== live-wanted-forgets-two-of-its-clauses ===
+    REVIEW-M8's non-binding note 4, and the reviewer's own mutant: this left all 258 tests green on main, because `has_terminal()` was asked for rather than passed in and is false in every test process
+    rust/src/main.rs, caught by: test
+    $ cargo test --release
+      test result: FAILED. 274 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+      tests::the_live_path_is_the_flags_and_a_terminal_and_nothing_else
+    caught
+```
+
+### Fence conditions this run was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m9`, branch `m9-cloud`, based on
+`main@644c66f`. Not merged, not pushed, no other branch touched, no harness
+file under `conformance/`, `rbench/`, `bench/` or `xbench/` modified, no
+`sudo`.
+
+**No file under `~/Library/CloudStorage` was read, listed, or stat'd**, and no
+real user data of any kind was touched. Every dataless behaviour in this claim
+was produced with a substituted flag on a scratch corpus, as §C describes.
+
+**`/Volumes` was never touched except by the conformance gate's own image.**
+The gate lists it before and after and diffs the two itself:
+
+```text
+$ diff <(ls /Volumes before) <(ls /Volumes after)
+(no output: the mounted volumes are the ones that were there before)
+```
+
+The only `/Volumes` path this run touched is the ephemeral 80 MB APFS image the
+`m4-trashes` check creates at `/Volumes/dedupconf` and detaches itself;
+`hdiutil info | grep -c dedupconf` reported `0` afterwards. `/Volumes/My New
+Passport` was never mounted, read or listed. The `dedupbench` RAM disk was not
+mounted at any point in this run, which is why the benchmark above is
+RBENCH-shaped rather than RBENCH.
+
+The listings in the evidence read `\]`, which is not a corrupt capture: the
+only thing in `/Volumes` on this machine is a symlink literally named `\]`
+pointing at `/`, dated two days before this branch was cut. It is not
+this run's doing and was not touched; it is recorded here so that nobody
+reading `evidence/m9-freeze.txt` has to wonder what it is.
+
+Every corpus was generated under `/tmp`, under this worktree's `rust/target/`,
+or under the session scratch directory, and removed or left there. The copy of
+`main@644c66f` used for the fence and the standards battery was extracted with
+`git archive` into `/tmp/m9-freeze-base-checkout` and built into a target
+directory of its own, rather than by touching any other worktree.
+
+Deletion ran only on scratch corpora this branch generated, in the `--auto`
+cases the freeze harness drives, and into a scratch `HOME`'s Trash rather than
+the real one. No process this branch did not start was signalled or killed.
+
+The machine was shared throughout: load average was between 1.90 and 2.71 for
+the benchmark, which is why a noise floor was measured beside it and why no
+wall-clock figure here is claimed as a fact.

@@ -4,11 +4,10 @@ corpus: 4 × 300 MiB identical files
 (sized so the comparison outlasts the pulse's 100 ms beat)
 
 the pulse names the file being read: ok
-  9 frames painted, 3 named a file, 3 of those during the comparison
-        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 4.1 GiB/s  ← media/holidays/IMG_20190710_183012_reel.MOV
-        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 3.8 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
-        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 3.7 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
-      3 of the comparison's frames showed a live rate
+  8 frames painted, 2 named a file, 2 of those during the comparison
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 5.1 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 4.6 GiB/s  ← media/holidays/IMG_20190712_183012_reel.MOV
+      2 of the comparison's frames showed a live rate
 
 --quiet paints nothing, terminal or not: ok
   no repaint, no frame, on a real terminal
