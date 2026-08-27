@@ -369,7 +369,7 @@ fn live_scan(
     let (live, watch) = live::channel(root);
     // Counters without a painter: in live mode the browser is the progress
     // display, so nothing may write to stderr behind the alternate screen.
-    let (pulse, seen) = Pulse::live(effort);
+    let (pulse, seen) = Pulse::live(effort, cloud);
     let mut probe = VolumeProbe::start(root, options.jobs);
     let mut cache = (!options.no_cache).then(|| {
         if options.force {

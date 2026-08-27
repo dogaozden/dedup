@@ -176,6 +176,9 @@ fn live_loop(
         browser.scanning = !ending;
         browser.cancelled = fresh.cancelled;
         browser.progress = if ending { None } else { view.read() };
+        // Still read after the scan ends: the count is a fact about the scan,
+        // not about whether it is still running.
+        browser.in_cloud = view.in_cloud();
 
         let painted = match terminal.draw(|frame| view::draw(frame, browser)) {
             Ok(frame) => frame.area,
@@ -261,6 +264,11 @@ fn summarise_live(browser: &Browser) {
             human_count(browser.applied_files as u64),
             human_size(browser.applied_bytes)
         );
+    }
+    if let Some(note) = crate::cloud::notice(browser.in_cloud) {
+        // The full sentence, where there is a whole line for it. The browser's
+        // own summary row carries the short form while the scan is running.
+        eprintln!("  {note}");
     }
     if browser.refused > 0 {
         eprintln!(

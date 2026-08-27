@@ -212,6 +212,10 @@ pub struct Browser {
     pub progress: Option<Progress>,
     /// True while a scan is still running behind the browser.
     pub scanning: bool,
+    /// Cloud placeholders this scan did not read. Kept on the browser rather
+    /// than on `progress`, because `progress` goes away when the scan ends and
+    /// this fact does not stop being true when it does.
+    pub in_cloud: u64,
     /// True when the scan stopped because the user asked it to.
     pub cancelled: bool,
 }
@@ -229,7 +233,13 @@ pub struct Progress {
     pub total: u64,
     /// Bytes the walk has seen, or bytes this reading stage has moved.
     pub bytes: u64,
+    /// Bytes a second over the last `RATE_WINDOW`, never over the stage's
+    /// lifetime. See `pulse::Rate`.
     pub rate: u64,
+    /// The file most recently opened, or empty during the walk, which opens
+    /// none. This is what a person staring at a bar that has stopped moving
+    /// needs to know, and it is the whole reason M9 puts it on the screen.
+    pub current: String,
 }
 
 impl Browser {
@@ -252,6 +262,7 @@ impl Browser {
             refused: 0,
             failures: Vec::new(),
             progress: None,
+            in_cloud: 0,
             scanning: false,
             cancelled: false,
         };
