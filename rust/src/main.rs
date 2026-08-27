@@ -106,8 +106,16 @@ fn live_flags(options: &Options) -> bool {
 }
 
 /// Whether this run opens the browser before the scan rather than after it.
-fn live_wanted(options: &Options) -> bool {
-    tui::has_terminal() && live_flags(options)
+///
+/// `terminal` is taken rather than asked for, on REVIEW-M8's non-binding note
+/// 4. Asked for, it is false in every `cargo test` process, so an assertion
+/// comparing this against `has_terminal() && live_flags(..)` was `false && …`
+/// on both sides and held whatever this function did with the flags — the
+/// reviewer dropped the `--report-json` and `--stage` exclusions back out of
+/// it and all 258 tests stayed green. As a parameter both values are
+/// reachable, and the test below runs each.
+fn live_wanted(terminal: bool, options: &Options) -> bool {
+    terminal && live_flags(options)
 }
 
 fn print_report(groups: &[Vec<&str>]) {
@@ -188,7 +196,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // The live scan: a browser opened before anything has been read, with the
     // scan behind it. Everything below this point is the path every other run
     // has always taken, unchanged.
-    if live_wanted(&options) {
+    if live_wanted(tui::has_terminal(), &options) {
         return live_scan(&options, &root, filters, &effort);
     }
     // After the menu, which owns the terminal until it hands it back, and
@@ -538,20 +546,29 @@ mod tests {
         // `live_wanted` may add the terminal to `live_flags` and may not add
         // anything else — otherwise the test above would be pinning a
         // different function from the one that decides.
-        for argv in [
-            &[][..],
-            &["--list"],
-            &["--list", "--interactive"],
-            &["--report-json", "/tmp/r.json"],
-            &["--stage", "size"],
-            &["--auto", "shortest"],
-        ] {
-            let options = flags(argv);
-            assert_eq!(
-                live_wanted(&options),
-                tui::has_terminal() && live_flags(&options),
-                "{argv:?}"
-            );
+        //
+        // REVIEW-M8's non-binding note 4: this test used to ask
+        // `has_terminal()` for the terminal half, which is false in every
+        // `cargo test` process, so both sides read `false && …` and the
+        // assertion could not fail. Both values are supplied now, and it is
+        // the `terminal = true` half that does the work — with no terminal
+        // every row below is false on both sides no matter what the flags say.
+        for terminal in [false, true] {
+            for argv in [
+                &[][..],
+                &["--list"],
+                &["--list", "--interactive"],
+                &["--report-json", "/tmp/r.json"],
+                &["--stage", "size"],
+                &["--auto", "shortest"],
+            ] {
+                let options = flags(argv);
+                assert_eq!(
+                    live_wanted(terminal, &options),
+                    terminal && live_flags(&options),
+                    "terminal={terminal} {argv:?}"
+                );
+            }
         }
     }
 
