@@ -1,0 +1,200 @@
+$ cargo build --release   (the committed source, before the mutant)
+    Finished `release` profile [optimized] target(s) in 0.04s
+$ shasum -a 256 rust/target/release/dedup-rs
+ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  rust/target/release/dedup-rs
+
+$ using the base capture m9_freeze_gate.sh already took: /tmp/m9-freeze-cap-base
+
+=== the mutant: the skip count is always emitted, even when it is zero ===
+-   skipped_cloud: (skipped_cloud > 0).then_some(skipped_cloud),
++   skipped_cloud: Some(skipped_cloud),
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 12.34s
+
+$ m8_freeze.py capture rust/target/release/dedup-rs /tmp/m9-teeth-cap-broken
+captured 84 cases from /Users/dogaozden/AI_Projects/dedup-m9/rust/target/release/dedup-rs
+  -> /tmp/m9-teeth-cap-broken/capture.json
+
+$ m8_freeze.py compare /tmp/m9-freeze-cap-base /tmp/m9-teeth-cap-broken
+DIFFERS: boundaries/auto-oldest
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/auto-shortest
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/flash-list
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/list
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/list-min-size
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/no-cache-list
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/parallel-list
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/parallel-spinning
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/piped-default
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/report-only
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/spinning-list
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/stage-size
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/warm-cold
+    report.skipped_cloud: None != 0
+DIFFERS: boundaries/warm-warm
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/auto-oldest
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/auto-shortest
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/flash-list
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/list
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/list-min-size
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/no-cache-list
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/parallel-list
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/parallel-spinning
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/piped-default
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/report-only
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/spinning-list
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/stage-size
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/warm-cold
+    report.skipped_cloud: None != 0
+DIFFERS: hardlinks/warm-warm
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/auto-oldest
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/auto-shortest
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/flash-list
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/list
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/list-min-size
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/no-cache-list
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/parallel-list
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/parallel-spinning
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/piped-default
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/report-only
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/spinning-list
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/stage-size
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/warm-cold
+    report.skipped_cloud: None != 0
+DIFFERS: no-duplicates/warm-warm
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/auto-oldest
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/auto-shortest
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/flash-list
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/list
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/list-min-size
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/no-cache-list
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/parallel-list
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/parallel-spinning
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/piped-default
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/report-only
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/spinning-list
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/stage-size
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/warm-cold
+    report.skipped_cloud: None != 0
+DIFFERS: out-of-order/warm-warm
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/auto-oldest
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/auto-shortest
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/flash-list
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/list
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/list-min-size
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/no-cache-list
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/parallel-list
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/parallel-spinning
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/piped-default
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/report-only
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/spinning-list
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/stage-size
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/warm-cold
+    report.skipped_cloud: None != 0
+DIFFERS: sameends/warm-warm
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/auto-oldest
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/auto-shortest
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/flash-list
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/list
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/list-min-size
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/no-cache-list
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/parallel-list
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/parallel-spinning
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/piped-default
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/report-only
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/spinning-list
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/stage-size
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/warm-cold
+    report.skipped_cloud: None != 0
+DIFFERS: widegroup/warm-warm
+    report.skipped_cloud: None != 0
+
+84 cases compared, 84 differing
+FENCE BROKEN
+
+THE GATE HAS TEETH: the mutant was caught, so "0 differing" means something
+
+=== the stale-mutant rule: restored, and proved restored ===
+$ cmp rust/src/main.rs /tmp/m9-teeth-main.rs.orig
+  (no output: the file is the one that was read before the mutant)
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 12.32s
+$ shasum -a 256 rust/target/release/dedup-rs
+ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  rust/target/release/dedup-rs
+  (compare with the pre-mutant hash printed at the top)

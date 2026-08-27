@@ -1,0 +1,26 @@
+$ python3 rust/evidence/scripts/m9_pulse.py rust/target/release/dedup-rs /tmp/m9-capture/pulse
+
+corpus: 4 × 300 MiB identical files
+(sized so the comparison outlasts the pulse's 100 ms beat)
+
+the pulse names the file being read: ok
+  9 frames painted, 3 named a file, 3 of those during the comparison
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 4.1 GiB/s  ← media/holidays/IMG_20190710_183012_reel.MOV
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 3.8 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 3.7 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
+      3 of the comparison's frames showed a live rate
+
+--quiet paints nothing, terminal or not: ok
+  no repaint, no frame, on a real terminal
+
+a pipe is silent and says nothing about the cloud: ok
+  stderr empty, stdout free of escapes, 1 group(s) found, no skipped_cloud key
+
+the pre-flight menu offers --cloud, off: ok
+      default: ...profileautocloudoffno-cacheonforceoffign...
+      with --cloud: ...profileautocloudonno-cacheonforceoffigno...
+      the row tracks the flag: off by default, on with --cloud given
+
+all 4 cases held
+
+   exit 0

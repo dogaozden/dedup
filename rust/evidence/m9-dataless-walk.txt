@@ -1,0 +1,59 @@
+$ python3 rust/evidence/scripts/m9_dataless_walk.py /tmp/m9-capture/walk
+
+$ cargo build --release   (the committed source, before any mutant)
+  ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+
+=== the mutant: SF_DATALESS means UF_HIDDEN for this build only ===
+-   pub const SF_DATALESS: u32 = 0x4000_0000;
++   pub const SF_DATALESS: u32 = 0x0000_8000;
+  ddf7c7a81df53221491ca34e138ccfb13b20b3dcdfa81f3222c73d86fc01a3b3  target/release/dedup-rs   (a different binary)
+
+=== 1. nothing flagged: the baseline this is measured against ===
+  groups:        [4]
+  files_seen:    6
+  bytes_read:    12599296
+  skipped_cloud: (absent)
+  stderr:        ''
+
+=== 2. one member of the group is a placeholder ===
+$ chflags hidden media/reel_2.mov
+  groups:        [3]
+  members:       ['media/reel_0.mov', 'media/reel_1.mov', 'media/reel_3.mov']
+  files_seen:    5   (was 6)
+  bytes_read:    9453568   (was 12599296)
+  skipped_cloud: 1
+  unreadable:    []
+  stderr:        '1 file in cloud — not scanned (--cloud to include)'
+
+=== 3. --cloud puts it back ===
+  groups:        [4]
+  members:       ['media/reel_0.mov', 'media/reel_1.mov', 'media/reel_2.mov', 'media/reel_3.mov']
+  files_seen:    6
+  bytes_read:    12599296
+  skipped_cloud: (absent)
+  stderr:        ''
+
+=== 4. a second placeholder, outside any group ===
+$ chflags hidden lone_0.bin
+  groups:        [3]
+  skipped_cloud: 2
+  stderr:        '2 files in cloud — not scanned (--cloud to include)'
+
+=== 5. the whole tree is placeholders ===
+  groups:        []
+  files_seen:    0
+  bytes_read:    0
+  skipped_cloud: 6
+  exit:          0
+  stderr:        '6 files in cloud — not scanned (--cloud to include)'
+
+=== the stale-mutant rule: restored, and proved restored ===
+$ git diff --stat -- rust/src/cloud.rs
+  ''   (empty = the file is the committed one)
+$ cargo build --release
+  ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+  identical to the pre-mutant binary
+
+every case held: a flagged file is excluded before it becomes a record, counted where a person can see it, absent from --report-json when the count is zero, and read only when --cloud asks for it
+
+   exit 0
