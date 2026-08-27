@@ -7,6 +7,7 @@
 
 mod cache;
 mod cli;
+mod cloud;
 mod compare;
 mod consts;
 mod device;
@@ -56,6 +57,16 @@ struct Report<'a> {
     /// on it, and a number nobody can read out of a run is a number nobody can
     /// check.
     seeks: u64,
+    /// Cloud placeholders this scan did not read, absent from the document
+    /// entirely when there were none.
+    ///
+    /// Skipped rather than always-zero because the M8 fence, restated for M9,
+    /// is that a tree with no dataless files produces byte-identical output to
+    /// the build before this one — and a new key with `0` in it is not
+    /// byte-identical. A referee that has never seen this field is a referee
+    /// scanning a tree that has nothing to say about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_cloud: Option<u64>,
 }
 
 /// Whether the flags on this run ask for the browser, leaving aside whether
@@ -178,7 +189,22 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         include_ext: include_ext.as_deref(),
         skip_ext: &skip_ext,
         excludes: &options.excludes,
+        cloud: options.cloud,
     };
+
+    // Defence in depth, and the second half of M9-CLOUD.md's law. The walk
+    // drops dataless files before they become records; this makes the kernel
+    // refuse to fetch one that got past it anyway — a file EVICTED to the
+    // cloud after the walk saw its bytes cannot be caught by any amount of
+    // walk-time care, and reading it would start a download.
+    //
+    // Set here, after the menu (which may have turned `--cloud` on or off) and
+    // before the first byte is read. Not lifted under `--cloud`, but never
+    // installed: a run that asked to compare cloud files has asked for the
+    // downloads, and overriding a policy the environment set for its own
+    // reasons is not this tool's business.
+    let refusing = !options.cloud && cloud::refuse_materialization();
+    let seen_in_cloud = Arc::new(cloud::Cloud::default());
 
     let rule = match options.auto.as_deref().map(Rule::parse) {
         Some(None) => {
@@ -197,7 +223,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // scan behind it. Everything below this point is the path every other run
     // has always taken, unchanged.
     if live_wanted(tui::has_terminal(), &options) {
-        return live_scan(&options, &root, filters, &effort);
+        return live_scan(&options, &root, filters, &effort, &seen_in_cloud);
     }
     // After the menu, which owns the terminal until it hands it back, and
     // before anything is read.
@@ -214,7 +240,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         }
     });
     let mut scan = if options.stage == "size" {
-        size_stage(&root, filters, &pulse)
+        size_stage(&root, filters, &pulse, &seen_in_cloud)
     } else {
         find_duplicates(
             &root,
@@ -224,6 +250,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             cache.as_mut(),
             options.profile,
             &pulse,
+            &seen_in_cloud,
             // Not live: this is the path every non-interactive run takes.
             None,
         )
@@ -236,6 +263,30 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     }
     scan.unreadable.sort();
     scan.unreadable.dedup();
+    // Which of the files that would not read live in the cloud. Asked now,
+    // of the files that actually failed, rather than tracked through every
+    // read path: the flag is the fact, and a file that was evicted while a
+    // stage was reading it still carries it. On the ordinary run this list is
+    // empty and the loop is over an empty vector.
+    seen_in_cloud.evicted(cloud::in_cloud(&scan.unreadable, |name| {
+        cloud::flags_of(&root.join(name))
+    }));
+    let skipped_cloud = seen_in_cloud.skipped();
+    if let Some(note) = cloud::evicted_notice(&seen_in_cloud.evicted_names()) {
+        eprintln!("{note}");
+    }
+    if let Some(note) = cloud::notice(skipped_cloud) {
+        eprintln!("  {note}");
+        if !options.cloud && !refusing {
+            // Said only where there is already something to say, so a tree
+            // with no cloud files in it stays byte-identical whatever this
+            // machine thinks of the policy.
+            eprintln!(
+                "  (this system would not hold the no-materialize I/O policy; \
+                 the walk-time skip was the only guard on this run)"
+            );
+        }
+    }
 
     let report = Report {
         groups: report_names(&scan.records, scan.reported()),
@@ -245,6 +296,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         unreadable: &scan.unreadable,
         opens: effort.opens(),
         seeks: effort.seeks(),
+        skipped_cloud: (skipped_cloud > 0).then_some(skipped_cloud),
     };
 
     let destination = options
@@ -312,6 +364,7 @@ fn live_scan(
     root: &std::path::Path,
     filters: Filters,
     effort: &Arc<Effort>,
+    cloud: &Arc<cloud::Cloud>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let (live, watch) = live::channel(root);
     // Counters without a painter: in live mode the browser is the progress
@@ -347,6 +400,7 @@ fn live_scan(
                 caching.as_deref_mut(),
                 options.profile,
                 &pulse,
+                cloud,
                 Some(&live),
             );
             // The list is complete; the progress display goes away. The thread

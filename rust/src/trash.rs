@@ -694,12 +694,14 @@ mod selection {
                     include_ext: None,
                     skip_ext: &[],
                     excludes: &[],
+                    cloud: false,
                 },
                 &mut crate::device::VolumeProbe::start(&self.root, Some(1)),
                 effort,
                 None,
                 wanted,
                 &crate::pulse::Pulse::off(),
+                &crate::cloud::Cloud::default(),
                 None,
             )
         }

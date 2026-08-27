@@ -904,6 +904,11 @@ const ATTR_CMN_NAME: u32 = 0x0000_0001;
 const ATTR_CMN_DEVID: u32 = 0x0000_0002;
 const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
 const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+/// `st_flags` — the word `SF_DATALESS` lives in. Free here: the walk was
+/// already making this call and asking for five other attributes, and one more
+/// fixed-width field per entry costs no extra syscall and no extra pass over
+/// the catalog.
+const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
 const ATTR_CMN_FILEID: u32 = 0x0200_0000;
 const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
 const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
@@ -921,6 +926,7 @@ const WANT_COMMON: u32 = ATTR_CMN_RETURNED_ATTRS
     | ATTR_CMN_DEVID
     | ATTR_CMN_OBJTYPE
     | ATTR_CMN_MODTIME
+    | ATTR_CMN_FLAGS
     | ATTR_CMN_FILEID;
 const WANT_FILE: u32 = ATTR_FILE_LINKCOUNT | ATTR_FILE_DATALENGTH;
 
@@ -961,6 +967,8 @@ pub struct BulkEntry {
     pub nlink: u64,
     pub size: u64,
     pub mtime_ns: i64,
+    /// `st_flags`. Only `SF_DATALESS` is read out of it; see `crate::cloud`.
+    pub flags: u32,
 }
 
 /// Scratch reused across every directory of a walk: the kernel's buffer, the
@@ -1106,6 +1114,13 @@ impl BulkDir {
         let objtype = take!(u32);
         let mtime_sec = take!(i64);
         let mtime_nsec = take!(i64);
+        // ATTR_CMN_FLAGS (0x0004_0000) sits between MODTIME (0x0000_0400) and
+        // FILEID (0x0200_0000), so it is read between them: the kernel returns
+        // the fields in the order of their bits, not the order they are asked
+        // for. Reading it in the wrong place would misplace every field after
+        // it — which is why `unique_sizes` and the whole walk would go dark
+        // rather than subtly wrong.
+        let flags = take!(u32);
         let ino = take!(u64);
 
         let name_start = name_reference as i64 + name_offset as i64;
@@ -1146,6 +1161,7 @@ impl BulkDir {
             nlink,
             size,
             mtime_ns: mtime_sec * 1_000_000_000 + mtime_nsec,
+            flags,
         });
         true
     }
@@ -1156,6 +1172,90 @@ impl BulkDir {
             let at = entry.name_at as usize;
             (&self.names[at..at + entry.name_len as usize], entry)
         })
+    }
+}
+
+#[cfg(test)]
+mod bulk_attributes {
+    use super::*;
+    use std::ffi::OsStr;
+    // `st_flags` lives on the macOS extension trait; the rest of the fields
+    // live on the unix one.
+    use std::os::macos::fs::MetadataExt as MacMetadataExt;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Every field the bulk read reports is the field `lstat` reports.
+    ///
+    /// This is the test that says the new `ATTR_CMN_FLAGS` was inserted in the
+    /// right place. The kernel returns attributes in the order of their bits
+    /// with no padding, so a field read at the wrong offset does not fail — it
+    /// silently shifts every field behind it, and `flags` sits in front of
+    /// `ATTR_CMN_FILEID`. Comparing inode, size and mtime against `lstat` as
+    /// well as the flags is what makes that shift visible rather than
+    /// plausible: a misplaced `flags` puts a mangled inode in the record and
+    /// hardlink folding starts joining unrelated files.
+    ///
+    /// `chflags` is used to put a real, non-zero flags word on a real file, so
+    /// the case where flags are interesting is covered and not only the case
+    /// where they are zero (which any misparse would also produce).
+    #[test]
+    fn the_bulk_read_agrees_with_lstat_field_by_field() {
+        let root = std::env::temp_dir().join(format!("dedup-bulk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+
+        let plain = root.join("plain.bin");
+        let flagged = root.join("flagged.bin");
+        std::fs::write(&plain, b"plain bytes").expect("writable");
+        std::fs::write(&flagged, b"a file wearing a flag").expect("writable");
+
+        // UF_HIDDEN — an owner-settable flag, so no privilege is needed, and
+        // one this tool does nothing about, so setting it changes no behaviour.
+        const UF_HIDDEN: u32 = 0x0000_8000;
+        let name = CString::new(flagged.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: `name` is NUL-terminated and outlives the call.
+        let set = unsafe { libc::chflags(name.as_ptr(), UF_HIDDEN) };
+        assert_eq!(set, 0, "chflags refused a flag the owner may set");
+
+        let mut bulk = BulkDir::default();
+        assert!(bulk.read(&root), "the scratch directory came back partial");
+
+        let mut checked = 0;
+        for (raw, entry) in bulk.entries() {
+            let path = root.join(OsStr::from_bytes(raw));
+            let truth = std::fs::symlink_metadata(&path).expect("the file is there");
+            assert_eq!(entry.objtype, VREG, "{path:?}");
+            assert_eq!(entry.ino, truth.ino(), "inode: {path:?}");
+            assert_eq!(entry.size, truth.len(), "size: {path:?}");
+            assert_eq!(entry.nlink, truth.nlink(), "nlink: {path:?}");
+            assert_eq!(
+                entry.mtime_ns,
+                truth.mtime() * 1_000_000_000 + truth.mtime_nsec(),
+                "mtime: {path:?}"
+            );
+            assert_eq!(entry.flags, truth.st_flags(), "flags: {path:?}");
+            if path == flagged {
+                assert_eq!(
+                    entry.flags & UF_HIDDEN,
+                    UF_HIDDEN,
+                    "the flag chflags set did not survive the bulk read"
+                );
+            } else {
+                assert_eq!(entry.flags, 0, "an untouched file carries no flags");
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both files were described");
+
+        // Nothing on this machine is dataless, and the walk must agree —
+        // otherwise every corpus in the freeze proof would start losing files.
+        assert!(
+            bulk.entries()
+                .all(|(_, entry)| !crate::cloud::dataless(entry.flags)),
+            "an ordinary scratch file read as a cloud placeholder"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
