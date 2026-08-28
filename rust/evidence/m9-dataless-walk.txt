@@ -1,12 +1,12 @@
 $ python3 rust/evidence/scripts/m9_dataless_walk.py /tmp/m9-capture/walk
 
 $ cargo build --release   (the committed source, before any mutant)
-  ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+  32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
 
 === the mutant: SF_DATALESS means UF_HIDDEN for this build only ===
 -   pub const SF_DATALESS: u32 = 0x4000_0000;
 +   pub const SF_DATALESS: u32 = 0x0000_8000;
-  ddf7c7a81df53221491ca34e138ccfb13b20b3dcdfa81f3222c73d86fc01a3b3  target/release/dedup-rs   (a different binary)
+  5d24257720802f814c62b77e043703b46c045debf8576a5dcf1f5a8f6bff0e25  target/release/dedup-rs   (a different binary)
 
 === 1. nothing flagged: the baseline this is measured against ===
   groups:        [4]
@@ -51,7 +51,7 @@ $ chflags hidden lone_0.bin
 $ git diff --stat -- rust/src/cloud.rs
   ''   (empty = the file is the committed one)
 $ cargo build --release
-  ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+  32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
   identical to the pre-mutant binary
 
 every case held: a flagged file is excluded before it becomes a record, counted where a person can see it, absent from --report-json when the count is zero, and read only when --cloud asks for it

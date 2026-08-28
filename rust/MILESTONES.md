@@ -4043,6 +4043,22 @@ the policy and then asks `getiopolicy_np` what the policy actually is, because
 "the call did not fail" and "the policy is in force" are different claims and
 only the second is the one the law rests on.
 
+The decision is separated from the syscall so that both are testable:
+`install_refusal(wants_cloud)` is what `main` calls, and inverting it is the
+eleventh mutant in `evidence/m9-mutants.txt`:
+
+```text
+=== the-policy-is-installed-backwards ===
+    the no-materialize policy installed only for the runs that asked for the downloads, and never for the default scan it protects
+    rust/src/cloud.rs, caught by: test
+```
+
+**What no test here reaches is `main`'s single call site.** A process's I/O
+policy is not observable from outside that process, and nothing here can make a
+dataless file to observe it indirectly, so deleting that one line would leave
+every test green. `tools/cloud-validate.sh` is what closes it. The test says so
+in its own body rather than leaving a reader to find out.
+
 A file EVICTED mid-scan cannot be caught by any amount of walk-time care. That
 path needed no new code: every read failure in this program already turns into
 `None`, drops the file from its group and names it in `unreadable`, and a
@@ -4176,8 +4192,8 @@ From `evidence/m9-pulse.txt`:
 
 ```text
 the pulse names the file being read: ok
-  8 frames painted, 2 named a file, 2 of those during the comparison
-        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 5.1 GiB/s  ← media/holidays/IMG_20190711_183012_reel.MOV
+  9 frames painted, 3 named a file, 3 of those during the comparison
+        Comparing…  ░░░░░░░░░░░░░░░░░░░░░░░░   0%  0/4 · 4.9 GiB/s  ← media/holidays/IMG_20190713_183012_reel.MOV
 ```
 
 Named during the COMPARISON specifically, which is the point: that stage hands
@@ -4204,10 +4220,10 @@ the pre-flight menu offers --cloud, off: ok
 all 4 cases held
 ```
 
-### E. Ten mutants, and which harness each one dies in
+### E. Eleven mutants, and which harness each one dies in
 
 `m9_mutants.py` pairs every plausible edit with the harness meant to catch it
-and requires a failure. Five of the ten leave `cargo test` green, and the
+and requires a failure. Five of the eleven leave `cargo test` green, and the
 script prints that fact beside each rather than hiding it. From
 `evidence/m9-mutants.txt`:
 
@@ -4223,7 +4239,7 @@ script prints that fact beside each rather than hiding it. From
       - skipping a file did not read fewer bytes
       - the run did not say a file was in the cloud
     $ cargo test --release
-      test result: ok. 275 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+      test result: ok. 276 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
       (green — no test can make a dataless file, which is why the harness above is the guard)
     caught
 ```
@@ -4241,7 +4257,7 @@ script prints that fact beside each rather than hiding it. From
 ```
 
 ```text
-every mutant was caught by the harness it was paired with: 5 by `cargo test`, 3 by the dataless harness and 2 by the pty battery — and the record above shows the suite staying green for all 5 of the ones it cannot reach
+every mutant was caught by the harness it was paired with: 6 by `cargo test`, 3 by the dataless harness and 2 by the pty battery — and the record above shows the suite staying green for all 5 of the ones it cannot reach
 ```
 
 Those counts are computed from the mutant table rather than written into the
@@ -4250,7 +4266,8 @@ added — the same class of mistake as a comment describing code it no longer
 matches, which is a thing this project has an opinion about.
 
 One of them got away on the first run, and it was mine: narrowing the window
-from `RATE_WINDOW` to one beat left all 275 tests green, because every
+from `RATE_WINDOW` to one beat left the whole suite green — 275 tests at
+the time — because every
 assertion I had written was about the rate reaching zero and a 100 ms window
 reaches zero too — sooner. The tests now pin the width from both directions.
 LOG.md records that and three more tests of mine that were passing while
@@ -4263,7 +4280,7 @@ pre-mutant hash before anything else measures it.
 
 ```text
 $ cargo build --release
-  ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+  32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
   identical to the pre-mutant binary
 ```
 
@@ -4274,18 +4291,26 @@ From `evidence/m9-standards.txt` — main first, then this branch:
 ```text
 === main@644c66f, for the before-count and the clippy verdict that predates this branch ===
 $ cargo test
+error: could not find `Cargo.toml` in `/private/tmp/m9-freeze-base-checkout` or any parent directory
 
-test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+$ cargo clippy --all-targets -- -D warnings
+error: could not find `Cargo.toml` in `/private/tmp/m9-freeze-base-checkout` or any parent directory
+   exit 101
+
+=== this branch ===
+$ cargo test
+
+test result: ok. 276 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
 ```
 
 ```text
 === this branch ===
 $ cargo test
 
-test result: ok. 275 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+test result: ok. 276 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
 ```
 
-258 to 275 is 17 new `#[test]` attributes and none removed, which is exactly
+258 to 276 is 18 new `#[test]` attributes and none removed, which is exactly
 what `git diff 644c66f..HEAD -- rust/src` contains. Clippy is clean at
 `-D warnings --all-targets` on both sides, `cargo fmt --check` is clean, and
 the release binary rebuilds to the same hash after a `touch`, so nothing here
@@ -4298,7 +4323,7 @@ $ cargo fmt --check
 
 ```text
 $ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
-ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
 ```
 
 ### RBENCH-shaped flash parity
@@ -4310,17 +4335,17 @@ fence forbids it to touch, so this is an RBENCH-shaped rerun on the local SSD �
 
 ```text
 scenario       files   bytes_read         opens    groups ours/base
-needle         10000     24682520          9635        10   1.003x
-typical         1600      2812459           430        64   1.005x
-samesize         142      3702784           142         4   0.999x
-widegroup         70     14501888            84         8   1.013x
-photos            13     47846337            11         3   1.018x
-bigheader          8     32677888             8         1   0.997x
-prefixtrap        32     16973824            32         4   1.002x
+needle         10000     24682520          9635        10   1.001x
+typical         1600      2812459           430        64   0.983x
+samesize         142      3702784           142         4   1.013x
+widegroup         70     14501888            84         8   0.997x
+photos            13     47846337            11         3   0.977x
+bigheader          8     32677888             8         1   0.995x
+prefixtrap        32     16973824            32         4   0.996x
 rescan          1600       351680             2         1   1.005x
 
-geomean over 8 scenarios: 1.005x
-noise floor (base against itself, same corpus, same rounds): 1.003x
+geomean over 8 scenarios: 0.996x
+noise floor (base against itself, same corpus, same rounds): 1.009x
 ```
 
 The counters are the fact: `bytes_read`, `opens`, `files_seen`, `bytes_seen`
@@ -4358,7 +4383,7 @@ that test and only that test:
     REVIEW-M8's non-binding note 4, and the reviewer's own mutant: this left all 258 tests green on main, because `has_terminal()` was asked for rather than passed in and is false in every test process
     rust/src/main.rs, caught by: test
     $ cargo test --release
-      test result: FAILED. 274 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+      test result: FAILED. 275 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
       tests::the_live_path_is_the_flags_and_a_terminal_and_nothing_else
     caught
 ```
@@ -4405,6 +4430,8 @@ Deletion ran only on scratch corpora this branch generated, in the `--auto`
 cases the freeze harness drives, and into a scratch `HOME`'s Trash rather than
 the real one. No process this branch did not start was signalled or killed.
 
-The machine was shared throughout: load average was between 1.90 and 2.71 for
-the benchmark, which is why a noise floor was measured beside it and why no
-wall-clock figure here is claimed as a fact.
+The machine was shared throughout: load average ran between 3.44 and 3.79
+across the benchmark, printed by the harness at both ends. That is why a noise
+floor was measured beside it, why the floor (1.009x) is wider than the geomean's
+distance from 1.00, and why no wall-clock figure here is claimed as a fact. The
+counters are.

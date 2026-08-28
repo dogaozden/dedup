@@ -1,34 +1,20 @@
 === main@644c66f, for the before-count and the clippy verdict that predates this branch ===
 $ cargo test
-
-test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
-
+error: could not find `Cargo.toml` in `/private/tmp/m9-freeze-base-checkout` or any parent directory
 
 $ cargo clippy --all-targets -- -D warnings
-    Checking crossterm v0.29.0
-    Checking ratatui-widgets v0.3.2
-    Checking serde_json v1.0.151
-    Checking serde v1.0.229
-    Checking ratatui-crossterm v0.1.2
-    Checking ratatui v0.30.2
-    Checking ahash v0.8.12
-    Checking hashbrown v0.14.5
-    Checking hashlink v0.9.1
-    Checking rusqlite v0.32.1
-    Checking dedup-rs v0.1.0 (/private/tmp/m9-freeze-base-checkout/rust)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s
-   exit 0
+error: could not find `Cargo.toml` in `/private/tmp/m9-freeze-base-checkout` or any parent directory
+   exit 101
 
 === this branch ===
 $ cargo test
 
-test result: ok. 275 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+test result: ok. 276 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
 
 
 $ cargo clippy --all-targets -- -D warnings
-    Checking rusqlite v0.32.1
     Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m9/rust)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.42s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.16s
    exit 0
 
 $ cargo fmt --check
@@ -37,8 +23,8 @@ $ cargo fmt --check
 === the binary the evidence was measured with is the committed source ===
     Finished `release` profile [optimized] target(s) in 0.09s
 $ shasum -a 256 target/release/dedup-rs
-ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
 $ touch src/compare.rs src/consts.rs && cargo build --release
-    Finished `release` profile [optimized] target(s) in 12.46s
+    Finished `release` profile [optimized] target(s) in 12.43s
 $ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
-ae571f81c9e6b0440ed5e75a5f949fc6206fa451a954253f30e9c346c80ae377  target/release/dedup-rs
+32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs

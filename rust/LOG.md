@@ -2854,7 +2854,8 @@ is what makes it cheap.
    failed.
 
 2. **My rate tests did not pin the window's width.** Narrowing `RATE_WINDOW`
-   to one beat left all 275 green: a stall reaches zero under a 100 ms window
+   to one beat left the whole suite of the day green (275 tests): a stall
+   reaches zero under a 100 ms window
    too, just sooner, and every assertion I had written was about reaching
    zero. Found by `m9_mutants.py`, not by reading. It now asserts the rate is
    still NON-zero a moment before a whole window has passed, and about half
@@ -2888,12 +2889,13 @@ still printed, for information.
 
 ### What the suite structurally cannot see
 
-Five of the ten mutants in `m9_mutants.py` leave `cargo test` green, and the
-script prints that fact beside each one rather than hiding it. The per-harness
-counts in its closing sentence are computed from the mutant table, not written
-into the prose — they were written in at first and drifted the moment the tenth
-mutant was added, which is the same defect as a comment describing code it no
-longer matches.
+Five of the eleven mutants in `m9_mutants.py` leave `cargo test` green, and
+the script prints that fact beside each one rather than hiding it. The
+per-harness counts in its closing sentence are computed from the mutant table,
+not written into the prose — they were written in at first and drifted the
+moment a tenth mutant was added, which is the same defect as a comment
+describing code it no longer matches. They have since survived an eleventh
+without anyone touching them.
 
 * Three are invisible because **no test can make a dataless file.**
   `SF_DATALESS` is in `SF_SYNTHETIC`, which `<sys/stat.h>` keeps out of
@@ -2936,3 +2938,33 @@ in `cloud.rs` was taken the same way.
   here because the drift predates this branch.
 * SIGHUP and SIGTERM still leave the terminal raw (M5, recorded by M8), and
   Ctrl+C at the menu is still ignored (M5.1). Neither is touched.
+
+### The policy decision, and the one line no test reaches
+
+M9-CLOUD.md's verification list asks for a unit test that the I/O policy is
+"set by default and lifted under `--cloud`". What I had proved the syscall pair
+works — set it, then ask `getiopolicy_np` whether it took — which is a
+different claim from "the flag is read the right way round", and the second is
+the one a tidy-up breaks. `install_refusal(wants_cloud)` puts the decision and
+the syscall in one function so both can be asked, and it is exactly what `main`
+calls.
+
+`--cloud` declines to install the policy rather than lifting an installed one.
+A run that asked to compare cloud files has asked for the downloads, and
+overriding a policy the surrounding environment set for its own reasons is not
+this tool's business.
+
+What no test reaches is `main`'s single call site. A process's I/O policy is
+not observable from outside that process, and nothing here can make a dataless
+file to observe it indirectly, so deleting that line would leave every test
+green. `tools/cloud-validate.sh` is what closes it, on the maintainer's machine
+and on a real cloud folder. The test says this in its own body: a gap a reader
+has to discover is worse than one that is written down.
+
+This landed after the first claim was written, which meant the release binary
+changed and every measurement in the claim described a binary that no longer
+existed. All of it was re-captured — fence, teeth, gate, mutants, dataless
+walk, pty battery, standards, benchmark — and nine fenced blocks in the claim
+were re-extracted from the new files programmatically rather than retyped.
+`claim_audit.py` caught every one of them, which is the second time on this
+branch it has caught me quoting a number I had not re-read.
