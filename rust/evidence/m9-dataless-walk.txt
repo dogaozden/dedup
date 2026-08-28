@@ -1,12 +1,12 @@
 $ python3 rust/evidence/scripts/m9_dataless_walk.py /tmp/m9-capture/walk
 
 $ cargo build --release   (the committed source, before any mutant)
-  32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
 
 === the mutant: SF_DATALESS means UF_HIDDEN for this build only ===
 -   pub const SF_DATALESS: u32 = 0x4000_0000;
 +   pub const SF_DATALESS: u32 = 0x0000_8000;
-  5d24257720802f814c62b77e043703b46c045debf8576a5dcf1f5a8f6bff0e25  target/release/dedup-rs   (a different binary)
+  5136282b85b0484f593d878383f8495340bfd3678310ab2993c30d9fed070dde  target/release/dedup-rs   (a different binary)
 
 === 1. nothing flagged: the baseline this is measured against ===
   groups:        [4]
@@ -47,11 +47,21 @@ $ chflags hidden lone_0.bin
   exit:          0
   stderr:        '6 files in cloud — not scanned (--cloud to include)'
 
+=== 6. an eviction, under --cloud (REVIEW-M9 item 3) ===
+$ chflags hidden media/reel_1.mov && chmod 000
+  groups:        [3]
+  unreadable:    ['media/reel_1.mov']
+  skipped_cloud: 1
+  stderr:
+    dedup-rs: media/reel_1.mov lives in the cloud and was evicted while this scan was reading it; it was left out of its group rather than downloaded. Its bytes could not be fetched.
+
 === the stale-mutant rule: restored, and proved restored ===
-$ git diff --stat -- rust/src/cloud.rs
-  ''   (empty = the file is the committed one)
+$ cmp rust/src/cloud.rs (the bytes read before the mutant)
+  (no output: identical, so the mutant is gone)
+$ git diff --stat -- rust/src/cloud.rs   (for information only)
+  ''
 $ cargo build --release
-  32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
   identical to the pre-mutant binary
 
 every case held: a flagged file is excluded before it becomes a record, counted where a person can see it, absent from --report-json when the count is zero, and read only when --cloud asks for it

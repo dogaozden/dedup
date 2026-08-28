@@ -4321,45 +4321,17 @@ $ cargo build --release
 
 ### Standards
 
-From `evidence/m9-standards.txt` — main first, then this branch:
-
-```text
-=== main@644c66f, for the before-count and the clippy verdict that predates this branch ===
-$ cargo test
-error: could not find `Cargo.toml` in `/private/tmp/m9-freeze-base-checkout` or any parent directory
-
-$ cargo clippy --all-targets -- -D warnings
-error: could not find `Cargo.toml` in `/private/tmp/m9-freeze-base-checkout` or any parent directory
-   exit 101
-
-=== this branch ===
-$ cargo test
-
-test result: ok. 276 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
-```
-
-```text
-=== this branch ===
-$ cargo test
-
-test result: ok. 276 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
-```
-
-258 to 276 is 18 new `#[test]` attributes and none removed, which is exactly
-what `git diff 644c66f..HEAD -- rust/src` contains. Clippy is clean at
-`-D warnings --all-targets` on both sides, `cargo fmt --check` is clean, and
-the release binary rebuilds to the same hash after a `touch`, so nothing here
-was measured with a stale one:
-
-```text
-$ cargo fmt --check
-(no output: clean)
-```
-
-```text
-$ shasum -a 256 target/release/dedup-rs   (identical = it was not stale)
-32055521d201410150c11ceddfd6cca8b75efbcfc0fe02e2ef7670f1db655bd3  target/release/dedup-rs
-```
+**The capture this section quoted was broken, and the correction is in the fix
+round below.** `m9_standards.sh` takes `<base-checkout>/rust`; the re-capture
+was given the checkout without `/rust`, so the whole `main@644c66f` half of it
+failed with "could not find `Cargo.toml`" — while the prose here went on
+claiming 258 tests on main and clippy clean "on both sides". The quoted block
+was a verbatim quote of a failed run, which is why `claim_audit.py` passed it:
+that tool proves a quote is faithful to a file, not that the sentences around
+it are supported by what the file says. Nothing was measured wrongly — the
+branch's own figures in that block were real, and the first capture of this
+file, before the re-capture overwrote it, had the base half right — but the
+record was wrong and is superseded. See "Standards, re-derived" below.
 
 ### RBENCH-shaped flash parity
 
@@ -4470,3 +4442,252 @@ across the benchmark, printed by the harness at both ends. That is why a noise
 floor was measured beside it, why the floor (1.009x) is wider than the geomean's
 distance from 1.00, and why no wall-clock figure here is claimed as a fact. The
 counters are.
+
+---
+
+## M9 — fix round after REVIEW-M9 — 2026-08-28 — RE-CLAIMED
+
+REVIEW-M9 returned CHANGES on four binding items and ratified the milestone's
+shape: the no-materialization law survived a complete hand-trace of all five
+`Effort::open` sites, and the flag-swap harness was ruled faithful. None of the
+four was a design objection. All four are closed below, with the reviewer's own
+verification recipes run here first.
+
+Two of the four non-binding notes are taken as well, and one item turned up a
+second instance of itself while being proved.
+
+### 1. The I/O policy verified itself against its own constants
+
+`refuse_materialization` set the policy and then asked `materialization_refused`
+whether it took — but both spelled the scope and the value with the SAME
+symbols, so any wrong value was self-consistent and invisible. The reviewer
+showed two one-character mutants passing all 276 tests while the process was
+either shielding nobody (thread-scoped, and every byte is read on a rayon
+worker) or asking the kernel to DOWNLOAD. The shipped values were right; the
+guard was missing, where `SF_DATALESS` had one already.
+
+**The test is the reviewer's, taken as written and credited** — the three
+`IOPOL` constants pinned to their header values, plus an assertion that the
+refusal is visible from a spawned thread. `m9_policy_guard.py` runs the
+reviewer's recipe. Three of its four mutants are caught by the literal pins;
+the fourth is the one that matters, because a literal pin can always be
+"fixed" by editing the literal:
+
+```text
+=== scope -> THREAD, with its literal pin edited to agree ===
+    what somebody tidying up a failing assertion would really do. Only the spawned-thread assertion can catch this, and it must
+    -   IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+    +   IOPOL_SCOPE_PROCESS: libc::c_int = 1;
+    -   assert_eq!(IOPOL_SCOPE_PROCESS, 0);
+    +   assert_eq!(IOPOL_SCOPE_PROCESS, 1);
+    $ cargo test --release
+      test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+      cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers
+      thread 'cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers' (2126820) panicked at src/cloud.rs:369:9:
+      assertion `left == right` failed: a worker thread is not covered by the refusal
+    caught by the_policy_constants_are_the_headers_and_the_shield_covers_workers
+```
+
+Only the behavioural half can catch that, and it does — which is what makes the
+scope a tested property rather than a remembered one.
+
+```text
+every wrong constant is caught, and the scope is caught even when its literal pin has been edited to agree with it — which is the half that makes it a tested property rather than a remembered one
+```
+
+### 2. The claim said the window was pinned from both directions, and it was not
+
+It was not: 900 ms and 2 s both passed. Worse, the 100 ms case the first claim
+leaned on "failed" through an underflow in the test's own arithmetic
+(`window_ms - 400`) rather than through an assertion — which under `--release`
+would have wrapped silently instead of panicking. That underflow is fixed.
+
+The tests now hold the width with a bracket taken from the spec rather than
+from taste: **at least a second**, because a shorter window cannot bridge the
+gaps between 512 KiB reads and would report ordinary reading as a stall; **at
+most five**, because M9-CLOUD.md asks that "a stalled read must read ~0 within a
+few seconds". `m9_rate_window.py` runs the reviewer's own sweep:
+
+```text
+from_millis(100) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:672:9:
+from_millis(500) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:672:9:
+from_millis(900) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:672:9:
+from_secs(1)     test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:704:9:
+from_secs(2)     test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+from_secs(60)    test result: FAILED. 275 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   pulse::tests::polling_faster_than_the_spacing_does_not_grow_the_window
+                   src/pulse.rs:672:9:
+```
+
+```text
+admitted: from_secs(2)
+refused:  from_millis(100), from_millis(500), from_millis(900), from_secs(1), from_secs(60)
+```
+
+100 ms, 500 ms, 900 ms and 60 s fail the bracket. One second fails for a better
+reason: at ten readings wide, "half a window into a stall" falls between
+readings and the decay-shape assertion cannot resolve it — so the tests also
+say the window must be several times the reading spacing to mean anything.
+
+**Two seconds passes, and that is correct.** The reviewer said 2 s would satisfy
+the spec, and it does. The exact choice of three is a tuning judgement defended
+in `consts.rs` and by nothing else, and the claim no longer says otherwise.
+What the tests pin is the SHAPE of the decay, the readings bound above and
+below, and that bracket.
+
+### 3. A `--cloud` run that met an eviction was told to pass `--cloud`
+
+Fixed by silencing the skip notice under the flag: under `--cloud` the walk
+skips nothing, so a non-zero count can only be evictions, and `evicted_notice`
+has already said the true thing better.
+
+Proving it turned up **the same defect one line up**, which the review did not
+name: the eviction sentence's own tail said "--cloud to download and compare".
+That is reachable in production — under `--cloud` the policy is not installed,
+so a dataless read normally downloads and succeeds, but a provider or network
+that fails leaves the file unread and still dataless. It now says the bytes
+could not be fetched.
+
+`m9_dataless_walk.py` grew a case for it: under the flag swap, a flagged and
+unreadable member is an eviction by every route the code takes, without needing
+to change a flag mid-scan.
+
+```text
+=== 6. an eviction, under --cloud (REVIEW-M9 item 3) ===
+$ chflags hidden media/reel_1.mov && chmod 000
+  groups:        [3]
+  unreadable:    ['media/reel_1.mov']
+  skipped_cloud: 1
+  stderr:
+    dedup-rs: media/reel_1.mov lives in the cloud and was evicted while this scan was reading it; it was left out of its group rather than downloaded. Its bytes could not be fetched.
+```
+
+No `--cloud` anywhere in a `--cloud` run's output; the file named, its group
+honest, exit 0.
+
+### 4. `cloud-validate.sh` reported `tee`'s exit status as the scan's
+
+`${pipestatus[1]}`, captured on the line straight after the pipeline, plus a
+note when the scan failed. Proved against a stub binary that exits 3, which the
+transcript now shows as `exit 3` where it used to show `tee`'s 0.
+
+### Non-binding notes taken
+
+**1.** The portable path's justification was a judgement written as a fact. It
+now separates what is proven — a placeholder reaching that path becomes a
+record and surfaces as an eviction, the I/O policy holding the law there — from
+what is relied upon: that a filesystem refusing an attribute request is unlikely
+to host placeholders. Neither the reviewer nor I could test the second.
+
+**3.** The kernel's default is to materialize. The reviewer probed a process
+that never calls `setiopolicy_np` and found downloading ENABLED, which is the
+strongest single argument for the call existing. Recorded in `cloud.rs`.
+
+**4.** `--cloud` declines to install the policy rather than lifting an installed
+one. The observable consequence, which was not written anywhere a reader of this
+file would find it: a `--cloud` run inside an environment that has already set
+the policy will still refuse to download. That is deliberate — overriding a
+policy the surrounding environment set for its own reasons is not this tool's
+business.
+
+**2** is in the fix commit: `m9_dataless_walk.py` proved its restore with
+`git diff`, which cost the reviewer a wrong result. It compares bytes now, as
+`m9_mutants.py` already did.
+
+### The fence, re-run against the new binary
+
+Every figure below was re-taken: adding the guard changed the release binary,
+so the first claim's measurements described a binary that no longer existed.
+
+```text
+84 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+```
+
+```text
+THE GATE HAS TEETH: the mutant was caught, so "0 differing" means something
+```
+
+```text
+33 check(s), 0 failed
+gate all: green
+```
+
+### Standards, re-derived
+
+```text
+=== main@644c66f, for the before-count and the clippy verdict that predates this branch ===
+$ cargo test
+
+test result: ok. 258 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+```
+
+```text
+=== this branch ===
+$ cargo test
+
+test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+```
+
+258 to 277 is 19 new `#[test]` attributes and none removed. Clippy is clean at
+`-D warnings --all-targets` on both sides and `cargo fmt --check` is clean.
+
+**This is also the correction to the archived section above**, whose standards
+block quoted a run where the `main` half had failed outright because
+`m9_standards.sh` was given the base checkout without its `/rust`. The prose
+around it claimed 258 and "clippy clean on both sides" over evidence showing two
+errors. `claim_audit.py` passed it because the quote was faithful to the file —
+which is the limit of what that tool can prove, and worth knowing: **it checks
+that quotes are real, not that the sentences around them are earned.** Three
+times on this branch it has caught a number I had not re-read; this is the first
+time it could not.
+
+### RBENCH-shaped flash parity, re-run
+
+```text
+scenario       files   bytes_read         opens    groups ours/base
+needle         10000     24682520          9635        10   1.036x
+typical         1600      2812459           430        64   1.019x
+samesize         142      3702784           142         4   1.004x
+widegroup         70     14501888            84         8   0.997x
+photos            13     47846337            11         3   0.982x
+bigheader          8     32677888             8         1   0.995x
+prefixtrap        32     16973824            32         4   0.979x
+rescan          1600       351680             2         1   1.011x
+
+geomean over 8 scenarios: 1.003x
+noise floor (base against itself, same corpus, same rounds): 0.980x
+```
+
+Counters identical on every scenario, which is the part that is a fact. The
+geomean sits inside the noise floor measured beside it on the same machine.
+
+### Fence conditions this fix round was made under
+
+Worktree `/Users/dogaozden/AI_Projects/dedup-m9`, branch `m9-cloud`, based on
+`main@644c66f`. Not merged, not pushed. **The reviewer's worktree and its
+`m9-review` branch were never entered or modified**; `REVIEW-M9.md` was read
+with `git show m9-review:rust/REVIEW-M9.md` from this worktree. No other branch
+touched, no harness file under `conformance/`, `rbench/`, `bench/` or `xbench/`
+modified, no `sudo`. No file under `~/Library/CloudStorage` was read, listed or
+stat'd. `/Volumes` holds only a pre-existing symlink dated before this branch
+was cut, and the conformance gate's own `dedupconf` image, which it detaches.
+
+One thing worth recording, because it is the hazard this project has a rule
+about. A capture run was killed by a ten-minute timeout **while a mutant was
+applied**, leaving `IOPOL_MATERIALIZE_DATALESS_FILES_OFF` set to 2 — the "ask
+the kernel to download" mutant — in the working tree. `git diff` found it
+immediately, `git checkout` restored it, and the binary was rebuilt to the hash
+every other measurement here was taken with before anything else ran. It is
+recorded rather than quietly fixed because it is exactly the stale-mutant
+failure the rule exists for, and because the scripts' own `finally` blocks
+cannot protect against SIGTERM.

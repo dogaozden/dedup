@@ -2968,3 +2968,110 @@ walk, pty battery, standards, benchmark — and nine fenced blocks in the claim
 were re-extracted from the new files programmatically rather than retyped.
 `claim_audit.py` caught every one of them, which is the second time on this
 branch it has caught me quoting a number I had not re-read.
+
+## 2026-08-28 — REVIEW-M9, the fix round
+
+### A guard that agreed with itself
+
+The one that mattered. `refuse_materialization` set the I/O policy and then
+asked `materialization_refused` whether it had taken — and both spelled the
+scope and the value with the same two symbols. So the check could only ever
+confirm that a constant equalled itself. The reviewer changed
+`IOPOL_SCOPE_PROCESS` from 0 to 1 and every one of 276 tests stayed green while
+the process shielded nobody: the scope binds the calling thread, and every byte
+this tool reads is read on a rayon worker. Changing `..._OFF` from 1 to 2 —
+which is `..._ON` — made the process ask the kernel to DOWNLOAD, and report
+success.
+
+Both values shipped correct. What shipped missing was any guard at all, on the
+mechanism the whole milestone falls back to. `SF_DATALESS` had exactly this
+discipline three functions away (`assert_eq!(SF_DATALESS, 0x4000_0000)`) and I
+did not carry it across.
+
+The reviewer wrote the fix and proved it bites; I took it as written and say so
+in the test. The half I would not have thought of is the second one: assert the
+refusal is visible **from a spawned thread**. Pinning a literal can always be
+"fixed" by editing the literal, and `m9_policy_guard.py` runs that exact
+scenario — scope changed AND its pin edited to agree — where only the
+behavioural assertion can catch it.
+
+**The rule:** a self-check written from the same constants as the thing it
+checks is not a check. Ask the kernel, from somewhere the setting had to travel
+to get to.
+
+### A sentence I could not have written if I had run the sweep
+
+"The tests now pin the width from both directions" was false, and I wrote it
+right after the mutant battery caught me for the first version of the same
+mistake. The battery had one mutant — one beat — and I concluded from its
+failure that the width was pinned. The reviewer swept six widths and found 900
+ms and 2 s green.
+
+The 100 ms case is worse than a gap. It "failed" through `window_ms - 400`
+underflowing, not through an assertion — arithmetic on `u64`, which panics in
+debug and **wraps silently under `--release`**. So the one data point I had was
+not even the kind of failure I thought it was.
+
+What the width is held by now is a bracket taken from the spec rather than from
+taste — at least a second to bridge the gaps between reads, at most five for
+"~0 within a few seconds". Two seconds still passes, and should. The exact
+three is a tuning judgement and the claim says so.
+
+**The rule:** one mutant is one data point. A property worth claiming is worth
+sweeping.
+
+### The same defect, one line up
+
+Item 3 was the skip notice telling a `--cloud` run to pass `--cloud`. While
+writing the end-to-end proof I read the line above it, which is the eviction
+sentence, and it ended "--cloud to download and compare." Same nonsense, same
+run, not in the review. Reachable: under `--cloud` the policy is not installed,
+so a dataless read normally downloads and succeeds — but a provider or a network
+that fails leaves the file unread and still dataless.
+
+**The rule:** when a reviewer names one instance of a wording defect, read the
+sentences around it before declaring the class closed.
+
+### What `claim_audit.py` cannot do, learned the hard way
+
+The re-capture of `m9-standards.txt` was given the base checkout without its
+`/rust`, so the entire `main@644c66f` half failed with "could not find
+`Cargo.toml`". My programmatic block-refresh then lifted that failure into the
+claim verbatim — and the prose around it went on saying 258 tests on main and
+clippy clean "on both sides".
+
+`claim_audit.py` passed it, correctly. It proves a fenced block is a faithful
+quote of a file under `evidence/`. It cannot know whether the sentences around
+the block are earned by it. Three times on this branch that tool has caught me
+quoting a number I had not re-read; this is the first time it could not, and the
+reason is worth writing down rather than treating the green as absolution.
+
+**The rule:** the audit checks that quotes are real. Reading the block and
+asking whether it says what the paragraph claims is still a person's job.
+
+### A mutant left in the tree by a timeout
+
+A capture run was killed at a ten-minute limit while a mutant was applied, and
+left `IOPOL_MATERIALIZE_DATALESS_FILES_OFF = 2` — the download-anyway mutant —
+sitting in `cloud.rs`. Every mutant script here reverts in a `finally`, and a
+`finally` does not run on SIGTERM.
+
+It was caught by checking `git diff` before trusting anything, which is the
+first thing the brief says to do. Restored from the commit, rebuilt to the hash
+every measurement here was taken with, and recorded in the claim. The lesson is
+not to add trap handlers — it is that "the script restores it" is a claim about
+the happy path, and the tree has to be checked, not assumed.
+
+### Defects found and not fixed
+
+* **The live path never classifies evictions.** `run()` asks `cloud::in_cloud`
+  which of the unreadable files are dataless; `live_scan` does not, so a file
+  evicted during an interactive scan leaves its group honestly and silently —
+  the browser's "N in cloud" counts walk-time skips only. The law holds (the
+  file is not read either way) and the fix is three lines mirroring `run()`,
+  but it is a behaviour change that would ship with weaker evidence than
+  everything around it: proving it needs an eviction driven through a pty and a
+  browser. Reported rather than slipped in during a fix round. It is why item 3
+  is only reachable on the non-interactive path today.
+* SIGHUP and SIGTERM still leave the terminal raw (M5), Ctrl+C at the menu is
+  still ignored (M5.1). Neither touched, both pre-existing.
