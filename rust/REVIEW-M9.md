@@ -812,3 +812,288 @@ enforces, count what was skipped where a person will see it, and replace the
 lifetime average with a window that can actually reach zero — is right, and the
 parts of it I tried hardest to break did not break. The law held every way I
 came at it.
+
+---
+
+# Re-review — 2026-08-28, at `500d9cd`
+
+**Verdict: APPROVED.**
+
+Two commits on top of `962fa3c`, no history rewrite (`962fa3c` is still an
+ancestor, checked with `git merge-base --is-ancestor` rather than taken from the
+hand-off) and the base is still `644c66f`. All four binding items are
+discharged, each by the recipe I wrote in the first round rather than by the
+builder's own script, and all four non-binding notes were taken.
+
+Everything below I ran myself: a fresh `git archive` extraction of `500d9cd`
+built beside my `main@644c66f` build, and a separate isolated `git clone`
+detached at `500d9cd` for the mutants. The builder's worktree was neither read
+from nor written to.
+
+```text
+$ shasum -a 256 .../builds/fix/rust/target/release/dedup-rs
+27602f507c42b5d373ed8589b568590b2cc410efd77547dc720438e14696764d   (archive build)
+$ shasum -a 256 .../mut2/rust/target/release/dedup-rs
+2cac29ea2b63aa19da2d3dd4551bc0af17837a7ba91669354d3f9e2b5a0b50b1   (mutant lab)
+```
+
+After every mutant this round the source was restored and the binary rebuilt to
+`2cac29ea…`, byte for byte, and the lab finished on an empty `git status`.
+
+**Three of the four items were closed more thoroughly than I asked**, and I want
+that on the record before the details, because in each case the builder found
+something my recipe would have missed.
+
+## Item 1 — discharged, and the guard is behavioural rather than remembered
+
+My test was taken as written, with an attribution comment that states the two
+mutants and why the self-consistency made them invisible. My recipe was to apply
+each constant mutant and require `cargo test` to fail on each, naming a test
+about the policy. Mine, in my own lab, with a fourth mutant I added this round:
+
+```text
+mutant                                    result                     failing test
+scope 0 -> 1 (THREAD, the false shield)   FAILED. 276 passed, 1      the_policy_constants_are_the_
+                                                                     headers_and_the_shield_covers_workers
+..._OFF 1 -> 2 (ask it to DOWNLOAD)       FAILED. 276 passed, 1      (same)
+type 3 -> 6 (IGNORE_CONTENT_PROTECTION)   FAILED. 274 passed, 3      (same, +2)
+BASIC_MASK 3 -> 7 (swallows _ORIG)        FAILED. 276 passed, 1      (same)
+```
+
+All four caught, each naming a test that is about the policy rather than about
+something incidental.
+
+**The half I most wanted to check.** My review warned that pinning a literal can
+be "fixed" by editing the literal, so I stripped the four `assert_eq!` lines out
+and left only the behavioural assertion, then applied the false shield:
+
+```text
+thread '...the_policy_constants_are_the_headers_and_the_shield_covers_workers'
+panicked at src/cloud.rs:365:9:
+assertion `left == right` failed: a worker thread is not covered by the refusal
+test result: FAILED. 0 passed; 1 failed
+```
+
+The behavioural half catches it on its own, with exactly the right message. The
+scope is now a tested property, not a remembered one.
+
+**And the builder built the mutant I only described.** `m9_policy_guard.py`
+carries a fourth case — "scope -> THREAD, with its literal pin edited to agree"
+— which is precisely the defeat I named in the item, and the worker assertion
+catches it. That is better evidence than I asked for, and it is the difference
+between a guard and a guard that has been attacked.
+
+## Item 2 — discharged, and solved a third way
+
+I offered two shapes: pin the width to a literal, or correct the sentence. The
+builder did neither and did something better — derived a bracket from the spec's
+own two requirements (`>= 1s`, because a shorter window cannot bridge the gaps
+between 512 KiB reads and would report ordinary reading as a stall; `<= 5s`,
+because `M9-CLOUD.md` asks that a stall read ~0 "within a few seconds") and
+asserted *that*, while correcting the claim to say exactly what is and is not
+pinned. `MILESTONES.md` now separates the shape of the decay, which is pinned,
+from the width, which is bracketed and not pinned to a value, and says so in
+those words.
+
+My sweep, re-run against the fix — the same values as round one plus four more:
+
+```text
+RATE_WINDOW      round 1 (962fa3c)   round 2 (500d9cd)   caught by
+100 ms           FAILED (underflow)  FAILED              the bracket
+500 ms           FAILED              FAILED              the bracket
+900 ms           ok — SURVIVED       FAILED              the bracket
+999 ms           (not run)           FAILED              the bracket
+1 s              FAILED              FAILED              half-a-window shape
+2 s              ok — SURVIVED       ok  (admitted)
+3 s              ok  (shipped)       ok  (shipped)
+4 s              (not run)           FAILED              readings-count bound
+5 s              FAILED              FAILED              readings-count bound
+6 s              FAILED              FAILED              the bracket
+60 s             FAILED              FAILED              the bracket
+```
+
+**My round-one survivor at 900 ms is now caught**, and the admitted set is
+exactly `{2s, 3s}`. The 100 ms case no longer depends on an arithmetic underflow
+— it fails on the bracket assertion, with a message naming the bracket — which
+also closes the `--release` concern, and the evidence file records a
+`cargo test --release` run rather than leaving me to wonder.
+
+`m9-rate-window.txt` closes with "the two widths the spec allows are the two the
+tests admit". I suspected that of being an overstatement and checked it rather
+than writing it up: 4 s and 5 s are both refused by the full suite (by
+`polling_faster_than_the_spacing_does_not_grow_the_window`, on the readings
+count, not by the bracket). The sentence is precise. Recorded because my
+suspicion was wrong and the check is what made the difference.
+
+## Item 3 — discharged, and the builder found the half I missed
+
+I named the skip notice. The builder fixed that and then found the same flaw one
+sentence earlier, in `evicted_notice`'s own tail — "--cloud to download and
+compare" was equally nonsense to a run that had already passed `--cloud` — and
+also threaded `wants_cloud` through `run_live` into `summarise_live`, so the
+**live browser's closing summary** is fixed too. I had only tested the frozen
+path. The `LOG.md` note on why the `--cloud` eviction case is reachable in
+production is correct: under `--cloud` the policy is not installed, so a dataless
+read normally downloads and succeeds, and it is a provider or network failure
+that leaves the file unread and still dataless.
+
+My own fault injection, re-run with assertions updated for the corrected
+wording:
+
+```text
+exit:           0
+groups:         [['media/reel_0.mov', 'media/reel_2.mov']]
+unreadable:     ['media/reel_1.mov']
+skipped_cloud:  1
+stderr:
+  dedup-rs: media/reel_1.mov lives in the cloud and was evicted while this scan
+  was reading it; it was left out of its group rather than downloaded. Its bytes
+  could not be fetched.
+
+the evicted file left its group, was named, was counted, and the scan finished cleanly
+```
+
+The eviction sentence survives and still names the file; `--cloud` appears
+nowhere in the output of a run that passed `--cloud`; the file still leaves its
+group and the group still survives as a real pair.
+
+The second half of my recipe — that a clean `--cloud` run still says nothing,
+and that the *default* path keeps the advice that is actually useful:
+
+```text
+2. one member is a placeholder     stderr: '1 file in cloud — not scanned (--cloud to include)'
+3. --cloud puts it back            stderr: ''      skipped_cloud: (absent)
+5. the whole tree is placeholders  stderr: '6 files in cloud — not scanned (--cloud to include)'
+6. an eviction, under --cloud      stderr: (the eviction sentence, no --cloud advice)
+```
+
+Case 6 is new: the builder added a regression test for this item to their own
+harness. One check I made that the item did not ask for: the machine-readable
+count is **not** suppressed — `skipped_cloud: 1` is still in the report under
+`--cloud`. Only the human advice is dropped, which is the right split.
+
+## Item 4 — discharged
+
+```text
+$ DEDUP_BIN=<a stand-in that writes a report and exits 3> ./tools/cloud-validate.sh <scratch tree>
+   exit 3
+NOTE: the scan itself failed. Everything below still measures the tree,
+
+$ DEDUP_BIN=<the real binary> ./tools/cloud-validate.sh <scratch tree>
+   exit 0
+PASS: not one block was fetched. The scan read no cloud file.
+```
+
+`${pipestatus[1]}` captured on the line straight after the pipeline, with a
+comment saying why `$?` is wrong there. The failing case now says so loudly; the
+passing case is unchanged and raises no spurious note. At `962fa3c` the first
+case printed `exit 0`.
+
+## Non-binding notes 1-4 — all taken
+
+Note 1: `gather_portable`'s doc comment is rewritten to separate **what is
+proven** (a placeholder reaching that path becomes a record, its read fails under
+the policy rather than downloading, and it surfaces as a named and counted
+eviction) from **what is relied upon and not proven** (that a filesystem
+refusing an attribute request is unlikely to host placeholders), and states in as
+many words that neither of us could test the latter. It also records that adding
+`ATTR_CMN_FLAGS` to `WANT_COMMON` widened the door into that function. That is
+the honest shape.
+
+Note 2: `m9_dataless_walk.py` compares the file's bytes against the bytes read at
+entry; `git diff` is printed for information only. I verified it with the exact
+mutant that cost me a wrong result — the scope mutant, in `cloud.rs`, the file
+the harness itself edits:
+
+```text
+  (no output: identical, so the mutant is gone)
+every case held: ...
+```
+
+No false failure. The harness now judges its own cases rather than the repository's
+git state, and is composable with another mutant in the same file.
+
+Note 3: the kernel default is recorded in `cloud.rs` — "REVIEW-M9 probed a process
+that never calls `setiopolicy_np` and found materialization ENABLED. The kernel's
+default is to download." That is the sentence that tells the next reader the call
+is load-bearing.
+
+Note 4: `MILESTONES.md` now records that `--cloud` declines to install rather than
+lifting, and the observable consequence — a `--cloud` run inside an environment
+that has already set the policy will still refuse to download.
+
+## The fence and the standards, re-derived on the new tip
+
+The fix touched `cloud.rs`, `main.rs`, `walk.rs` and `tui/mod.rs`, so a fence
+proof from `962fa3c` would not have covered it. Re-run, my own 66 cases, my own
+corpora, reader count pinned:
+
+```text
+$ python3 rv9_fence.py compare fence/base1 fence/fix
+66 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+
+$ candidate --cloud  vs  candidate --list, same six corpora
+6 corpora compared, 0 differing
+```
+
+```text
+$ cargo test        main@644c66f     258 passed
+$ cargo test        m9-cloud@500d9cd 277 passed
+$ cargo clippy --all-targets -- -D warnings    CLIPPY_EXIT=0
+$ cargo fmt --check                            FMT_EXIT=0
+$ python3 conformance/run.py --gate all --candidate '…'
+  33 check(s), 0 failed        gate all: green
+  /Volumes `\]` before and after; hdiutil info | grep -c dedupconf -> 0
+$ python3 rust/evidence/scripts/claim_audit.py M9     11 block(s), 0 untraced
+$ python3 rust/evidence/scripts/claim_audit.py --all  0 untraced anywhere
+$ python3 rust/evidence/scripts/m9_pulse.py           all 4 cases held
+```
+
+276 → 277 reconciles exactly: the diff adds one `#[test]` and removes none, and
+that one is the guard from item 1. My round-one mutants still behave: the
+detection line deleted from the walk still leaves `cargo test` green at 277 and
+is still caught by the flag-swap harness, which is the documented shape and not
+a regression.
+
+## Spot-check of the re-captured evidence
+
+`m9-standards.txt`, `m9-policy-guard.txt` and `m9-rate-window.txt` agree with my
+own independent runs case for case — 258 and 277, the same four policy mutants
+with the same failing test, and the same sweep verdicts for the six widths we
+both ran. The two new evidence scripts run and pass in my lab. Nothing in the
+re-captured set describes a binary that no longer exists, which is the failure
+the builder was bitten by once already and recorded.
+
+## Defects still open, and still not M9's
+
+SIGHUP and SIGTERM leave the terminal raw — M5's. Ctrl+C at the menu is ignored
+— M5.1's. Both unchanged and correctly ungraded here.
+
+## Fence conditions this round was made under
+
+Same worktree, `/Users/dogaozden/AI_Projects/dedup-m9-review` on `m9-review`. All
+verification in a fresh scratch extraction and an isolated clone of `500d9cd`.
+The builder's worktree `/Users/dogaozden/AI_Projects/dedup-m9` was neither read
+from nor written to. No pushes, no branch deleted, no `sudo`, no process killed
+that I did not start, `main` and `m9-cloud` untouched.
+
+Nothing went near `~/Library/CloudStorage`, `/Volumes/My New Passport`, or any
+real user data; `cloud-validate.sh` was again run only against a scratch tree I
+generated. `/Volumes` held `\]` before and after and no `dedupconf` image was
+left attached.
+
+## Disposition
+
+**M9 is APPROVED at `500d9cd`.** The no-materialization law holds and is now
+guarded at both of its mechanisms rather than one: the walk-time detector was
+always attacked by the flag-swap harness, and the I/O policy — the backstop that
+was invisible to every test in round one — now fails loudly if its scope, its
+type, its value or its mask is wrong, and fails behaviourally from a worker
+thread even if the literals are edited to agree. The fence holds on my own
+corpora against the new tip. The 1/t regression is dead, the width is honestly
+described, and the messages no longer advise a flag the run already passed.
+
+Three of the four fixes are better than what I specified, and in each case
+because the builder kept pulling on the thread after the item was technically
+closed. That is the standard this project's reviews are supposed to produce.
