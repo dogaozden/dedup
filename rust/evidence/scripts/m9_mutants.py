@@ -150,6 +150,15 @@ MUTANTS = [
         "UF_COMPRESSED folded in, which drops real local files as 'cloud'",
     ),
     (
+        "the-policy-is-installed-backwards",
+        "rust/src/cloud.rs",
+        "    !wants_cloud && refuse_materialization()",
+        "    wants_cloud && refuse_materialization()",
+        "test",
+        "the no-materialize policy installed only for the runs that asked for "
+        "the downloads, and never for the default scan it protects",
+    ),
+    (
         "the-window-becomes-the-lifetime",
         "rust/src/pulse.rs",
         "        while self.readings.len() >= 2\n"

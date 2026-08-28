@@ -95,6 +95,20 @@ pub fn refuse_materialization() -> bool {
     materialization_refused() == Some(true)
 }
 
+/// Install the refusal, unless this run asked for the downloads.
+///
+/// The decision and the syscall in one place, so the decision is testable:
+/// `main` calls exactly this, and a test can ask it both questions. `--cloud`
+/// does not LIFT an installed policy, it declines to install one — a run that
+/// asked to compare cloud files has asked for the downloads, and overriding a
+/// policy the surrounding environment set for its own reasons is not this
+/// tool's business.
+///
+/// Answers whether the kernel is now refusing on this process's behalf.
+pub fn install_refusal(wants_cloud: bool) -> bool {
+    !wants_cloud && refuse_materialization()
+}
+
 /// What the policy is right now, asked of the kernel rather than remembered.
 ///
 /// A flag this file set and then reported back would be proving that a bool
@@ -291,6 +305,30 @@ mod tests {
             materialization_refused(),
             Some(true),
             "the policy was set and the kernel does not agree it is set"
+        );
+    }
+
+    #[test]
+    fn the_policy_is_installed_by_default_and_declined_under_cloud() {
+        // The decision `main` makes, asked directly. The test above proves the
+        // syscall pair works; this one proves the flag is read the right way
+        // round, which is a different thing and the one a tidy-up would break.
+        //
+        // What NEITHER test reaches is `main`'s single call site. A process's
+        // I/O policy is not observable from outside that process, and no test
+        // here can make a dataless file to observe it indirectly, so deleting
+        // that one line would leave every test green. `tools/cloud-validate.sh`
+        // is what closes it, on a real cloud folder, on the maintainer's own
+        // machine. Said here rather than left for a reader to discover.
+        assert!(
+            !install_refusal(true),
+            "--cloud asked for the downloads; nothing should be installed"
+        );
+        assert!(install_refusal(false), "the default run must install it");
+        assert_eq!(
+            materialization_refused(),
+            Some(true),
+            "the policy was installed and the kernel does not agree it is set"
         );
     }
 

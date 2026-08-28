@@ -203,7 +203,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // installed: a run that asked to compare cloud files has asked for the
     // downloads, and overriding a policy the environment set for its own
     // reasons is not this tool's business.
-    let refusing = !options.cloud && cloud::refuse_materialization();
+    let refusing = cloud::install_refusal(options.cloud);
     let seen_in_cloud = Arc::new(cloud::Cloud::default());
 
     let rule = match options.auto.as_deref().map(Rule::parse) {
