@@ -272,10 +272,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         cloud::flags_of(&root.join(name))
     }));
     let skipped_cloud = seen_in_cloud.skipped();
-    if let Some(note) = cloud::evicted_notice(&seen_in_cloud.evicted_names()) {
+    if let Some(note) = cloud::evicted_notice(&seen_in_cloud.evicted_names(), options.cloud) {
         eprintln!("{note}");
     }
-    if let Some(note) = cloud::notice(skipped_cloud) {
+    if let Some(note) = cloud::notice(skipped_cloud, options.cloud) {
         eprintln!("  {note}");
         if !options.cloud && !refusing {
             // Said only where there is already something to say, so a tree
@@ -434,7 +434,7 @@ fn live_scan(
         // skipped by exactly that unwind, and the process hung instead of
         // dying (REVIEW-M8 item 1).
         let stopping = watch.stopping();
-        let code = tui::run_live(&watch, &seen, root, options.hard);
+        let code = tui::run_live(&watch, &seen, root, options.hard, options.cloud);
         // ...and on the ordinary path the scan is stopped and joined before
         // the cache is closed, so a half-written row is impossible: the only
         // thread that writes rows has stopped running.

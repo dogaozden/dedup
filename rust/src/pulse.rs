@@ -655,6 +655,27 @@ mod tests {
         };
         let window_ms = crate::consts::RATE_WINDOW.as_millis() as u64;
 
+        // The bracket the spec implies, which is also this test's own
+        // precondition. M9-CLOUD.md asks that "a stalled read must read ~0
+        // within a few seconds" — an upper bound; and a window shorter than a
+        // second cannot bridge the gaps between 512 KiB reads, so it would
+        // report ordinary reading as a stall — a lower one.
+        //
+        // This deliberately does NOT pin three seconds. Two would satisfy the
+        // spec as well, and the exact width is a tuning choice that no test
+        // here defends. What it refuses is a window so long that a stall stays
+        // invisible, or so short that the display — and the arithmetic below,
+        // which subtracts 400 ms from it — stops meaning anything. REVIEW-M9
+        // item 2: that subtraction used to underflow instead of asserting,
+        // which under `--release` would have wrapped silently rather than
+        // panicking.
+        assert!(
+            crate::consts::RATE_WINDOW >= Duration::from_secs(1)
+                && crate::consts::RATE_WINDOW <= Duration::from_secs(5),
+            "RATE_WINDOW is {:?}, outside the bracket M9-CLOUD.md implies",
+            crate::consts::RATE_WINDOW
+        );
+
         // One window later there is no reading left inside it that moved, so
         // the subtraction is zero — exactly zero, not approaching it.
         assert_eq!(

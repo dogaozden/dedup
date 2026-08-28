@@ -4266,10 +4266,45 @@ added — the same class of mistake as a comment describing code it no longer
 matches, which is a thing this project has an opinion about.
 
 One of them got away on the first run, and it was mine: narrowing the window
-from `RATE_WINDOW` to one beat left the whole suite green — 275 tests at
-the time — because every
-assertion I had written was about the rate reaching zero and a 100 ms window
-reaches zero too — sooner. The tests now pin the width from both directions.
+from `RATE_WINDOW` to one beat left the whole suite green — 275 tests at the
+time — because every assertion I had written was about the rate reaching zero,
+and a 100 ms window reaches zero too, sooner.
+
+**What the tests pin, said exactly** (REVIEW-M9 item 2, which found the sentence
+that used to stand here overreaching). They pin the SHAPE of the decay — a
+stall reads exactly 0 one window after the last byte, is still non-zero a
+moment before that, and reads about half the steady rate half a window in — and
+they bound the readings the window holds, above and below. They do **not** pin
+the width to a value. What bounds the width is a bracket the spec implies
+rather than a literal: at least a second, because a shorter window cannot
+bridge the gaps between 512 KiB reads and would report ordinary reading as a
+stall; at most five, because M9-CLOUD.md asks that "a stalled read must read ~0
+within a few seconds".
+
+Run against the reviewer's own sweep, the suite now admits two of the six
+widths it tried and refuses four:
+
+```text
+from_millis(100) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+from_millis(500) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+from_millis(900) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+from_secs(1)   test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+from_secs(2)   test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+from_secs(60)  test result: FAILED. 275 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+```
+
+100 ms, 500 ms, 900 ms and 60 s fail the bracket. One second fails for a
+different and more interesting reason: at a window only ten readings wide, "half
+a window into a stall" falls between readings and the decay-shape assertion
+cannot resolve it — so the tests also say, in effect, that the window has to be
+several times the reading spacing to mean anything. **Two seconds passes, and
+that is correct**: the reviewer said 2 s would satisfy the spec, and it does.
+The exact choice of three is a tuning judgement, defended in `consts.rs` and by
+nothing else.
+
+That sweep also uncovered a real defect in the test's own arithmetic, now
+fixed: `window_ms - 400` underflowed at 100 ms rather than asserting, and under
+`--release` would have wrapped silently instead of panicking.
 LOG.md records that and three more tests of mine that were passing while
 testing nothing.
 

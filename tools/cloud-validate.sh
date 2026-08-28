@@ -64,7 +64,18 @@ log "== the default scan: no --cloud, no deletion flag, --list only =="
 REPORT=$(mktemp -t cloud-validate-report)
 log "\$ $BIN \"$TREE\" --list --report-json $REPORT"
 "$BIN" "$TREE" --list --report-json "$REPORT" 2>&1 | tee -a "$OUT"
-log "   exit $?"
+# ${pipestatus[1]} and not $?, which in zsh is the LAST element of the pipeline
+# — that is `tee`'s status, and `tee` succeeds whatever the scan did. Captured
+# on the line straight after the pipeline, because the next command overwrites
+# it. REVIEW-M9 item 4: this is the script the maintainer runs on real cloud
+# storage, where the transcript IS the record.
+SCAN_STATUS=${pipestatus[1]}
+log "   exit ${SCAN_STATUS}"
+if [[ "${SCAN_STATUS}" != "0" ]]; then
+  log ""
+  log "NOTE: the scan itself failed. Everything below still measures the tree,"
+  log "but a scan that did not finish proves nothing about what it would read."
+fi
 log ""
 
 log "== what the report says it skipped =="

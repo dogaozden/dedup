@@ -75,7 +75,14 @@ extern "C" {
 /// answer whether it is now really doing so.
 ///
 /// Process-scoped, so it covers every reader thread including ones rayon has
-/// not built yet.
+/// not built yet — which is the whole point of the scope and is asserted
+/// behaviourally below, not merely remembered.
+///
+/// This call is load-bearing rather than belt-and-braces: REVIEW-M9 probed a
+/// process that never calls `setiopolicy_np` and found materialization
+/// ENABLED. The kernel's default is to download. Without this line the only
+/// thing standing between a default scan and somebody's bandwidth is the
+/// walk-time exclusion.
 ///
 /// The answer comes from `getiopolicy_np` rather than from `setiopolicy_np`'s
 /// return, because those are different claims: one is "the call did not fail"
@@ -178,8 +185,14 @@ where
 ///
 /// Nothing is said on a run that met no cloud file, which is what keeps every
 /// output on a dataless-free tree byte-identical to the build before this one.
-pub fn notice(skipped: u64) -> Option<String> {
-    (skipped > 0).then(|| {
+///
+/// `wants_cloud` silences it, on REVIEW-M9 binding item 3. Under `--cloud` the
+/// walk skips nothing, so a non-zero count can only be evictions — and telling
+/// somebody who passed `--cloud` that a file was "not scanned (--cloud to
+/// include)" is wrong twice over: it was not a choice, and the flag is already
+/// on. `evicted_notice` has already said the true thing, and said it better.
+pub fn notice(skipped: u64, wants_cloud: bool) -> Option<String> {
+    (skipped > 0 && !wants_cloud).then(|| {
         format!(
             "{skipped} file{} in cloud — not scanned (--cloud to include)",
             if skipped == 1 { "" } else { "s" }
@@ -189,17 +202,30 @@ pub fn notice(skipped: u64) -> Option<String> {
 
 /// A note naming the files that went to the cloud while the scan was reading
 /// them, for the run that met one.
-pub fn evicted_notice(names: &[String]) -> Option<String> {
+///
+/// The advice at the end is dropped under `--cloud`, for REVIEW-M9 item 3's
+/// reason one line further down: telling somebody who passed `--cloud` to pass
+/// `--cloud` is not advice. The item named the skip notice; this sentence had
+/// the same flaw in its tail, and it was found while proving the fix for that
+/// one. Reachable in production — under `--cloud` the policy is not installed,
+/// so a dataless read normally downloads and succeeds, but a provider or a
+/// network that fails leaves the file unread AND still dataless.
+pub fn evicted_notice(names: &[String], wants_cloud: bool) -> Option<String> {
     let (first, rest) = names.split_first()?;
     let more = match rest.len() {
         0 => String::new(),
         1 => " (and 1 more)".to_string(),
         many => format!(" (and {many} more)"),
     };
+    let advice = if wants_cloud {
+        " Its bytes could not be fetched."
+    } else {
+        " --cloud to download and compare."
+    };
     Some(format!(
         "dedup-rs: {first} lives in the cloud and was evicted while this scan \
          was reading it{more}; it was left out of its group rather than \
-         downloaded. --cloud to download and compare."
+         downloaded.{advice}"
     ))
 }
 
@@ -309,6 +335,45 @@ mod tests {
     }
 
     #[test]
+    fn the_policy_constants_are_the_headers_and_the_shield_covers_workers() {
+        // REVIEW-M9 binding item 1, and the test is the reviewer's own, taken
+        // as written. `refuse_materialization` sets the policy and then asks
+        // `materialization_refused` whether it took — but both spell the scope
+        // and the value with the SAME symbols, so any wrong value is
+        // self-consistent and invisible. The reviewer demonstrated two
+        // one-character mutants that left all 276 tests green and every
+        // behavioural case of `m9_dataless_walk.py` passing:
+        //
+        //   IOPOL_SCOPE_PROCESS 0 -> 1   binds the calling thread only. The
+        //                                scan reads on rayon's workers, so
+        //                                that is a shield over nobody.
+        //   ..._OFF 1 -> 2               2 is ..._FILES_ON. The process asks
+        //                                the kernel to DOWNLOAD, and reports
+        //                                success.
+        //
+        // The shipped values were right; the guard was missing. `SF_DATALESS`
+        // had this discipline already and these three did not.
+        assert_eq!(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, 3);
+        assert_eq!(IOPOL_SCOPE_PROCESS, 0);
+        assert_eq!(IOPOL_MATERIALIZE_DATALESS_FILES_OFF, 1);
+        assert_eq!(IOPOL_MATERIALIZE_DATALESS_FILES_BASIC_MASK, 3);
+
+        // The literals alone are not enough: pinning a literal can be "fixed"
+        // by editing the literal. The scope is therefore also checked as a
+        // BEHAVIOUR — the refusal must be visible from a thread this one did
+        // not set it on, because that is where every byte is actually read.
+        assert!(refuse_materialization());
+        let on_a_worker = std::thread::spawn(materialization_refused)
+            .join()
+            .expect("the probe thread");
+        assert_eq!(
+            on_a_worker,
+            Some(true),
+            "a worker thread is not covered by the refusal"
+        );
+    }
+
+    #[test]
     fn the_policy_is_installed_by_default_and_declined_under_cloud() {
         // The decision `main` makes, asked directly. The test above proves the
         // syscall pair works; this one proves the flag is read the right way
@@ -376,37 +441,58 @@ mod tests {
 
     #[test]
     fn the_notice_appears_only_when_there_is_something_to_notice() {
-        assert_eq!(notice(0), None, "a clean tree says nothing at all");
+        assert_eq!(notice(0, false), None, "a clean tree says nothing at all");
         assert_eq!(
-            notice(1).unwrap(),
+            notice(1, false).unwrap(),
             "1 file in cloud — not scanned (--cloud to include)"
         );
         assert_eq!(
-            notice(2).unwrap(),
+            notice(2, false).unwrap(),
             "2 files in cloud — not scanned (--cloud to include)"
         );
+        // REVIEW-M9 item 3: under --cloud the count can only be evictions, and
+        // "not scanned (--cloud to include)" is nonsense advice to somebody who
+        // already passed it. `evicted_notice` covers that case on its own.
+        assert_eq!(notice(1, true), None, "--cloud was told to pass --cloud");
+        assert_eq!(notice(9, true), None);
+        assert_eq!(notice(0, true), None);
     }
 
     #[test]
     fn the_eviction_note_names_the_file_and_says_where_it_went() {
-        assert_eq!(evicted_notice(&[]), None);
-        let one = evicted_notice(&["movies/holiday.MOV".to_string()]).unwrap();
+        assert_eq!(evicted_notice(&[], false), None);
+        let one = evicted_notice(&["movies/holiday.MOV".to_string()], false).unwrap();
         assert!(one.contains("movies/holiday.MOV"), "{one}");
         assert!(one.contains("lives in the cloud"), "{one}");
         assert!(one.contains("--cloud"), "{one}");
         assert!(!one.contains("and 0 more"), "{one}");
-        let two = evicted_notice(&["a.MOV".to_string(), "b.MOV".to_string()]).unwrap();
+        let two = evicted_notice(&["a.MOV".to_string(), "b.MOV".to_string()], false).unwrap();
         assert!(
             two.contains("a.MOV") && two.contains("(and 1 more)"),
             "{two}"
         );
-        let many = evicted_notice(&[
-            "a.MOV".to_string(),
-            "b.MOV".to_string(),
-            "c.MOV".to_string(),
-        ])
+        let many = evicted_notice(
+            &[
+                "a.MOV".to_string(),
+                "b.MOV".to_string(),
+                "c.MOV".to_string(),
+            ],
+            false,
+        )
         .unwrap();
         assert!(many.contains("(and 2 more)"), "{many}");
+
+        // Under --cloud the file is still named and still explained, but it is
+        // not advised to turn on the flag it already has on. Same reason as
+        // REVIEW-M9 item 3, one sentence earlier.
+        let already = evicted_notice(&["movies/holiday.MOV".to_string()], true).unwrap();
+        assert!(already.contains("movies/holiday.MOV"), "{already}");
+        assert!(already.contains("lives in the cloud"), "{already}");
+        assert!(
+            !already.contains("--cloud"),
+            "a --cloud run was told to pass --cloud: {already}"
+        );
+        assert!(already.contains("could not be fetched"), "{already}");
     }
 
     #[test]

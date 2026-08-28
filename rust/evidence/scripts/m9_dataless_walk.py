@@ -25,9 +25,18 @@ chflags and finds it in exactly the field this script is about to reinterpret,
 so the two flags travel the same path from kernel to walk.
 
 THE STALE-MUTANT RULE. This script edits src/, builds, and restores. The
-restore is proved, not asserted: the source is diffed against git and the
-rebuilt binary's hash is compared to the one taken before the mutant. Anything
-that runs after this must still `cargo build --release` first.
+restore is proved, not asserted: the file's bytes are compared against the
+bytes read at entry, and the rebuilt binary's hash against the one taken before
+the mutant. Anything that runs after this must still `cargo build --release`
+first.
+
+Bytes and not `git diff` — REVIEW-M9 non-binding note 2. This script used to
+prove its restore with `git diff -- rust/src/cloud.rs`, which reports a failure
+whenever ANY other uncommitted change is in that file. It cost the reviewer a
+wrong result: two mutants recorded as caught when nothing had caught them, and
+only noticed because the failure said "the source was NOT restored" rather than
+naming a case. `m9_mutants.py` had already been fixed for exactly this; the fix
+had not reached here.
 
 Usage, from the repository root:
     python3 rust/evidence/scripts/m9_dataless_walk.py <scratch-dir>
@@ -260,15 +269,77 @@ def main():
             failures.append("a tree of nothing but placeholders was an error")
         print()
 
+        # ---------------------------------------------------------------
+        print("=== 6. an eviction, under --cloud (REVIEW-M9 item 3) ===")
+        # The reachable shape of a mid-scan eviction, arranged rather than
+        # raced. Under --cloud the walk skips nothing, so a flagged file DOES
+        # become a record; making it unreadable makes its stage-3 read fail the
+        # way the kernel's refusal would; and `cloud::in_cloud` then asks the
+        # file itself and finds it flagged. That is an eviction by every route
+        # the code takes, without needing to change a flag mid-scan.
+        build_corpus(root)
+        evicted = os.path.join(root, "media", "reel_1.mov")
+        subprocess.run(["chflags", "hidden", evicted], check=True)
+        os.chmod(evicted, 0o000)
+        print(f"$ chflags hidden {os.path.relpath(evicted, root)} && chmod 000")
+        try:
+            done, said = scan(root, home, "--cloud")
+            stderr = done.stderr.strip()
+            print(f"  groups:        {[len(g) for g in said['groups']]}")
+            print(f"  unreadable:    {said['unreadable']}")
+            print(f"  skipped_cloud: {said.get('skipped_cloud', '(absent)')}")
+            print("  stderr:")
+            for line in stderr.splitlines():
+                print(f"    {line}")
+            if said["unreadable"] != ["media/reel_1.mov"]:
+                failures.append("the evicted file did not go down the read-error path")
+            if [len(g) for g in said["groups"]] != [3]:
+                failures.append("the evicted file did not leave its group honestly")
+            if said.get("skipped_cloud") != 1:
+                failures.append(
+                    f"an eviction is not counted: skipped_cloud is "
+                    f"{said.get('skipped_cloud')}, want 1"
+                )
+            if "lives in the cloud and was evicted" not in stderr:
+                failures.append("the eviction was not named and explained")
+            if "media/reel_1.mov" not in stderr:
+                failures.append("the eviction notice does not name the file")
+            # The item itself: a run that already passed --cloud must not be
+            # told to pass --cloud.
+            if "--cloud" in stderr:
+                failures.append(
+                    "a --cloud run was advised to pass --cloud (REVIEW-M9 item 3) "
+                    "— check the eviction sentence's tail as well as the notice"
+                )
+            if "could not be fetched" not in stderr:
+                failures.append(
+                    "the --cloud eviction does not say what actually happened"
+                )
+            if "not scanned" in stderr:
+                failures.append(
+                    "a --cloud run called an eviction 'not scanned', which was "
+                    "not a choice it made"
+                )
+            if done.returncode != 0:
+                failures.append(f"an eviction made the run fail: exit {done.returncode}")
+        finally:
+            os.chmod(evicted, 0o644)
+        print()
+
     finally:
         print("=== the stale-mutant rule: restored, and proved restored ===")
         with open(SOURCE, "w") as fh:
             fh.write(original)
-        print(f"$ git diff --stat -- {SOURCE}")
+        with open(SOURCE) as fh:
+            back = fh.read()
+        print(f"$ cmp {SOURCE} (the bytes read before the mutant)")
+        if back == original:
+            print("  (no output: identical, so the mutant is gone)")
+        else:
+            failures.append(f"{SOURCE} was NOT restored")
+        print(f"$ git diff --stat -- {SOURCE}   (for information only)")
         diff = run(["git", "diff", "--stat", "--", SOURCE]).stdout.strip()
-        print(f"  {diff!r}   (empty = the file is the committed one)")
-        if diff:
-            failures.append("the source was NOT restored")
+        print(f"  {diff!r}")
         restored = build()
         print("$ cargo build --release")
         print(f"  {restored}  target/release/dedup-rs")

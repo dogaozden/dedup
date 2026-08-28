@@ -131,6 +131,10 @@ pub fn run_live(
     view: &crate::pulse::View,
     root: &Path,
     hard: bool,
+    // Whether this run asked to read cloud files. Only the closing summary
+    // reads it, and only to keep from advising `--cloud` to a run that already
+    // passed it (REVIEW-M9 item 3).
+    wants_cloud: bool,
 ) -> i32 {
     let mut browser = Browser::new(Vec::new(), root.to_string_lossy().into_owned(), hard);
     browser.scanning = true;
@@ -148,7 +152,7 @@ pub fn run_live(
         }
         Ok(Ended::TerminalGone) => 1,
         Ok(Ended::Quit) => {
-            summarise_live(&browser);
+            summarise_live(&browser, wants_cloud);
             0
         }
     }
@@ -252,7 +256,7 @@ fn live_loop(
 /// it still has the scan's records; this side never had them. It says the
 /// count, which is what the user needs to know, and the paths are on the
 /// screen they just left.
-fn summarise_live(browser: &Browser) {
+fn summarise_live(browser: &Browser, wants_cloud: bool) {
     if browser.applied_files > 0 {
         let where_to = if browser.hard {
             "deleted"
@@ -265,7 +269,7 @@ fn summarise_live(browser: &Browser) {
             human_size(browser.applied_bytes)
         );
     }
-    if let Some(note) = crate::cloud::notice(browser.in_cloud) {
+    if let Some(note) = crate::cloud::notice(browser.in_cloud, wants_cloud) {
         // The full sentence, where there is a whole line for it. The browser's
         // own summary row carries the short form while the scan is running.
         eprintln!("  {note}");

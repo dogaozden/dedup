@@ -380,13 +380,27 @@ fn child_relative(prefix: &str, name: &[u8]) -> String {
 
 /// The portable walk, for a directory `getattrlistbulk` would not describe.
 ///
-/// Nothing here is ever dataless, and there is no `cloud` parameter to say so
-/// with. `fs::Metadata` does carry `st_flags` on macOS, but this path exists
-/// precisely for the directories the bulk call would not describe completely —
-/// a filesystem that will not answer an attribute request is not one that has
-/// cloud placeholders on it. On a platform without `SF_DATALESS` at all this
-/// is the only path there is, `--cloud` changes nothing, and the skip count
-/// stays zero, which is the honest answer rather than a silent one.
+/// **This path has no dataless detector, and the law is held here by the I/O
+/// policy alone.** Worth stating plainly, because adding `ATTR_CMN_FLAGS` to
+/// `WANT_COMMON` widened the door into this function: `parse_entry` sends a
+/// WHOLE directory down here whenever the kernel declines any one requested
+/// attribute, so a filesystem that will not answer about flags now loses
+/// walk-time detection for everything in it.
+///
+/// What is proven: a placeholder that reaches this path becomes a record, and
+/// the read that follows fails under the no-materialize policy rather than
+/// downloading. It surfaces as an EVICTION — named, counted, dropped from its
+/// group — rather than as a walk-time skip.
+///
+/// What is relied upon and not proven: that a filesystem refusing an attribute
+/// request is unlikely to be one hosting cloud placeholders. That is a
+/// judgement, it is why the fallback is acceptable rather than merely
+/// tolerable, and REVIEW-M9 was right that it was written here as though it
+/// were a fact. Neither of us could test it.
+///
+/// On a platform without `SF_DATALESS` at all this is the only path there is,
+/// `--cloud` changes nothing, and the skip count stays zero — the honest
+/// answer rather than a silent one.
 #[allow(clippy::too_many_arguments)]
 fn gather_portable(
     root: &Path,
