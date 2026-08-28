@@ -1,0 +1,67 @@
+$ python3 rust/evidence/scripts/m9_policy_guard.py
+
+$ cargo build --release   (the committed source, before any mutant)
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
+$ cargo test --release
+  test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+=== scope -> THREAD (the false shield) ===
+    the policy binds the calling thread only, and every byte is read on one of rayon's workers — a shield over nobody
+    -   IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+    +   IOPOL_SCOPE_PROCESS: libc::c_int = 1;
+    $ cargo test --release
+      test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+      cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers
+      thread 'cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers' (2120331) panicked at src/cloud.rs:357:9:
+      assertion `left == right` failed
+    caught by the_policy_constants_are_the_headers_and_the_shield_covers_workers
+
+=== OFF -> 2 (ask the kernel to download) ===
+    2 is ..._FILES_ON: the process asks the kernel to materialize, and reports success
+    -   IOPOL_MATERIALIZE_DATALESS_FILES_OFF: libc::c_int = 1;
+    +   IOPOL_MATERIALIZE_DATALESS_FILES_OFF: libc::c_int = 2;
+    $ cargo test --release
+      test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+      cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers
+      thread 'cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers' (2122430) panicked at src/cloud.rs:358:9:
+      assertion `left == right` failed
+    caught by the_policy_constants_are_the_headers_and_the_shield_covers_workers
+
+=== type -> 6 (the neighbour the comment warns about) ===
+    6 is IOPOL_TYPE_VFS_IGNORE_CONTENT_PROTECTION — a different policy entirely, set on a value that means nothing to it
+    -   IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 3;
+    +   IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 6;
+    $ cargo test --release
+      test result: FAILED. 274 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+      cloud::tests::the_kernel_is_asked_to_refuse_and_then_asked_whether_it_did
+      cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers
+      cloud::tests::the_policy_is_installed_by_default_and_declined_under_cloud
+      thread 'cloud::tests::the_kernel_is_asked_to_refuse_and_then_asked_whether_it_did' (2124605) panicked at src/cloud.rs:329:9:
+      thread 'cloud::tests::the_policy_is_installed_by_default_and_declined_under_cloud' (2124608) panicked at src/cloud.rs:392:9:
+    caught by the_policy_constants_are_the_headers_and_the_shield_covers_workers
+
+=== scope -> THREAD, with its literal pin edited to agree ===
+    what somebody tidying up a failing assertion would really do. Only the spawned-thread assertion can catch this, and it must
+    -   IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+    +   IOPOL_SCOPE_PROCESS: libc::c_int = 1;
+    -   assert_eq!(IOPOL_SCOPE_PROCESS, 0);
+    +   assert_eq!(IOPOL_SCOPE_PROCESS, 1);
+    $ cargo test --release
+      test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+      cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers
+      thread 'cloud::tests::the_policy_constants_are_the_headers_and_the_shield_covers_workers' (2126820) panicked at src/cloud.rs:369:9:
+      assertion `left == right` failed: a worker thread is not covered by the refusal
+    caught by the_policy_constants_are_the_headers_and_the_shield_covers_workers
+
+=== the stale-mutant rule: restored, and proved restored ===
+  rust/src/cloud.rs was compared byte for byte against the bytes read at
+  entry, immediately after each revert.
+$ cargo build --release
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
+  identical to the pre-mutant binary
+$ cargo test --release
+  test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+
+every wrong constant is caught, and the scope is caught even when its literal pin has been edited to agree with it — which is the half that makes it a tested property rather than a remembered one
+
+   exit 0

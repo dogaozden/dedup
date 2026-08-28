@@ -178,6 +178,7 @@ pub fn walk<'a>(
     bytes_seen: &mut u64,
     unreadable: &mut Vec<String>,
     pulse: &crate::pulse::Pulse,
+    cloud: &crate::cloud::Cloud,
 ) -> Vec<FileRec> {
     let harvest = Harvest::default();
     // Sibling directories have nothing to say to each other, and since the
@@ -192,6 +193,7 @@ pub fn walk<'a>(
             filters,
             &harvest,
             pulse,
+            cloud,
         );
     });
 
@@ -218,6 +220,7 @@ fn visit<'scope>(
     filters: Filters<'scope>,
     harvest: &'scope Harvest,
     pulse: &'scope crate::pulse::Pulse,
+    cloud: &'scope crate::cloud::Cloud,
 ) {
     let mut survivors = Vec::new();
     let mut children: Vec<(PathBuf, String)> = Vec::new();
@@ -242,6 +245,7 @@ fn visit<'scope>(
                 &mut survivors,
                 &mut children,
                 pulse,
+                cloud,
             );
         } else {
             gather_portable(
@@ -259,7 +263,18 @@ fn visit<'scope>(
     });
 
     for (child, child_prefix) in children {
-        scope.spawn(move |scope| visit(scope, root, child, child_prefix, filters, harvest, pulse));
+        scope.spawn(move |scope| {
+            visit(
+                scope,
+                root,
+                child,
+                child_prefix,
+                filters,
+                harvest,
+                pulse,
+                cloud,
+            )
+        });
     }
 
     harvest.files_seen.fetch_add(files, Ordering::Relaxed);
@@ -292,6 +307,7 @@ fn gather_bulk(
     survivors: &mut Vec<FileRec>,
     directories: &mut Vec<(PathBuf, String)>,
     pulse: &crate::pulse::Pulse,
+    cloud: &crate::cloud::Cloud,
 ) {
     for (name, entry) in bulk.entries() {
         let relative = child_relative(prefix, name);
@@ -312,6 +328,21 @@ fn gather_bulk(
             continue;
         }
         if entry.objtype != VREG || !extension_allowed(&relative, &filters) {
+            continue;
+        }
+        // Before the count, and before any record exists — the same place the
+        // name filters sit, and for the same reason. A file this scan will not
+        // look at is not a file it saw, and `files_seen`/`bytes_seen` are what
+        // the protocol calls the honesty fields for what it DID look at. The
+        // skipped ones are not lost: they are counted where a person will be
+        // shown them.
+        //
+        // This is the only place a cloud placeholder is ever excluded. The
+        // whole law rests on it being here, upstream of grouping, sampling and
+        // any proof at apply — none of which can reach a file that never
+        // became a record.
+        if !filters.cloud && crate::cloud::dataless(entry.flags) {
+            cloud.skip();
             continue;
         }
 
@@ -348,6 +379,28 @@ fn child_relative(prefix: &str, name: &[u8]) -> String {
 }
 
 /// The portable walk, for a directory `getattrlistbulk` would not describe.
+///
+/// **This path has no dataless detector, and the law is held here by the I/O
+/// policy alone.** Worth stating plainly, because adding `ATTR_CMN_FLAGS` to
+/// `WANT_COMMON` widened the door into this function: `parse_entry` sends a
+/// WHOLE directory down here whenever the kernel declines any one requested
+/// attribute, so a filesystem that will not answer about flags now loses
+/// walk-time detection for everything in it.
+///
+/// What is proven: a placeholder that reaches this path becomes a record, and
+/// the read that follows fails under the no-materialize policy rather than
+/// downloading. It surfaces as an EVICTION — named, counted, dropped from its
+/// group — rather than as a walk-time skip.
+///
+/// What is relied upon and not proven: that a filesystem refusing an attribute
+/// request is unlikely to be one hosting cloud placeholders. That is a
+/// judgement, it is why the fallback is acceptable rather than merely
+/// tolerable, and REVIEW-M9 was right that it was written here as though it
+/// were a fact. Neither of us could test it.
+///
+/// On a platform without `SF_DATALESS` at all this is the only path there is,
+/// `--cloud` changes nothing, and the skip count stays zero — the honest
+/// answer rather than a silent one.
 #[allow(clippy::too_many_arguments)]
 fn gather_portable(
     root: &Path,

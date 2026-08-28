@@ -39,6 +39,10 @@ pub struct Options {
     pub force: bool,
     /// No progress line, whatever stderr turns out to be attached to.
     pub quiet: bool,
+    /// Read cloud placeholders too, downloading each one to compare it.
+    /// Off by default: a scan must not cost somebody their bandwidth, their
+    /// provider quota or their battery without being asked.
+    pub cloud: bool,
     /// "size" stops after the walk and size grouping. Only the M1 gate asks
     /// for it; every other gate leaves it empty.
     pub stage: String,
@@ -134,6 +138,7 @@ impl Flag {
             "--no-cache" => options.no_cache = true,
             "--force" => options.force = true,
             "--quiet" => options.quiet = true,
+            "--cloud" => options.cloud = true,
             // Accepted so a command line written for the Python tool still
             // runs. This build verifies every group it deletes from
             // regardless, so there is nothing for the flag to turn on.
@@ -205,6 +210,16 @@ pub const FLAGS: &[Flag] = &[
         takes: Takes::Value("NAME"),
         help: "access patterns to use: flash, spinning or auto",
         default: "auto",
+    },
+    Flag {
+        long: "--cloud",
+        short: None,
+        takes: Takes::Nothing,
+        help: "include cloud placeholder files — files whose bytes live on a \
+               provider's server, not this disk. Comparing one DOWNLOADS it in \
+               full, which costs bandwidth and can be slow; without this they \
+               are skipped and counted",
+        default: "skip them, and say how many",
     },
     Flag {
         long: "--no-cache",
@@ -502,6 +517,11 @@ mod tests {
         assert!(bare.ext.is_empty() && bare.skip_ext.is_empty() && bare.excludes.is_empty());
         assert!(!bare.list && !bare.interactive && !bare.yes && !bare.hard && !bare.no_cache);
         assert!(!bare.quiet);
+        assert_eq!(said("--cloud"), "skip them, and say how many");
+        assert!(
+            !bare.cloud,
+            "a scan that downloads cloud files by default is the bug M9 exists to fix"
+        );
         assert_eq!(bare.auto, None);
         assert_eq!(bare.stage, "");
         assert_eq!(bare.report_json, None);

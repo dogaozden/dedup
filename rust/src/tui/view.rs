@@ -112,9 +112,17 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
     line(rows[1], frame, rule(width));
 
     let summary = format!(
-        "{} groups · {} reclaimable",
+        "{} groups · {} reclaimable{}",
         human_count(browser.groups.len() as u64),
-        human_size(browser.reclaimable())
+        human_size(browser.reclaimable()),
+        // The short form: this row is always on screen, during the scan and
+        // after it, which is what makes it the right place for a fact the user
+        // must not be able to miss. The sentence that says what to do about it
+        // is printed on the way out, where there is room for it.
+        match browser.in_cloud {
+            0 => String::new(),
+            count => format!(" · {} in cloud", human_count(count)),
+        }
     );
     let marked = if browser.marked_count() > 0 {
         vec![Span::styled(
@@ -269,6 +277,12 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
 /// header to share the row with, so it draws fewer.
 const LIVE_BAR: usize = 16;
 
+/// Between the numbers and the name of the file they are about, and the
+/// narrowest a name may be cut to before it is dropped instead. The stderr
+/// pulse spells both the same way.
+const LEAD: &str = "  ← ";
+const LEAST_NAME: usize = 12;
+
 /// The scan's progress, in the browser's own row.
 ///
 /// The two shapes are the pulse's two shapes, for the same reason: the walk
@@ -295,10 +309,22 @@ pub fn progress_line(width: u16, progress: &crate::tui::model::Progress) -> Line
             human_size(progress.rate)
         )
     };
-    let text: String = format!("  {}…  {body}", progress.label)
+    let room = usize::from(width).saturating_sub(1);
+    let mut text: String = format!("  {}…  {body}", progress.label)
         .chars()
-        .take(usize::from(width).saturating_sub(1))
+        .take(room)
         .collect();
+    // The file being read, in whatever room the numbers left. Same rule as the
+    // stderr pulse and for the same reason: on a narrow screen the numbers stay
+    // and the name goes.
+    let left = room.saturating_sub(text.chars().count());
+    if !progress.current.is_empty() && left > LEAD.chars().count() + LEAST_NAME {
+        text.push_str(LEAD);
+        text.push_str(&crate::pulse::middle_truncated(
+            &progress.current,
+            left - LEAD.chars().count(),
+        ));
+    }
     Line::from(vec![Span::styled(text, Style::default().fg(ACCENT))])
 }
 
@@ -805,6 +831,7 @@ mod tests {
             total: 1000,
             bytes: 32 * 1024 * 1024,
             rate: 8 * 1024 * 1024,
+            current: "photos/beach.jpg".to_string(),
         });
         let screen = render(&browser, 80, 16);
         let body = screen.join("\n");
@@ -830,6 +857,53 @@ mod tests {
         let after = render(&browser, 80, 16);
         assert!(!after.join("\n").contains("Sampling…"), "{after:?}");
         assert!(after[6].contains("photos/beach.jpg"), "{:?}", after[6]);
+    }
+
+    #[test]
+    fn the_progress_row_names_the_file_being_read() {
+        // M9-CLOUD.md part B: "A user staring at a frozen bar must be able to
+        // see WHICH file it is frozen on." The frozen case is exactly this —
+        // a rate of 0 with a name beside it.
+        let stuck = progress_line(
+            120,
+            &crate::tui::model::Progress {
+                label: "Comparing",
+                done: 3,
+                total: 40,
+                bytes: 12 * 1024 * 1024,
+                rate: 0,
+                current: "/Users/x/Library/CloudStorage/GoogleDrive-x@y.com/\
+                          My Drive/holiday/VIDEO_TS/VTS_01_1.VOB"
+                    .to_string(),
+            },
+        );
+        let text: String = stuck
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(text.contains("0 B/s"), "the stall is visible: {text}");
+        assert!(text.contains("VTS_01_1.VOB"), "the file is named: {text}");
+        assert!(text.contains('\u{2026}'), "the path was cut: {text}");
+
+        // The walk opens no files and so names none.
+        let walking = progress_line(
+            120,
+            &crate::tui::model::Progress {
+                label: "Scanning",
+                done: 10,
+                total: 0,
+                bytes: 1024,
+                rate: 0,
+                current: String::new(),
+            },
+        );
+        let text: String = walking
+            .spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect();
+        assert!(!text.contains('\u{2190}'), "{text}");
     }
 
     #[test]
@@ -861,6 +935,7 @@ mod tests {
             total: 0,
             bytes: 5678,
             rate: 0,
+            current: String::new(),
         });
         let body = render(&browser, 80, 14).join("\n");
         assert!(body.contains("Scanning — nothing found yet."), "{body}");
@@ -881,6 +956,7 @@ mod tests {
                 total: 0,
                 bytes: 4 * 1024 * 1024 * 1024,
                 rate: 0,
+                current: String::new(),
             },
         );
         let text: String = walking
@@ -899,6 +975,7 @@ mod tests {
                 total: 100,
                 bytes: 1024 * 1024,
                 rate: 1024 * 1024,
+                current: String::new(),
             },
         );
         let text: String = reading
@@ -919,6 +996,7 @@ mod tests {
                     total: 9999,
                     bytes: 1 << 30,
                     rate: 1 << 30,
+                    current: "/a/deep/path/to/some/IMG_0001.MOV".to_string(),
                 },
             );
             let drawn: String = line.spans.iter().map(|span| span.content.clone()).collect();

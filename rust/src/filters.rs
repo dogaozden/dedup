@@ -14,6 +14,10 @@ pub struct Filters<'a> {
     pub include_ext: Option<&'a [String]>,
     pub skip_ext: &'a [String],
     pub excludes: &'a [String],
+    /// Whether a cloud placeholder is a file this scan will read. False by
+    /// default, because reading one downloads it; `--cloud` says yes. See
+    /// `crate::cloud`.
+    pub cloud: bool,
 }
 
 #[derive(Debug)]
@@ -267,6 +271,7 @@ mod tests {
             include_ext: None,
             skip_ext,
             excludes,
+            cloud: false,
         }
     }
 

@@ -1,0 +1,69 @@
+$ python3 rust/evidence/scripts/m9_dataless_walk.py /tmp/m9-capture/walk
+
+$ cargo build --release   (the committed source, before any mutant)
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
+
+=== the mutant: SF_DATALESS means UF_HIDDEN for this build only ===
+-   pub const SF_DATALESS: u32 = 0x4000_0000;
++   pub const SF_DATALESS: u32 = 0x0000_8000;
+  5136282b85b0484f593d878383f8495340bfd3678310ab2993c30d9fed070dde  target/release/dedup-rs   (a different binary)
+
+=== 1. nothing flagged: the baseline this is measured against ===
+  groups:        [4]
+  files_seen:    6
+  bytes_read:    12599296
+  skipped_cloud: (absent)
+  stderr:        ''
+
+=== 2. one member of the group is a placeholder ===
+$ chflags hidden media/reel_2.mov
+  groups:        [3]
+  members:       ['media/reel_0.mov', 'media/reel_1.mov', 'media/reel_3.mov']
+  files_seen:    5   (was 6)
+  bytes_read:    9453568   (was 12599296)
+  skipped_cloud: 1
+  unreadable:    []
+  stderr:        '1 file in cloud — not scanned (--cloud to include)'
+
+=== 3. --cloud puts it back ===
+  groups:        [4]
+  members:       ['media/reel_0.mov', 'media/reel_1.mov', 'media/reel_2.mov', 'media/reel_3.mov']
+  files_seen:    6
+  bytes_read:    12599296
+  skipped_cloud: (absent)
+  stderr:        ''
+
+=== 4. a second placeholder, outside any group ===
+$ chflags hidden lone_0.bin
+  groups:        [3]
+  skipped_cloud: 2
+  stderr:        '2 files in cloud — not scanned (--cloud to include)'
+
+=== 5. the whole tree is placeholders ===
+  groups:        []
+  files_seen:    0
+  bytes_read:    0
+  skipped_cloud: 6
+  exit:          0
+  stderr:        '6 files in cloud — not scanned (--cloud to include)'
+
+=== 6. an eviction, under --cloud (REVIEW-M9 item 3) ===
+$ chflags hidden media/reel_1.mov && chmod 000
+  groups:        [3]
+  unreadable:    ['media/reel_1.mov']
+  skipped_cloud: 1
+  stderr:
+    dedup-rs: media/reel_1.mov lives in the cloud and was evicted while this scan was reading it; it was left out of its group rather than downloaded. Its bytes could not be fetched.
+
+=== the stale-mutant rule: restored, and proved restored ===
+$ cmp rust/src/cloud.rs (the bytes read before the mutant)
+  (no output: identical, so the mutant is gone)
+$ git diff --stat -- rust/src/cloud.rs   (for information only)
+  ''
+$ cargo build --release
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
+  identical to the pre-mutant binary
+
+every case held: a flagged file is excluded before it becomes a record, counted where a person can see it, absent from --report-json when the count is zero, and read only when --cloud asks for it
+
+   exit 0

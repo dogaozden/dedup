@@ -13,6 +13,7 @@ use std::path::Path;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::cache::ScanCache;
+use crate::cloud::Cloud;
 use crate::compare::{compare_stage, Compare};
 use crate::consts::{DEEP_HEAD, HANDLE_BUDGET, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_SPAN, TAIL_BYTES};
 use crate::device::{Profile, VolumeProbe, Wanted};
@@ -99,7 +100,7 @@ fn ends_bytes(profile: Profile, size: u64) -> usize {
 /// the moment stage 3 exists, which is why the harness's own oracle driver
 /// carries the same switch. Nothing but `--gate m1` ever asks for it, and no
 /// milestone here is claimed with it — see LOG.md.
-pub fn size_stage(root: &Path, filters: Filters, pulse: &Pulse) -> Scan {
+pub fn size_stage(root: &Path, filters: Filters, pulse: &Pulse, cloud: &Cloud) -> Scan {
     let mut files_seen = 0;
     let mut bytes_seen = 0;
     let mut unreadable = Vec::new();
@@ -111,6 +112,7 @@ pub fn size_stage(root: &Path, filters: Filters, pulse: &Pulse) -> Scan {
         &mut bytes_seen,
         &mut unreadable,
         pulse,
+        cloud,
     );
     let records = candidates(root, entries);
     let mut buckets: Ordered<u64, usize> = Ordered::new();
@@ -156,10 +158,11 @@ fn pool_of(jobs: usize) -> ThreadPool {
 /// bytes, so the live path may not cost them an instruction it can avoid.
 pub type Streaming<'a> = Option<&'a crate::live::Live>;
 
-/// Eight arguments, and each is a different thing the scan needs to be told:
+/// Nine arguments, and each is a different thing the scan needs to be told:
 /// where, what to keep, what disk, what to count, what to remember, which
-/// profile, where to report progress, and whether anybody is watching. A
-/// struct to carry them would be a struct with one caller.
+/// profile, where to report progress, what it left in the cloud, and whether
+/// anybody is watching. A struct to carry them would be a struct with one
+/// caller.
 #[allow(clippy::too_many_arguments)]
 pub fn find_duplicates(
     root: &Path,
@@ -169,6 +172,7 @@ pub fn find_duplicates(
     mut cache: Option<&mut ScanCache>,
     wanted: Wanted,
     pulse: &Pulse,
+    cloud: &Cloud,
     live: Streaming<'_>,
 ) -> Scan {
     if let Some(cache) = cache.as_deref_mut() {
@@ -186,6 +190,7 @@ pub fn find_duplicates(
         &mut bytes_seen,
         &mut unreadable,
         pulse,
+        cloud,
     );
 
     // stage 2 — group by size, collapse hardlinks, discard unique sizes
@@ -910,11 +915,13 @@ mod tests {
                 include_ext: None,
                 skip_ext: &[],
                 excludes: &[],
+                cloud: false,
             },
             &mut files_seen,
             &mut bytes_seen,
             &mut unreadable,
             &Pulse::off(),
+            &Cloud::default(),
         );
         candidates(root, entries)
     }
@@ -1095,12 +1102,14 @@ mod tests {
                     include_ext: None,
                     skip_ext: &[],
                     excludes: &[],
+                    cloud: false,
                 },
                 &mut VolumeProbe::answered(solid, Some(1)),
                 &effort,
                 None,
                 wanted,
                 &Pulse::off(),
+                &Cloud::default(),
                 None,
             )
         }

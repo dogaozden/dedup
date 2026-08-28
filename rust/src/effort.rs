@@ -11,7 +11,7 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Where a read starts: which file, and how far into it.
@@ -35,9 +35,67 @@ pub struct Effort {
     /// last byte. A lock rather than two atomics so the pair is never torn —
     /// a half-updated pair would report a seek that did not happen.
     last: Mutex<Option<At>>,
+    /// Whether anything is displaying the name below. Off for every piped run,
+    /// every gate and every `--quiet` run, where it costs one relaxed load and
+    /// a branch the predictor gets right every time — `pulse.rs`'s "off is
+    /// off", kept here because `Effort` is the one thing already threaded to
+    /// every read in the program, and giving `Compare` a `&Pulse` would have
+    /// meant a field the deletion path has no progress display to fill.
+    watching: AtomicBool,
+    /// The file a reader most recently took up, for the progress display to
+    /// name.
+    ///
+    /// Set where a read STARTS and not where a file is opened. An earlier
+    /// draft recorded it in `open`, which is one line instead of seven and is
+    /// wrong in exactly the case the display exists for: stages 3 and 4 hand
+    /// their descriptors forward (`take_or_open`), so the comparison — the
+    /// long stage, and the one a cloud file stalls in — opens nothing at all
+    /// and the name stayed empty for the whole of it. Measured, not reasoned:
+    /// on a 1.8 GB corpus, 14 painted frames named no file.
+    ///
+    /// Under parallel readers it is whichever reader started last, which is
+    /// what M9-CLOUD.md asks for. For the case it exists for — a bar frozen on
+    /// one file — it is exact, because a read that blocks has already recorded
+    /// itself here before it blocks.
+    reading: Mutex<String>,
 }
 
 impl Effort {
+    /// Start recording the file each read starts on. Called by whichever
+    /// display is going to show it, and by nothing else.
+    pub fn watch_reads(&self) {
+        self.watching.store(true, Ordering::Relaxed);
+    }
+
+    /// A reader is taking up `name` now.
+    #[inline]
+    pub fn reading(&self, name: &str) {
+        if self.watching.load(Ordering::Relaxed) {
+            let mut reading = self.reading.lock().unwrap_or_else(|held| held.into_inner());
+            reading.clear();
+            reading.push_str(name);
+        }
+    }
+
+    /// The file a reader most recently took up, or empty when nothing is
+    /// displaying or nothing has been read since the last stage began.
+    pub fn now_reading(&self) -> String {
+        self.reading
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+    }
+
+    /// Forget it — a new stage has begun and has read nothing yet. Naming a
+    /// file the previous stage read would be this display's own 1/t: something
+    /// that keeps being shown after it stopped being true.
+    pub fn forget_reading(&self) {
+        self.reading
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clear();
+    }
+
     /// Open a file for reading and charge one open for it. A failed open is
     /// not charged — nothing was opened.
     pub fn open(&self, path: &Path) -> io::Result<File> {
@@ -129,6 +187,64 @@ mod tests {
         assert_eq!(effort.opens(), 1);
         assert_eq!(effort.bytes_read(), block.len() as u64);
         assert_eq!(block, std::fs::read("Cargo.toml").expect("readable"));
+    }
+
+    #[test]
+    fn a_read_from_a_carried_descriptor_still_names_its_file() {
+        // The trap this pins, found by running the tool rather than by
+        // reading it. Recording the name inside `open` compiles, reads
+        // sensibly, and leaves the display blank for the whole of the
+        // comparison — because stages 3 and 4 hand their descriptors forward
+        // (`stages::take_or_open`) and the comparison opens nothing at all.
+        // On a 1.8 GB corpus that was 14 painted frames naming no file, in
+        // exactly the stage a cloud placeholder stalls in.
+        let effort = Effort::default();
+        effort.watch_reads();
+
+        // Stage 3: open, say what is being read, read.
+        let mut file = effort.open(Path::new("Cargo.toml")).expect("readable");
+        effort.reading("Cargo.toml");
+        effort.read_block(&mut file, 16, at(0)).expect("readable");
+        assert_eq!(effort.now_reading(), "Cargo.toml");
+
+        // The stage boundary clears it, so no stage inherits the last file of
+        // the one before it.
+        effort.forget_reading();
+        assert_eq!(effort.now_reading(), "");
+
+        // Stage 5: the same descriptor, carried, and NOT reopened.
+        effort.reading("Cargo.toml");
+        effort.read_block(&mut file, 16, at(16)).expect("readable");
+        assert_eq!(
+            effort.now_reading(),
+            "Cargo.toml",
+            "a read from a carried descriptor left the progress display blank"
+        );
+        assert_eq!(
+            effort.opens(),
+            1,
+            "the second read opened nothing, which is the whole reason \
+             recording this in `open` was wrong"
+        );
+    }
+
+    #[test]
+    fn nothing_is_recorded_for_a_run_with_nothing_displaying() {
+        // Off is off, as `pulse.rs` has it. Every piped run, every gate and
+        // every --quiet run takes this path: one relaxed load, no lock, no
+        // allocation, nothing to show.
+        let effort = Effort::default();
+        let mut file = effort.open(Path::new("Cargo.toml")).expect("readable");
+        effort.reading("Cargo.toml");
+        effort.read_block(&mut file, 16, at(0)).expect("readable");
+        assert_eq!(
+            effort.now_reading(),
+            "",
+            "a run with no display recorded a name anyway"
+        );
+        // ...and the counters the protocol grades are untouched by any of it.
+        assert_eq!(effort.opens(), 1);
+        assert_eq!(effort.bytes_read(), 16);
     }
 
     #[test]

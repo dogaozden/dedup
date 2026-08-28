@@ -2746,3 +2746,332 @@ slots that stay behind. Neither was real: `groups` is a plain `Vec<Group>`,
 was dead. The behaviour was correct and the description was not, which is the
 worse of the two ways to be wrong — a reader trusts the comment. Dropped rather
 than implemented, as the reviewer preferred.
+
+## 2026-08-27 — M9, cloud placeholders and the windowed rate
+
+### The window is a ring, not an EWMA
+
+M9-CLOUD.md left the shape to me. An exponential average was the obvious
+answer and it is the wrong one, because it has the same shape as the bug. The
+bug was a scan-lifetime average sliding towards zero while nothing moved,
+which read as a dying scan; an EWMA also slides towards zero and also never
+arrives, just faster. Swapping one asymptote for a steeper asymptote would
+have asked the maintainer to learn a new number's habits instead of reading
+it.
+
+A ring subtracts one reading from another. When nothing has moved for the
+length of the window, both readings hold the same number and the rate is
+exactly 0 — not nearly 0, and not still falling. Zero is the honest reading of
+"nothing is happening", and only the window produces it.
+
+The second reason is structural. The divisor is the span of the window, so
+there is nowhere in the arithmetic to put a lifetime. `Stage::started` is gone
+from `pulse.rs` entirely — it was the only ingredient the old average needed,
+and with it deleted the old behaviour is not something a later edit can
+reintroduce by accident. That is worth more than the test.
+
+Three seconds. Long enough to bridge the gaps between 512 KiB chunks so
+ordinary reading does not read as a stall, short enough that a real stall
+reaches zero while somebody is still looking at it.
+
+### Naming the current file: where I put it first, and why that was wrong
+
+M9-CLOUD.md says "most recently opened", so I recorded it in `Effort::open` —
+one line, one choke point every open in the program passes through, no
+plumbing. It compiles, it reads sensibly, and it is blank for the whole of the
+comparison.
+
+Stages 3 and 4 hand their descriptors forward (`stages::take_or_open`) rather
+than reopening, so stage 5 — the long one, and the one a cloud placeholder
+stalls in — opens nothing at all. I found this by building a 1.8 GB corpus and
+driving the binary on a pty: 14 painted frames, 0 naming a file. The design
+was defensible against the spec's wording and useless for the spec's purpose.
+
+It is recorded where a read STARTS now: `probe_one`, the three whole-file
+helpers, and the three read sites in `compare.rs`. Seven lines instead of one.
+Under parallel readers it is whichever reader started last, which is what the
+spec asks for; for the case it exists for — a bar frozen on one file — it is
+exact, because a read that blocks has already recorded itself before it
+blocks.
+
+**The rule:** when a spec's wording and a spec's purpose come apart, run the
+thing. Reading the code would not have shown me this and neither would any
+test I had written; the frames did.
+
+### Where the skip notice prints, and why in two places
+
+The browser's summary row carries the short form (`· 12 in cloud`) and the
+exit summary carries the sentence with `--cloud to include` in it. Two places
+because the row is the only thing on screen during AND after the scan — the
+progress row disappears when the scan ends, and the fact does not stop being
+true when it does — but the row is also 80 columns wide and already carries
+the group count and the reclaimable bytes. So the row carries the fact that
+cannot be missed, and the sentence that says what to do about it goes where
+there is a whole line for it.
+
+On the non-interactive path both go to stderr after the pulse is cleared,
+beside `scan.hint`. Nothing is printed when the count is zero, which is what
+keeps a dataless-free tree byte-identical.
+
+### The EDEADLK path needed no new code, and that is the finding
+
+The spec asks that a file evicted mid-scan "degrade gracefully through the
+existing read-error path". It already did. Every read failure in this program
+turns into `None`, the file leaves its group, and its name lands in
+`unreadable` — and a kernel refusing to materialize is just another read
+failure. The graceful degradation was free.
+
+What was missing was only the explanation, so that is all that was added:
+`cloud::in_cloud` asks which of the files that failed are dataless NOW, and
+names them. Asked of the flag rather than of the errno on purpose —
+`SF_DATALESS` is what is actually true about the file, it is the same fact the
+walk filters on, and it stays right if the read failed at a different call or
+came back with a different number. `refused_materialization` exists, is
+`#[cfg(test)]`, and says in its own doc comment that the scan does not branch
+on it and must not.
+
+### Skipped means skipped, and one idea not built
+
+A dataless file is dropped before `files_seen` counts it, in the same place
+the name filters sit. A file this scan will not look at is not a file it saw,
+and the protocol's honesty fields are about what it did look at; the skipped
+ones are counted where a person is shown them instead.
+
+The idea M9-CLOUD.md told me to note and not build: a dataless file's cached
+verdict is still on disk from whenever it was last local, so a future
+milestone could group placeholders from cache without reading a byte. Noted,
+not built. `CACHE_SCHEMA` would not need to move for it.
+
+### Four things that were passing while testing nothing
+
+Recorded because the previous builder recorded four of its own and the habit
+is what makes it cheap.
+
+1. `the_live_path_is_the_flags_and_a_terminal_and_nothing_else` (inherited).
+   REVIEW-M8's non-binding note 4. Both sides were `false && …` under
+   `cargo test`. `live_wanted` takes terminal-ness as a parameter now and the
+   test runs both values; the reviewer's own mutant fails it, 257 passed 1
+   failed.
+
+2. **My rate tests did not pin the window's width.** Narrowing `RATE_WINDOW`
+   to one beat left the whole suite of the day green (275 tests): a stall
+   reaches zero under a 100 ms window
+   too, just sooner, and every assertion I had written was about reaching
+   zero. Found by `m9_mutants.py`, not by reading. It now asserts the rate is
+   still NON-zero a moment before a whole window has passed, and about half
+   the steady rate at half a window, and bounds the reading count from below
+   as well as above.
+
+3. **`m9_pulse.py` counted a frame that was never painted.** Splitting the
+   transcript on the repaint sequence leaves everything before the FIRST
+   repaint as element zero, and that is not a frame — it is whatever the run
+   said on its way there. A `--quiet` run that painted nothing at all was
+   being reported as painting one blank frame. Dropping element zero also
+   corrected the frame counts in the passing cases.
+
+4. **The menu case matched an accidental line.** I looked for a line
+   containing "cloud" and "off" in the ANSI-stripped screen; the TUI draws
+   with cursor positioning rather than newlines, so the whole form is one
+   line, and the assertion was satisfied by the root path. It reads the
+   squeezed screen now, checks `profileautocloudoff` (the row, in its place),
+   and — the part that makes it non-vacuous — checks the row reads `cloudon`
+   when `--cloud` is on the command line. A row that could not change was not
+   evidence that the row works.
+
+### And one in the harness rather than the code
+
+`m9_mutants.py` proved each mutant's revert with `git diff --stat -- rust/src`
+and called a non-empty diff a failed restore. That is a check on the wrong
+thing: it fails the moment the branch has any other uncommitted work, which it
+did. It compares each file's bytes against the bytes read before its mutant
+went in now, and the binary's hash against the pre-mutant build. `git diff` is
+still printed, for information.
+
+### What the suite structurally cannot see
+
+Five of the eleven mutants in `m9_mutants.py` leave `cargo test` green, and
+the script prints that fact beside each one rather than hiding it. The
+per-harness counts in its closing sentence are computed from the mutant table,
+not written into the prose — they were written in at first and drifted the
+moment a tenth mutant was added, which is the same defect as a comment
+describing code it no longer matches. They have since survived an eleventh
+without anyone touching them.
+
+* Three are invisible because **no test can make a dataless file.**
+  `SF_DATALESS` is in `SF_SYNTHETIC`, which `<sys/stat.h>` keeps out of
+  `SF_SUPPORTED` so that no userland process — root included — can set it.
+  `m9_dataless_walk.py` gets around this by swapping the flag constant for
+  `UF_HIDDEN`, which `chflags` will set, and running the real binary over a
+  real tree. That substitution is licensed by
+  `the_bulk_read_agrees_with_lstat_field_by_field`, which sets `UF_HIDDEN`
+  with `chflags` and finds it in the very field the swap reinterprets, so both
+  flags travel the same path from kernel to walk. What it cannot show is that
+  `0x40000000` is the right number, and that is checked separately against the
+  SDK header.
+
+* Two are invisible because **`cargo test` has no terminal.** `m9_pulse.py`
+  catches those on a pty. This is M8's lesson about its deletion-honesty proof
+  restated: a green suite is not the same claim as a covered line.
+
+### The attribute offset was the real risk
+
+`ATTR_CMN_FLAGS` sits between `ATTR_CMN_MODTIME` and `ATTR_CMN_FILEID` in bit
+order, and `getattrlistbulk` returns fields in bit order, packed. Reading it
+in the wrong place would not fail — it would shift every field behind it, so
+the inode in each record would be garbage and hardlink folding would start
+joining unrelated files. Nothing would look broken.
+`the_bulk_read_agrees_with_lstat_field_by_field` compares inode, size, nlink,
+mtime AND flags against `lstat` on a real directory, which is what makes the
+offset checked rather than plausible. The conformance gate is the second
+check: it grades the groups.
+
+`IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES` is 3. I had 6 from memory. It
+came out of the SDK header on this machine instead, and every other constant
+in `cloud.rs` was taken the same way.
+
+### Defects found and not fixed
+
+* `menu.rs`'s `LEAST_HEIGHT` comment said "seven rows" while `FIELDS` had
+  eight, and had presumably said so since M5.1. I was adding a ninth row and
+  changing that constant, so I rewrote the comment to say "one row per
+  `FIELDS` entry" — that one is my own mess and it is cleaned up. Reported
+  here because the drift predates this branch.
+* SIGHUP and SIGTERM still leave the terminal raw (M5, recorded by M8), and
+  Ctrl+C at the menu is still ignored (M5.1). Neither is touched.
+
+### The policy decision, and the one line no test reaches
+
+M9-CLOUD.md's verification list asks for a unit test that the I/O policy is
+"set by default and lifted under `--cloud`". What I had proved the syscall pair
+works — set it, then ask `getiopolicy_np` whether it took — which is a
+different claim from "the flag is read the right way round", and the second is
+the one a tidy-up breaks. `install_refusal(wants_cloud)` puts the decision and
+the syscall in one function so both can be asked, and it is exactly what `main`
+calls.
+
+`--cloud` declines to install the policy rather than lifting an installed one.
+A run that asked to compare cloud files has asked for the downloads, and
+overriding a policy the surrounding environment set for its own reasons is not
+this tool's business.
+
+What no test reaches is `main`'s single call site. A process's I/O policy is
+not observable from outside that process, and nothing here can make a dataless
+file to observe it indirectly, so deleting that line would leave every test
+green. `tools/cloud-validate.sh` is what closes it, on the maintainer's machine
+and on a real cloud folder. The test says this in its own body: a gap a reader
+has to discover is worse than one that is written down.
+
+This landed after the first claim was written, which meant the release binary
+changed and every measurement in the claim described a binary that no longer
+existed. All of it was re-captured — fence, teeth, gate, mutants, dataless
+walk, pty battery, standards, benchmark — and nine fenced blocks in the claim
+were re-extracted from the new files programmatically rather than retyped.
+`claim_audit.py` caught every one of them, which is the second time on this
+branch it has caught me quoting a number I had not re-read.
+
+## 2026-08-28 — REVIEW-M9, the fix round
+
+### A guard that agreed with itself
+
+The one that mattered. `refuse_materialization` set the I/O policy and then
+asked `materialization_refused` whether it had taken — and both spelled the
+scope and the value with the same two symbols. So the check could only ever
+confirm that a constant equalled itself. The reviewer changed
+`IOPOL_SCOPE_PROCESS` from 0 to 1 and every one of 276 tests stayed green while
+the process shielded nobody: the scope binds the calling thread, and every byte
+this tool reads is read on a rayon worker. Changing `..._OFF` from 1 to 2 —
+which is `..._ON` — made the process ask the kernel to DOWNLOAD, and report
+success.
+
+Both values shipped correct. What shipped missing was any guard at all, on the
+mechanism the whole milestone falls back to. `SF_DATALESS` had exactly this
+discipline three functions away (`assert_eq!(SF_DATALESS, 0x4000_0000)`) and I
+did not carry it across.
+
+The reviewer wrote the fix and proved it bites; I took it as written and say so
+in the test. The half I would not have thought of is the second one: assert the
+refusal is visible **from a spawned thread**. Pinning a literal can always be
+"fixed" by editing the literal, and `m9_policy_guard.py` runs that exact
+scenario — scope changed AND its pin edited to agree — where only the
+behavioural assertion can catch it.
+
+**The rule:** a self-check written from the same constants as the thing it
+checks is not a check. Ask the kernel, from somewhere the setting had to travel
+to get to.
+
+### A sentence I could not have written if I had run the sweep
+
+"The tests now pin the width from both directions" was false, and I wrote it
+right after the mutant battery caught me for the first version of the same
+mistake. The battery had one mutant — one beat — and I concluded from its
+failure that the width was pinned. The reviewer swept six widths and found 900
+ms and 2 s green.
+
+The 100 ms case is worse than a gap. It "failed" through `window_ms - 400`
+underflowing, not through an assertion — arithmetic on `u64`, which panics in
+debug and **wraps silently under `--release`**. So the one data point I had was
+not even the kind of failure I thought it was.
+
+What the width is held by now is a bracket taken from the spec rather than from
+taste — at least a second to bridge the gaps between reads, at most five for
+"~0 within a few seconds". Two seconds still passes, and should. The exact
+three is a tuning judgement and the claim says so.
+
+**The rule:** one mutant is one data point. A property worth claiming is worth
+sweeping.
+
+### The same defect, one line up
+
+Item 3 was the skip notice telling a `--cloud` run to pass `--cloud`. While
+writing the end-to-end proof I read the line above it, which is the eviction
+sentence, and it ended "--cloud to download and compare." Same nonsense, same
+run, not in the review. Reachable: under `--cloud` the policy is not installed,
+so a dataless read normally downloads and succeeds — but a provider or a network
+that fails leaves the file unread and still dataless.
+
+**The rule:** when a reviewer names one instance of a wording defect, read the
+sentences around it before declaring the class closed.
+
+### What `claim_audit.py` cannot do, learned the hard way
+
+The re-capture of `m9-standards.txt` was given the base checkout without its
+`/rust`, so the entire `main@644c66f` half failed with "could not find
+`Cargo.toml`". My programmatic block-refresh then lifted that failure into the
+claim verbatim — and the prose around it went on saying 258 tests on main and
+clippy clean "on both sides".
+
+`claim_audit.py` passed it, correctly. It proves a fenced block is a faithful
+quote of a file under `evidence/`. It cannot know whether the sentences around
+the block are earned by it. Three times on this branch that tool has caught me
+quoting a number I had not re-read; this is the first time it could not, and the
+reason is worth writing down rather than treating the green as absolution.
+
+**The rule:** the audit checks that quotes are real. Reading the block and
+asking whether it says what the paragraph claims is still a person's job.
+
+### A mutant left in the tree by a timeout
+
+A capture run was killed at a ten-minute limit while a mutant was applied, and
+left `IOPOL_MATERIALIZE_DATALESS_FILES_OFF = 2` — the download-anyway mutant —
+sitting in `cloud.rs`. Every mutant script here reverts in a `finally`, and a
+`finally` does not run on SIGTERM.
+
+It was caught by checking `git diff` before trusting anything, which is the
+first thing the brief says to do. Restored from the commit, rebuilt to the hash
+every measurement here was taken with, and recorded in the claim. The lesson is
+not to add trap handlers — it is that "the script restores it" is a claim about
+the happy path, and the tree has to be checked, not assumed.
+
+### Defects found and not fixed
+
+* **The live path never classifies evictions.** `run()` asks `cloud::in_cloud`
+  which of the unreadable files are dataless; `live_scan` does not, so a file
+  evicted during an interactive scan leaves its group honestly and silently —
+  the browser's "N in cloud" counts walk-time skips only. The law holds (the
+  file is not read either way) and the fix is three lines mirroring `run()`,
+  but it is a behaviour change that would ship with weaker evidence than
+  everything around it: proving it needs an eviction driven through a pty and a
+  browser. Reported rather than slipped in during a fix round. It is why item 3
+  is only reachable on the non-interactive path today.
+* SIGHUP and SIGTERM still leave the terminal raw (M5), Ctrl+C at the menu is
+  still ignored (M5.1). Neither touched, both pre-existing.

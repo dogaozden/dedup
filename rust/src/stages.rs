@@ -129,6 +129,9 @@ fn probe_one(
     held: Option<File>,
 ) -> Option<Probed> {
     let path = root.join(record.path());
+    // Before the open and before the read, so a read that blocks has already
+    // said which file it is blocking on.
+    effort.reading(record.path());
     match probe {
         Probe::Ends { keep } => {
             let mut file = take_or_open(effort, &path, held)?;
@@ -593,6 +596,7 @@ pub fn small_file_stage(
 /// or under `DEEP_HEAD`: reading the whole thing once costs no more than the
 /// head page stage 3 would read for a bigger file.
 fn read_whole(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>> {
+    effort.reading(record.path());
     let mut file = effort.open(&root.join(record.path())).ok()?;
     effort
         .read_block(&mut file, record.size as usize, record.at(0))
@@ -600,12 +604,14 @@ fn read_whole(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>>
 }
 
 fn read_head(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>> {
+    effort.reading(record.path());
     let mut file = effort.open(&root.join(record.path())).ok()?;
     effort.read_block(&mut file, HEAD_BYTES, record.at(0)).ok()
 }
 
 fn read_rest(root: &Path, record: &FileRec, effort: &Effort) -> Option<Vec<u8>> {
     let want = (record.size as usize).saturating_sub(HEAD_BYTES);
+    effort.reading(record.path());
     let mut file = effort.open(&root.join(record.path())).ok()?;
     file.seek(SeekFrom::Start(HEAD_BYTES as u64)).ok()?;
     effort

@@ -141,3 +141,22 @@ pub const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 pub const FLUSH_ROWS: usize = 4096;
 
 pub const DEFAULT_MIN_SIZE: u64 = 10 * 1024 * 1024;
+
+/// How far back a displayed rate looks.
+///
+/// Every rate on screen is bytes moved inside this window divided by the span
+/// of it — never bytes moved since the stage began divided by how long ago
+/// that was. The difference is the whole of M9-CLOUD.md part B: a scan that
+/// stalls on one file keeps a constant numerator against a growing
+/// denominator, so a lifetime average decays like 1/t. The maintainer watched
+/// that happen and read it as a dying scan, when what was really happening was
+/// one 470 MB file being downloaded from Google.
+///
+/// Three seconds, because the window has two jobs that pull against each
+/// other. It has to be long enough to bridge the gaps between reads — a 512
+/// KiB chunk arriving every few hundred milliseconds must not read as a stall
+/// — and short enough that a real stall reaches zero while somebody is still
+/// looking at it. At three seconds a stalled read shows 0 B/s three seconds
+/// after the last byte, which is about as long as a person will wait before
+/// deciding the number is lying to them.
+pub const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);

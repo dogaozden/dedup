@@ -444,6 +444,7 @@ fn lockstep(
                 let read = |slot: &usize| -> (usize, Option<Vec<u8>>) {
                     let mut file = handles[*slot].lock().expect("no reader panics");
                     let where_from = records[opened[*slot]].at(at[*slot]);
+                    context.effort.reading(records[opened[*slot]].path());
                     (
                         *slot,
                         context.effort.read_block(&mut file, span, where_from).ok(),
@@ -761,6 +762,7 @@ fn split_pivot_windows(
                 let block = {
                     let mut file = handles[pivot].lock().expect("no reader panics");
                     let where_from = records[opened[pivot]].at(positions[pivot]);
+                    context.effort.reading(records[opened[pivot]].path());
                     context.effort.read_block(&mut file, want, where_from)
                 };
                 match block {
@@ -806,6 +808,7 @@ fn split_pivot_windows(
                     let block = {
                         let mut file = handles[slot].lock().expect("no reader panics");
                         let where_from = records[opened[slot]].at(positions[slot]);
+                        context.effort.reading(records[opened[slot]].path());
                         context.effort.read_block(&mut file, *want, where_from)
                     };
                     let Ok(block) = block else {

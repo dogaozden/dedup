@@ -36,13 +36,14 @@ use crate::cli::{flag_named, Flag, Takes};
 /// to anyone who uses the menu — safe, but not what was intended. So the list
 /// is guarded from the other side as well: `EXPECTED_FIELDS` below names every
 /// flag the form is MEANT to carry, and a test fails if the two disagree.
-const FIELDS: [&str; 8] = [
+const FIELDS: [&str; 9] = [
     "--min-size",
     "--ext",
     "--skip-ext",
     "--exclude",
     "--jobs",
     "--profile",
+    "--cloud",
     "--no-cache",
     "--force",
 ];
@@ -56,13 +57,18 @@ const FIELDS: [&str; 8] = [
 /// decide what happens to the scan rather than what the scan is, and which
 /// M5_1-MENU.md keeps off the form because it runs before any scan exists.
 #[cfg(test)]
-const MENU_EXPOSURE: [(&str, bool); 17] = [
+const MENU_EXPOSURE: [(&str, bool); 18] = [
     ("--min-size", true),
     ("--ext", true),
     ("--skip-ext", true),
     ("--exclude", true),
     ("--jobs", true),
     ("--profile", true),
+    // What the scan is, not what is done with it: whether a placeholder is a
+    // file this run will read. It belongs on the form for the same reason
+    // `--min-size` does — and because the person most likely to want it is the
+    // one who just read "12 files in cloud" on the screen before this one.
+    ("--cloud", true),
     ("--no-cache", true),
     ("--force", true),
     // Below: what to DO about what is found, or how to report it. The form is
@@ -80,9 +86,11 @@ const MENU_EXPOSURE: [(&str, bool); 17] = [
 ];
 
 /// The narrowest screen the form can be read on: the widest label and value
-/// side by side, the root line, seven rows, the hint, and the frame around it.
+/// side by side, the root line, one row per `FIELDS` entry, the hint, and the
+/// frame around it. One taller than M8 left it, because `--cloud` is a ninth
+/// row and a form whose last row is off the bottom is a form nobody agreed to.
 pub const LEAST_WIDTH: u16 = 54;
-pub const LEAST_HEIGHT: u16 = 16;
+pub const LEAST_HEIGHT: u16 = 17;
 
 pub struct Row {
     pub flag: &'static Flag,

@@ -1,0 +1,49 @@
+$ python3 rust/evidence/scripts/m9_rate_window.py
+
+$ cargo build --release   (the committed source: RATE_WINDOW = 3s)
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
+$ cargo test --release
+  test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+=== the sweep: RATE_WINDOW set to each width in turn ===
+from_millis(100) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:672:9:
+from_millis(500) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:672:9:
+from_millis(900) test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:672:9:
+from_secs(1)     test result: FAILED. 276 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   src/pulse.rs:704:9:
+from_secs(2)     test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+from_secs(60)    test result: FAILED. 275 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+                   pulse::tests::a_stall_reads_zero_within_one_window_instead_of_decaying_like_one_over_t
+                   pulse::tests::polling_faster_than_the_spacing_does_not_grow_the_window
+                   src/pulse.rs:672:9:
+
+=== what that means ===
+admitted: from_secs(2)
+refused:  from_millis(100), from_millis(500), from_millis(900), from_secs(1), from_secs(60)
+The bracket refuses 100ms, 500ms, 900ms and 60s. One second is refused
+for a different reason: at ten readings wide, 'half a window into a
+stall' falls between readings and the decay-shape assertion cannot
+resolve it — so the tests also say the window must be several times the
+reading spacing to mean anything. Two seconds passes, and should: the
+spec allows it. The exact choice of three is a tuning judgement, and no
+test here defends it.
+
+=== the stale-mutant rule: restored, and proved restored ===
+  rust/src/consts.rs compared byte for byte against the bytes read at entry:
+  identical
+$ cargo build --release
+  b3edda0dc173dec03a8b604ebfec2519d1bc6feeef8d04d4b60b74dadcd05175  target/release/dedup-rs
+  identical to the pre-sweep binary
+$ cargo test --release
+  test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+the width is held by a bracket and not by a value, the claim says so, and the two widths the spec allows are the two the tests admit
+
+   exit 0
