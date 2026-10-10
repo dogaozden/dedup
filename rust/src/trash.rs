@@ -194,36 +194,52 @@ fn unique_destination(directory: &Path, name: &str) -> PathBuf {
 }
 
 /// Move one file or one whole folder to the Trash of its own volume.
-///
-/// A folder is one directory rename (M10-FOLDERS.md §D), not a move per file.
-/// The cross-device fallback copies the whole tree before it removes anything,
-/// so the source is only ever gone once the copy is complete, and a copy that
-/// fails part-way is cleaned up rather than left in the Trash.
 fn send_to_trash(path: &Path) -> Result<(), String> {
     let directory = trash_dir_for(path);
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let name = path
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let is_folder = path.symlink_metadata().is_ok_and(|meta| meta.is_dir());
-    // Rename first: within a volume it is one atomic operation. A cross-device
-    // rename cannot happen here, because the Trash was chosen on the file's own
-    // volume, but fall back to copy-then-remove rather than lose the file.
     let destination = unique_destination(&directory, &name);
-    match std::fs::rename(path, &destination) {
+    move_to(path, &destination)
+}
+
+/// Move a file or a folder to `destination`: one rename, and a copy only when
+/// the rename crossed a volume boundary.
+///
+/// A folder is one directory rename (M10-FOLDERS.md §D), not a move per file.
+/// Any other rename failure, such as a permission, a busy file or a name that
+/// is too long, has changed nothing, so it is returned as it is and the source
+/// stays where it was. Copying after such a failure would repeat it, or leave
+/// two copies of something that was meant to move. A copy that fails part-way
+/// is cleaned up, and the source is removed only once the copy is complete.
+fn move_to(path: &Path, destination: &Path) -> Result<(), String> {
+    let is_folder = path.symlink_metadata().is_ok_and(|meta| meta.is_dir());
+    match std::fs::rename(path, destination) {
         Ok(()) => Ok(()),
+        Err(error) if !crosses_devices(&error) => Err(error.to_string()),
         Err(_) if is_folder => {
-            if let Err(error) = copy_tree(path, &destination) {
-                let _ = std::fs::remove_dir_all(&destination);
+            if let Err(error) = copy_tree(path, destination) {
+                let _ = std::fs::remove_dir_all(destination);
                 return Err(error.to_string());
             }
             std::fs::remove_dir_all(path).map_err(|error| error.to_string())
         }
         Err(_) => {
-            std::fs::copy(path, &destination).map_err(|error| error.to_string())?;
+            if let Err(error) = std::fs::copy(path, destination) {
+                let _ = std::fs::remove_file(destination);
+                return Err(error.to_string());
+            }
             std::fs::remove_file(path).map_err(|error| error.to_string())
         }
     }
+}
+
+/// Whether a failed rename failed only because source and destination are on
+/// different volumes. That is the one case where copying is the way to move
+/// something.
+fn crosses_devices(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::CrossesDevices
 }
 
 /// Copy a folder tree, links as links. Nothing is followed, so a link cannot
@@ -1479,6 +1495,64 @@ mod selection {
             assert!(late.exists(), "the folder that changed was not moved");
             assert!(tree.root.join("Photos copy/a.bin").exists());
             assert!(tree.root.join("Photos/a.bin").exists());
+        }
+    }
+
+    /// The move policy, away from the real Trash: `move_to` takes its destination,
+    /// so these tests never name a directory the user would see.
+    mod move_policy {
+        use super::super::*;
+        use std::io::ErrorKind;
+        use std::path::PathBuf;
+
+        fn scratch(name: &str) -> PathBuf {
+            let root = std::env::temp_dir().join(format!("m10-move-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("scratch");
+            root
+        }
+
+        #[test]
+        fn a_rename_that_fails_for_another_reason_leaves_the_file_in_place() {
+            let root = scratch("file");
+            let source = root.join("keep.bin");
+            std::fs::write(&source, b"still here").expect("a file");
+            // The destination's folder does not exist, so the rename fails with
+            // ENOENT: not a volume boundary, so no copy may be made.
+            let destination = root.join("no-such-folder/keep.bin");
+            assert!(move_to(&source, &destination).is_err());
+            assert_eq!(std::fs::read(&source).expect("the source"), b"still here");
+            assert!(!destination.exists(), "nothing was copied");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_rename_that_fails_for_another_reason_leaves_the_folder_in_place() {
+            let root = scratch("folder");
+            let source = root.join("Photos");
+            std::fs::create_dir_all(source.join("sub")).expect("a folder");
+            std::fs::write(source.join("sub/a.bin"), b"inside").expect("a file");
+            let destination = root.join("no-such-folder/Photos");
+            assert!(move_to(&source, &destination).is_err());
+            assert_eq!(
+                std::fs::read(source.join("sub/a.bin")).expect("kept"),
+                b"inside"
+            );
+            assert!(!destination.exists(), "no tree was copied");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn only_a_volume_boundary_is_a_reason_to_copy() {
+            assert!(crosses_devices(&std::io::Error::from(
+                ErrorKind::CrossesDevices
+            )));
+            // EXDEV on macOS is 18: the errno a rename gives across volumes.
+            assert!(crosses_devices(&std::io::Error::from_raw_os_error(18)));
+            // ENOENT, EACCES and EBUSY: none of them is a reason to copy.
+            assert!(!crosses_devices(&std::io::Error::from_raw_os_error(2)));
+            assert!(!crosses_devices(&std::io::Error::from_raw_os_error(13)));
+            assert!(!crosses_devices(&std::io::Error::from_raw_os_error(16)));
         }
     }
 }

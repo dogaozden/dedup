@@ -477,6 +477,93 @@ fn root_of(parent: &mut [usize], mut at: usize) -> usize {
     at
 }
 
+/// One entry at the top level of a folder, as far as a shallow check needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Top {
+    name: String,
+    kind: TopKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopKind {
+    /// A regular file, with its size.
+    File(u64),
+    Link,
+    /// A directory that holds at least one file or link somewhere below it.
+    /// An empty one is left out, because empty directories are ignored.
+    Dir,
+}
+
+/// Whether anything other than an empty directory lies under `directory`.
+/// Stops at the first file or link it finds, so a large directory that holds
+/// one is answered at once. `None` if it cannot be read in full.
+fn holds_a_leaf(directory: &Path) -> Option<bool> {
+    for item in fs::read_dir(directory).ok()? {
+        let item = item.ok()?;
+        let file_type = item.file_type().ok()?;
+        if file_type.is_dir() {
+            if holds_a_leaf(&item.path())? {
+                return Some(true);
+            }
+        } else if !(file_type.is_file() && item.file_name() == FINDER_NOTE) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// The top level of a folder, read without going below it.
+///
+/// Used to reject a candidate pair before anything is read whole. Two folders
+/// whose top-level names, file sizes or non-empty subfolder names differ cannot
+/// be identical, so such a pair is never listed in full. The check only ever
+/// rejects: anything it lets through is still listed and compared in full.
+/// `None` means the top level could not be read here, which the full listing
+/// would also refuse.
+fn top_of(root: &Path, folder: &str, cloud: bool) -> Option<Vec<Top>> {
+    let path = root.join(folder);
+    if !present(&fs::symlink_metadata(&path).ok()?, cloud) {
+        return None;
+    }
+    let mut tops = Vec::new();
+    for item in fs::read_dir(&path).ok()? {
+        let item = item.ok()?;
+        let name = item.file_name().into_string().ok()?;
+        let file_type = item.file_type().ok()?;
+        // Ignored before anything is checked, as `collect` ignores it, so a
+        // placeholder `.DS_Store` cannot reject a folder here that the full
+        // listing would accept.
+        if file_type.is_file() && name == FINDER_NOTE {
+            continue;
+        }
+        let metadata = item.metadata().ok()?;
+        if !present(&metadata, cloud) {
+            return None;
+        }
+        let kind = if file_type.is_dir() {
+            if !holds_a_leaf(&item.path())? {
+                continue;
+            }
+            TopKind::Dir
+        } else if file_type.is_symlink() {
+            TopKind::Link
+        } else if file_type.is_file() {
+            TopKind::File(metadata.len())
+        } else {
+            return None;
+        };
+        tops.push(Top { name, kind });
+    }
+    tops.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(tops)
+}
+
+thread_local! {
+    /// How many folders this thread has listed in full. Read by the tests, to
+    /// show that a pair the top level rejected was never read whole.
+    static FULL_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Find the folder groups the proven file groups point at.
 ///
 /// Every edge (a pair of candidate folders) is tested in a fixed order, and a
@@ -508,10 +595,13 @@ pub fn find(
         .enumerate()
         .map(|(at, &path)| (path, at))
         .collect();
-    let mut listings: Vec<Option<Listing>> = paths
-        .iter()
-        .map(|path| list(context.root, path, cloud))
-        .collect();
+    // Nothing is listed up front. A folder is read at its top level when a pair
+    // first needs it, and read whole only for a pair whose top levels agree, and
+    // only once however many pairs it is in. A duplicate pair sitting in two
+    // large folders whose top levels differ therefore costs two directory reads
+    // and nothing below them.
+    let mut tops: Vec<Option<Option<Vec<Top>>>> = vec![None; paths.len()];
+    let mut listings: Vec<Option<Option<Listing>>> = vec![None; paths.len()];
 
     let mut proven_in: HashMap<&str, usize> = HashMap::new();
     for (number, group) in groups.iter().enumerate() {
@@ -543,7 +633,24 @@ pub fn find(
         if root_left == root_right {
             continue;
         }
-        let (Some(ours), Some(theirs)) = (&listings[left], &listings[right]) else {
+        tops[left].get_or_insert_with(|| top_of(context.root, paths[left], cloud));
+        tops[right].get_or_insert_with(|| top_of(context.root, paths[right], cloud));
+        let agree = matches!(
+            (&tops[left], &tops[right]),
+            (Some(Some(ours)), Some(Some(theirs))) if ours == theirs
+        );
+        if !agree {
+            continue;
+        }
+        listings[left].get_or_insert_with(|| {
+            FULL_LISTINGS.with(|count| count.set(count.get() + 1));
+            list(context.root, paths[left], cloud)
+        });
+        listings[right].get_or_insert_with(|| {
+            FULL_LISTINGS.with(|count| count.set(count.get() + 1));
+            list(context.root, paths[right], cloud)
+        });
+        let (Some(Some(ours)), Some(Some(theirs))) = (&listings[left], &listings[right]) else {
             continue;
         };
         let verdict = identical(
@@ -560,14 +667,14 @@ pub fn find(
         }
     }
 
+    // Only folders that were compared in full can have been merged, so every
+    // member of a group below has a listing.
     let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (at, listing) in listings.iter().enumerate() {
-        if listing.is_some() {
-            components
-                .entry(root_of(&mut parent, at))
-                .or_default()
-                .push(at);
-        }
+    for at in 0..paths.len() {
+        components
+            .entry(root_of(&mut parent, at))
+            .or_default()
+            .push(at);
     }
     let mut found: Vec<FolderGroup> = components
         .into_iter()
@@ -576,7 +683,7 @@ pub fn find(
             let mut folders: Vec<Folder> = members
                 .into_iter()
                 .filter_map(|at| {
-                    listings[at].take().map(|listing| Folder {
+                    listings[at].take().flatten().map(|listing| Folder {
                         path: paths[at].to_string(),
                         listing,
                     })
@@ -1533,6 +1640,70 @@ mod tests {
         );
         let still_fine = unchanged(&scratch.0, &folders[0].folders[0], false);
         assert!(still_fine.is_ok(), "the kept twin did not change");
+    }
+
+    #[test]
+    fn a_pair_whose_top_levels_differ_is_never_listed_in_full() {
+        // The duplicate is in a folder each, and each folder also holds a file
+        // of its own at the top. The top levels disagree, so neither folder is
+        // listed below its top level.
+        let scratch = Scratch::new("shallow");
+        scratch.write("one/copy.bin", &[9_u8; 4000]);
+        scratch.write("one/only-here.txt", b"nothing else matches");
+        scratch.write("two/copy.bin", &[9_u8; 4000]);
+        scratch.write("two/only-there.txt", b"nor this");
+        FULL_LISTINGS.with(|count| count.set(0));
+        let groups = found(&scratch);
+        assert!(groups.is_empty());
+        assert_eq!(
+            FULL_LISTINGS.with(std::cell::Cell::get),
+            0,
+            "a pair whose top levels differ was listed below the top"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_subfolder_with_another_name_is_a_shallow_mismatch() {
+        // The same file sits at the top of both folders, and each holds a
+        // different subfolder with content. The subfolder names differ, so the
+        // pair is rejected without reading either subfolder.
+        let scratch = Scratch::new("subfolder-names");
+        scratch.write("one/copy.bin", &[9_u8; 4000]);
+        scratch.write("one/deep/a.txt", b"under one");
+        scratch.write("two/copy.bin", &[9_u8; 4000]);
+        scratch.write("two/deeper/a.txt", b"under two");
+        FULL_LISTINGS.with(|count| count.set(0));
+        assert!(found(&scratch).is_empty());
+        assert_eq!(FULL_LISTINGS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn an_empty_subfolder_with_another_name_does_not_make_a_shallow_mismatch() {
+        // Empty directories are ignored, so a stray empty `tmp/` on one side
+        // must not reject a pair the full comparison would accept.
+        let scratch = Scratch::new("empty-subfolder");
+        for copy in ["one", "two"] {
+            scratch.write(&format!("{copy}/copy.bin"), &[9_u8; 4000]);
+        }
+        std::fs::create_dir_all(scratch.folder("two/tmp/deeper")).expect("an empty folder");
+        assert_eq!(found(&scratch).len(), 1);
+    }
+
+    #[test]
+    fn an_identical_group_lists_each_folder_in_full_exactly_once() {
+        let scratch = Scratch::new("lists-once");
+        for copy in ["A", "B", "C"] {
+            scratch.write(&format!("{copy}/x.bin"), &[7_u8; 3000]);
+            scratch.write(&format!("{copy}/y.bin"), &[8_u8; 3000]);
+        }
+        FULL_LISTINGS.with(|count| count.set(0));
+        let groups = found(&scratch);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            FULL_LISTINGS.with(std::cell::Cell::get),
+            3,
+            "each folder is listed in full once, however many pairs it is in"
+        );
     }
 
     #[test]
