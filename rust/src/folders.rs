@@ -21,6 +21,7 @@ use std::os::macos::fs::MetadataExt as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use crate::cache::{Field, ScanCache};
 use crate::cloud;
 use crate::compare::{compare_chunk, split_identical, Compare};
 use crate::pipeline::DupGroup;
@@ -118,6 +119,10 @@ pub struct Folder {
 pub struct FolderGroup {
     /// Shortest path first, the way file groups list their members.
     pub folders: Vec<Folder>,
+    /// True when some file pair was matched from a digest the cache remembers
+    /// rather than bytes read this scan. Such a group is a candidate: every
+    /// folder in it is compared byte for byte again before anything moves.
+    pub attested: bool,
 }
 
 impl FolderGroup {
@@ -325,41 +330,71 @@ fn record_of(path: &str, entry: &Entry) -> Option<FileRec> {
     })
 }
 
-/// Whether two folders hold the same files with the same bytes, reading what
-/// is not already proven.
+/// How two folders were settled, file pair by file pair.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Differ,
+    /// Identical. `from_cache` is set when some file pair matched on a digest
+    /// the cache remembers, rather than on bytes read in this call.
+    Same {
+        from_cache: bool,
+    },
+}
+
+/// Whether two folders hold the same files with the same bytes.
 ///
-/// `proven_in` maps each file name a proven group holds to that group. Two
-/// files in one group were compared this scan, so they are not read again.
-/// Every other pair is read here, through the same comparison the scan uses,
-/// so the reads land in the same counters the report shows.
+/// A pair the scan proved this scan is settled without reading, as before. A
+/// pair with a remembered whole-file digest on both sides is settled from the
+/// cache, and the answer is marked as such. Every other pair is read through
+/// the scan's own comparison, and what that read learns is remembered, so the
+/// next scan of an untouched tree reads nothing here.
+///
+/// A remembered difference is believed as well: the cache may only narrow, and
+/// a difference it reports can only cost a missed group, never a wrong removal.
+///
+/// `proven_in` maps each file name a proven group holds to that group.
 fn identical(
     context: &Compare,
     proven_in: &HashMap<&str, usize>,
-    left: &Folder,
-    right: &Folder,
+    mut cache: Option<&mut ScanCache>,
+    (left_path, left): (&str, &Listing),
+    (right_path, right): (&str, &Listing),
     unreadable: &mut Vec<String>,
-) -> bool {
-    if !same_shape(&left.listing, &right.listing) {
-        return false;
+) -> Verdict {
+    if !same_shape(left, right) {
+        return Verdict::Differ;
     }
     let chunk = compare_chunk(context.profile, 2, context.solid);
-    for (ours, theirs) in left.listing.entries.iter().zip(&right.listing.entries) {
+    let mut from_cache = false;
+    for (ours, theirs) in left.entries.iter().zip(&right.entries) {
         let Kind::File { size, .. } = ours.kind else {
             continue;
         };
         if size == 0 {
             continue;
         }
-        let here = format!("{}/{}", left.path, ours.name);
-        let there = format!("{}/{}", right.path, theirs.name);
+        let here = format!("{left_path}/{}", ours.name);
+        let there = format!("{right_path}/{}", theirs.name);
         let known = proven_in.get(here.as_str());
         if known.is_some() && known == proven_in.get(there.as_str()) {
             continue;
         }
         let (Some(first), Some(second)) = (record_of(&here, ours), record_of(&there, theirs))
         else {
-            return false;
+            return Verdict::Differ;
         };
+        if let Some(cache) = cache.as_deref_mut() {
+            if let (Some(remembered), Some(other)) = (
+                cache.get(&first, Field::Full),
+                cache.get(&second, Field::Full),
+            ) {
+                if remembered != other {
+                    return Verdict::Differ;
+                }
+                from_cache = true;
+                continue;
+            }
+        }
         let records = [first, second];
         let settled = split_identical(
             context,
@@ -371,10 +406,67 @@ fn identical(
             Vec::new(),
         );
         if settled.matched.len() != 1 || settled.matched[0].len() != 2 {
-            return false;
+            return Verdict::Differ;
+        }
+        if let Some(cache) = cache.as_deref_mut() {
+            for (index, digest) in settled.learned {
+                cache.remember(&records[index], Field::Full, digest);
+            }
         }
     }
-    true
+    Verdict::Same { from_cache }
+}
+
+/// Prove again, byte for byte, that `folder` still matches the copy beside it.
+///
+/// Run on an attested folder before anything moves. Its match came from the
+/// cache, so nothing the cache says is taken for granted here: both listings are
+/// read again, and then every file pair is read, whatever is remembered. A
+/// remembered digest can be forged along with a file's mtime, and this is where
+/// that is caught.
+pub fn reprove(
+    context: &Compare,
+    folder: &Folder,
+    keeper: &Folder,
+    cloud: bool,
+    unreadable: &mut Vec<String>,
+) -> Result<(), String> {
+    unchanged(context.root, folder, cloud)?;
+    unchanged(context.root, keeper, cloud)?;
+    let verdict = identical(
+        context,
+        &HashMap::new(),
+        None,
+        (&folder.path, &folder.listing),
+        (&keeper.path, &keeper.listing),
+        unreadable,
+    );
+    match verdict {
+        Verdict::Same { .. } => Ok(()),
+        Verdict::Differ => Err(
+            "its files no longer match the copy beside it, or could not be read in full, so \
+             nothing in it was moved"
+                .to_string(),
+        ),
+    }
+}
+
+/// The entries of one folder as the records a cache knows them by.
+fn records_of(folder: &Folder) -> Vec<FileRec> {
+    folder
+        .listing
+        .entries
+        .iter()
+        .filter_map(|entry| record_of(&format!("{}/{}", folder.path, entry.name), entry))
+        .collect()
+}
+
+/// Drop what the cache remembers about every file in a group whose match has
+/// been found wrong, so the wrong answer cannot survive into the next scan.
+pub fn forget(group: &FolderGroup, cache: &mut ScanCache) {
+    let records: Vec<FileRec> = group.folders.iter().flat_map(records_of).collect();
+    let refs: Vec<&FileRec> = records.iter().collect();
+    cache.forget(&refs);
 }
 
 fn root_of(parent: &mut [usize], mut at: usize) -> usize {
@@ -398,6 +490,7 @@ pub fn find(
     groups: &[DupGroup],
     context: &Compare,
     cloud: bool,
+    mut cache: Option<&mut ScanCache>,
     unreadable: &mut Vec<String>,
 ) -> Vec<FolderGroup> {
     let pairs = seeds(records, groups);
@@ -432,31 +525,38 @@ pub fn find(
         }
     }
 
+    // On a cold scan the bytes read here are what a warm scan will need, so
+    // they are learned when there is a cache to learn them into.
+    let learning = Compare {
+        root: context.root,
+        effort: context.effort,
+        profile: context.profile,
+        solid: context.solid,
+        learn: cache.is_some(),
+    };
     let mut parent: Vec<usize> = (0..paths.len()).collect();
+    // Set on a root when any pair merged into its group matched from memory.
+    let mut attested = vec![false; paths.len()];
     for (first, second) in &pairs {
         let (left, right) = (index[first.as_str()], index[second.as_str()]);
-        if root_of(&mut parent, left) == root_of(&mut parent, right) {
+        let (root_left, root_right) = (root_of(&mut parent, left), root_of(&mut parent, right));
+        if root_left == root_right {
             continue;
         }
         let (Some(ours), Some(theirs)) = (&listings[left], &listings[right]) else {
             continue;
         };
-        let same = identical(
-            context,
+        let verdict = identical(
+            &learning,
             &proven_in,
-            &Folder {
-                path: paths[left].to_string(),
-                listing: ours.clone(),
-            },
-            &Folder {
-                path: paths[right].to_string(),
-                listing: theirs.clone(),
-            },
+            cache.as_deref_mut(),
+            (paths[left], ours),
+            (paths[right], theirs),
             unreadable,
         );
-        if same {
-            let (keep, merge) = (root_of(&mut parent, left), root_of(&mut parent, right));
-            parent[merge] = keep;
+        if let Verdict::Same { from_cache } = verdict {
+            parent[root_right] = root_left;
+            attested[root_left] |= attested[root_right] || from_cache;
         }
     }
 
@@ -470,9 +570,9 @@ pub fn find(
         }
     }
     let mut found: Vec<FolderGroup> = components
-        .into_values()
-        .filter(|members| members.len() > 1)
-        .map(|members| {
+        .into_iter()
+        .filter(|(_, members)| members.len() > 1)
+        .map(|(root, members)| {
             let mut folders: Vec<Folder> = members
                 .into_iter()
                 .filter_map(|at| {
@@ -483,7 +583,10 @@ pub fn find(
                 })
                 .collect();
             folders.sort_by(|left, right| name_order(&left.path).cmp(&name_order(&right.path)));
-            FolderGroup { folders }
+            FolderGroup {
+                folders,
+                attested: attested[root],
+            }
         })
         .collect();
     found = maximal(found);
@@ -737,7 +840,8 @@ pub struct Plan {
     pub refused: Vec<usize>,
 }
 
-/// Decide what `--auto` removes.
+/// Decide what `--auto` removes. `held` names folder groups that must not move
+/// this run, because their proof failed before the plan was made.
 ///
 /// Each folder group keeps the folder `rule` picks and moves the rest. Then the
 /// file groups are planned against what is left: a member inside a kept folder
@@ -748,14 +852,30 @@ pub struct Plan {
 /// move would tear a kept folder, or leave some file group without a copy, is
 /// dropped from the plan and its folders are kept. The loop runs until nothing
 /// more needs dropping, and every pass only ever keeps more, so it terminates.
-pub fn plan(records: &[FileRec], groups: &[DupGroup], folders: &[FolderGroup], rule: Rule) -> Plan {
+pub fn plan(
+    records: &[FileRec],
+    groups: &[DupGroup],
+    folders: &[FolderGroup],
+    rule: Rule,
+    held: &[usize],
+) -> Plan {
     let mut active = vec![true; folders.len()];
+    for &number in held {
+        active[number] = false;
+    }
     let mut refused = Vec::new();
     loop {
         let live: Vec<usize> = (0..folders.len())
             .filter(|&number| active[number])
             .collect();
+        // A held group's folders stay exactly where they are, and what is in
+        // them stays too: they shelter their files the way a kept folder does.
         let mut kept: HashMap<&str, usize> = HashMap::new();
+        for &number in held {
+            for folder in &folders[number].folders {
+                kept.insert(folder.path.as_str(), number);
+            }
+        }
         let mut moves: Vec<(usize, usize)> = Vec::new();
         for &number in &live {
             let keeper = keep_folder(rule, &folders[number].folders);
@@ -1034,7 +1154,7 @@ mod tests {
         let effort = Effort::default();
         let context = compare(&scratch.0, &effort);
         let mut unreadable = Vec::new();
-        find(&records, &groups, &context, false, &mut unreadable)
+        find(&records, &groups, &context, false, None, &mut unreadable)
     }
 
     fn paths(group: &FolderGroup) -> Vec<&str> {
@@ -1212,9 +1332,11 @@ mod tests {
         };
         let outer = FolderGroup {
             folders: vec![folder("A"), folder("B")],
+            attested: false,
         };
         let inner = FolderGroup {
             folders: vec![folder("A/sub"), folder("B/sub")],
+            attested: false,
         };
         let kept = maximal(vec![outer, inner]);
         assert_eq!(kept.len(), 1);
@@ -1231,7 +1353,7 @@ mod tests {
         let effort = Effort::default();
         let context = compare(&scratch.0, &effort);
         let mut unreadable = Vec::new();
-        let folders = find(&records, &groups, &context, false, &mut unreadable);
+        let folders = find(&records, &groups, &context, false, None, &mut unreadable);
         // a.jpg, notes.txt and sub/b.jpg each have exactly one copy per folder.
         let folded = fold(&records, &groups, &folders, &[0]);
         assert_eq!(folded.len(), 3);
@@ -1247,7 +1369,7 @@ mod tests {
         let effort = Effort::default();
         let context = compare(&scratch.0, &effort);
         let mut unreadable = Vec::new();
-        let folders = find(&records, &groups, &context, false, &mut unreadable);
+        let folders = find(&records, &groups, &context, false, None, &mut unreadable);
         assert_eq!(folders.len(), 1);
         let folded = fold(&records, &groups, &folders, &[0]);
         let loose = groups
@@ -1276,6 +1398,7 @@ mod tests {
                     listing: Listing::default(),
                 })
                 .collect(),
+            attested: false,
         }
     }
 
@@ -1348,8 +1471,8 @@ mod tests {
         let effort = Effort::default();
         let context = compare(&scratch.0, &effort);
         let mut unreadable = Vec::new();
-        let folders = find(&records, &groups, &context, false, &mut unreadable);
-        let decided = plan(&records, &groups, &folders, rule);
+        let folders = find(&records, &groups, &context, false, None, &mut unreadable);
+        let decided = plan(&records, &groups, &folders, rule, &[]);
         (records, groups, folders, decided)
     }
 
@@ -1385,12 +1508,14 @@ mod tests {
         let folders = vec![
             FolderGroup {
                 folders: vec![folder("A", 900), folder("B", 100)],
+                attested: false,
             },
             FolderGroup {
                 folders: vec![folder("B/x", 500), folder("C/x", 50)],
+                attested: false,
             },
         ];
-        let decided = plan(&[], &[], &folders, Rule::Newest);
+        let decided = plan(&[], &[], &folders, Rule::Newest, &[]);
         assert_eq!(decided.refused, [0], "the group whose move would tear B/x");
         assert_eq!(decided.folders, [(1, 1)], "only C/x moves");
     }
@@ -1408,6 +1533,32 @@ mod tests {
         );
         let still_fine = unchanged(&scratch.0, &folders[0].folders[0], false);
         assert!(still_fine.is_ok(), "the kept twin did not change");
+    }
+
+    #[test]
+    fn a_hardlink_with_a_name_outside_the_folder_is_not_counted_as_freed() {
+        // A file with a second name outside the folder keeps its data alive
+        // after the folder moves, so only the bytes that really go are counted.
+        let file = |name: &str, size: u64, nlink: u64| Entry {
+            name: name.to_string(),
+            kind: Kind::File {
+                size,
+                dev: 1,
+                ino: name.len() as u64,
+                nlink,
+            },
+            mtime_ns: 0,
+        };
+        let listing = Listing {
+            entries: vec![
+                file("alone.bin", 100, 1),
+                file("linked.bin", 50, 2),
+                file("notes.txt", 7, 1),
+            ],
+        };
+        assert_eq!(listing.bytes(), 157, "every byte in the folder");
+        assert_eq!(listing.freed(), 107, "the linked file is not freed");
+        assert_eq!(listing.files(), 3);
     }
 
     #[test]
@@ -1453,7 +1604,7 @@ mod tests {
             members: vec![2, 0, 1],
             attested: false,
         }];
-        let decided = plan(&records, &groups, &[], Rule::Shortest);
+        let decided = plan(&records, &groups, &[], Rule::Shortest, &[]);
         assert!(decided.folders.is_empty());
         assert_eq!(decided.files, [0, 1], "the shortest name keeps c.bin");
     }

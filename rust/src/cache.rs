@@ -141,6 +141,16 @@ impl ScanCache {
         }
     }
 
+    /// A cache in `directory`, for tests: the real database code, kept away
+    /// from the user's cache.
+    #[cfg(test)]
+    pub fn in_directory(directory: PathBuf) -> Self {
+        ScanCache {
+            directory,
+            ..ScanCache::new()
+        }
+    }
+
     /// A cache that answers nothing and records everything — `--force`.
     pub fn forced() -> Self {
         ScanCache {

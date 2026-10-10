@@ -131,7 +131,7 @@ pub fn oracle_mtime(record: &FileRec) -> f64 {
 /// would free nothing.
 #[cfg(test)]
 fn plan_auto(records: &[FileRec], groups: &[DupGroup], rule: Rule) -> Vec<usize> {
-    folders::plan(records, groups, &[], rule).files
+    folders::plan(records, groups, &[], rule, &[]).files
 }
 
 /// The mount point of the volume holding `path`.
@@ -289,6 +289,17 @@ pub fn remove_record(root: &Path, record: &FileRec, hard: bool) -> Result<(), St
     remove_names(root, &names, hard)
 }
 
+/// The test seam's hook: called with each folder just before `--auto` checks it
+/// again and moves it, so a test can change the tree between the plan and the move.
+#[cfg(test)]
+type BeforeMove = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MOVE: std::cell::RefCell<Option<BeforeMove>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Non-interactive cleanup: keep one copy per group by `rule`, remove the rest.
 ///
 /// Taking `ProvenGroups` rather than a slice is the guard: the only way to
@@ -300,7 +311,7 @@ pub fn run_auto(
     proven: ProvenGroups<'_>,
     removal: &Removal,
     context: &Compare,
-    cache: Option<&mut ScanCache>,
+    mut cache: Option<&mut ScanCache>,
 ) -> i32 {
     // Groups matched from the cache have not been read yet. They are read here,
     // before a plan is even printed, so the plan describes files that really
@@ -313,11 +324,51 @@ pub fn run_auto(
             attested: group.attested,
         })
         .collect();
-    let (groups, refused) = verify_attested(context, &scan.records, candidates, cache);
+    let (groups, refused) =
+        verify_attested(context, &scan.records, candidates, cache.as_deref_mut());
     report_refusals(&scan.records, &refused);
 
+    // The same for folder groups matched from the cache: every folder is
+    // compared byte for byte with its kept copy again. A group that fails is
+    // held where it is, whole, and what the cache remembered about it is dropped.
     let folders = proven.folders();
-    let plan = folders::plan(&scan.records, &groups, folders, removal.rule);
+    let mut held = Vec::new();
+    let mut unreadable = Vec::new();
+    for (number, group) in folders.iter().enumerate() {
+        if !group.attested {
+            continue;
+        }
+        let keeper = folders::keep_folder(removal.rule, &group.folders);
+        let failure = group
+            .folders
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| at != keeper)
+            .find_map(|(_, folder)| {
+                folders::reprove(
+                    context,
+                    folder,
+                    &group.folders[keeper],
+                    removal.cloud,
+                    &mut unreadable,
+                )
+                .err()
+                .map(|why| (folder.path.as_str(), why))
+            });
+        if let Some((path, why)) = failure {
+            eprintln!(
+                "\n  Refusing the folder group at {}/: {path}/ {why}. \
+                 What the cache remembered about the group has been dropped.",
+                group.folders[keeper].path
+            );
+            if let Some(cache) = cache.as_deref_mut() {
+                folders::forget(group, cache);
+            }
+            held.push(number);
+        }
+    }
+
+    let plan = folders::plan(&scan.records, &groups, folders, removal.rule, &held);
     for &number in &plan.refused {
         let group = &folders[number];
         eprintln!(
@@ -390,7 +441,7 @@ pub fn run_auto(
         println!(
             "\n  Keeping the {} copy in each of {} folder group(s) and {} file group(s).",
             removal.rule,
-            folders.len(),
+            folders.len() - held.len(),
             groups.len()
         );
         if plan.folders.is_empty() {
@@ -450,6 +501,12 @@ pub fn run_auto(
         let group = &folders[number];
         let folder = &group.folders[at];
         let twin = &group.folders[folders::keep_folder(removal.rule, &group.folders)];
+        #[cfg(test)]
+        BEFORE_MOVE.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(&context.root.join(&folder.path));
+            }
+        });
         let proof_holds = folders::unchanged(context.root, folder, removal.cloud)
             .and_then(|()| folders::unchanged(context.root, twin, removal.cloud));
         if let Err(why) = proof_holds {
@@ -803,13 +860,13 @@ mod selection {
 
     /// A scratch tree, and the ground beside it for names the scan must not
     /// see. Removed when the test ends, however it ends.
-    struct Tree {
-        base: PathBuf,
-        root: PathBuf,
+    pub(super) struct Tree {
+        pub(super) base: PathBuf,
+        pub(super) root: PathBuf,
     }
 
     impl Tree {
-        fn new(files: &[(&str, &[u8])]) -> Tree {
+        pub(super) fn new(files: &[(&str, &[u8])]) -> Tree {
             let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
             let base =
                 std::env::temp_dir().join(format!("m5-selection-{}-{serial}", std::process::id()));
@@ -823,7 +880,7 @@ mod selection {
             tree
         }
 
-        fn write(&self, name: &str, content: &[u8]) {
+        pub(super) fn write(&self, name: &str, content: &[u8]) {
             let path = self.root.join(name);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("scratch directory");
@@ -846,7 +903,7 @@ mod selection {
                 .expect("hard link outside the tree");
         }
 
-        fn scan(&self, effort: &Effort) -> Scan {
+        pub(super) fn scan(&self, effort: &Effort) -> Scan {
             self.scan_with(effort, crate::device::Wanted::Flash)
         }
 
@@ -1199,5 +1256,229 @@ mod selection {
         .expect("two of three is a legal selection");
         assert_eq!(removed.files, 2);
         assert_eq!(tree.survivors(), vec!["c.bin"]);
+    }
+
+    /// Attested folder groups: the cache, not the bytes, settles a scan's
+    /// folder pairs, and `--auto` has to compare them again before it moves.
+    mod attested {
+        use super::super::*;
+        use super::Tree;
+        use crate::cache::ScanCache;
+        use crate::cloud::Cloud;
+        use crate::device::{Profile, VolumeProbe, Wanted};
+        use crate::effort::Effort;
+        use crate::filters::Filters;
+        use crate::folders;
+        use crate::pipeline::find_duplicates;
+        use crate::pulse::Pulse;
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        /// Two identical folders with a big-enough file and a small one, each
+        /// old enough that the cache does not treat it as racily clean.
+        fn two_copies() -> Tree {
+            let big = vec![0x5A_u8; 6000];
+            let tree = Tree::new(&[
+                ("Photos/a.bin", &big),
+                ("Photos/n.txt", b"same note"),
+                ("Photos copy/a.bin", &big),
+                ("Photos copy/n.txt", b"same note"),
+            ]);
+            backdate(&tree.root);
+            tree
+        }
+
+        fn backdate(root: &Path) {
+            let past = SystemTime::now() - Duration::from_secs(60);
+            for base in [
+                root.to_path_buf(),
+                root.join("Photos"),
+                root.join("Photos copy"),
+            ] {
+                for name in std::fs::read_dir(&base)
+                    .expect("a scratch folder")
+                    .flatten()
+                {
+                    let path = name.path();
+                    if path.is_file() {
+                        File::open(&path)
+                            .and_then(|file| file.set_modified(past))
+                            .expect("an old mtime");
+                    }
+                }
+            }
+        }
+
+        /// A scan, and the folder groups it finds, with `cache` learning and
+        /// answering. Returns the scan with its folder groups attached.
+        fn scan_with_folders(tree: &Tree, effort: &Effort, cache: &mut ScanCache) -> Scan {
+            let mut scan = find_duplicates(
+                &tree.root,
+                Filters {
+                    min_size: 1,
+                    include_ext: None,
+                    skip_ext: &[],
+                    excludes: &[],
+                    cloud: false,
+                },
+                &mut VolumeProbe::start(&tree.root, Some(1)),
+                effort,
+                Some(cache),
+                Wanted::Flash,
+                &Pulse::off(),
+                &Cloud::default(),
+                None,
+            );
+            let context = Compare {
+                root: &tree.root,
+                effort,
+                profile: Profile::Flash,
+                solid: true,
+                learn: false,
+            };
+            let mut unreadable = Vec::new();
+            let found = folders::find(
+                &scan.records,
+                scan.reported(),
+                &context,
+                false,
+                Some(cache),
+                &mut unreadable,
+            );
+            scan.attach_folders(found);
+            scan
+        }
+
+        fn context<'a>(tree: &'a Tree, effort: &'a Effort) -> Compare<'a> {
+            Compare {
+                root: &tree.root,
+                effort,
+                profile: Profile::Flash,
+                solid: true,
+                learn: false,
+            }
+        }
+
+        fn removal(rule: Rule) -> Removal {
+            Removal {
+                rule,
+                // Nothing here may reach the real Trash: a test removes for good,
+                // and only ever inside its own scratch tree.
+                hard: true,
+                assume_yes: true,
+                cloud: false,
+            }
+        }
+
+        /// Make a file's bytes different while keeping its size and its mtime,
+        /// which is what defeats the cache's key.
+        fn forge_keeping_size_and_mtime(path: &Path, body: &[u8]) {
+            let before = std::fs::metadata(path).expect("the file");
+            let mtime = before.modified().expect("an mtime");
+            std::fs::write(path, body).expect("a rewrite");
+            File::options()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.set_modified(mtime))
+                .expect("the mtime put back");
+        }
+
+        #[test]
+        fn a_folder_matched_from_the_cache_is_compared_again_and_then_moves() {
+            let tree = two_copies();
+            let cache_dir = tree.base.join("cache");
+            let mut cache = ScanCache::in_directory(cache_dir.clone());
+            let cold = Effort::default();
+            scan_with_folders(&tree, &cold, &mut cache);
+            let effort = Effort::default();
+            let scan = scan_with_folders(&tree, &effort, &mut cache);
+            let proven = scan.proven().expect("a proven scan");
+            let found = proven.folders();
+            assert_eq!(found.len(), 1, "one folder group");
+            assert!(found[0].attested, "the warm scan settled it from the cache");
+            assert_eq!(effort.bytes_read(), 0, "the warm scan read nothing");
+
+            let check = Effort::default();
+            let code = run_auto(
+                &scan,
+                proven,
+                &removal(Rule::Shortest),
+                &context(&tree, &check),
+                Some(&mut cache),
+            );
+            assert_eq!(code, 0);
+            assert!(check.bytes_read() > 0, "the move proved the group again");
+            assert!(!tree.root.join("Photos copy").exists(), "the copy moved");
+            assert_eq!(
+                std::fs::read(tree.root.join("Photos/a.bin")).expect("kept"),
+                vec![0x5A_u8; 6000]
+            );
+        }
+
+        #[test]
+        fn a_forged_file_refuses_its_folder_group_and_both_folders_stay() {
+            let tree = two_copies();
+            let mut cache = ScanCache::in_directory(tree.base.join("cache"));
+            scan_with_folders(&tree, &Effort::default(), &mut cache);
+            let effort = Effort::default();
+            let scan = scan_with_folders(&tree, &effort, &mut cache);
+            assert!(scan.proven().expect("proven").folders()[0].attested);
+
+            // Same size, different bytes, and the mtime put back: the cache
+            // still believes the old digest.
+            forge_keeping_size_and_mtime(&tree.root.join("Photos copy/n.txt"), b"same notf");
+            let check = Effort::default();
+            let code = run_auto(
+                &scan,
+                scan.proven().expect("proven"),
+                &removal(Rule::Shortest),
+                &context(&tree, &check),
+                Some(&mut cache),
+            );
+            assert_eq!(code, 0);
+            assert!(
+                tree.root.join("Photos copy/a.bin").exists(),
+                "the copy stayed whole"
+            );
+            assert_eq!(
+                std::fs::read(tree.root.join("Photos copy/n.txt")).expect("forged"),
+                b"same notf"
+            );
+            assert!(
+                tree.root.join("Photos/n.txt").exists(),
+                "the kept folder stayed whole"
+            );
+            assert!(tree.root.join("Photos/a.bin").exists());
+        }
+
+        #[test]
+        fn a_file_added_after_the_scan_blocks_its_move_through_run_auto() {
+            // A proven group, not an attested one: the listing check at the move
+            // is what catches the change, and the hook makes the change between
+            // the plan and that check.
+            let tree = two_copies();
+            let effort = Effort::default();
+            let mut cache = ScanCache::in_directory(tree.base.join("cache"));
+            let scan = scan_with_folders(&tree, &effort, &mut cache);
+            let late = tree.root.join("Photos copy/late.txt");
+            BEFORE_MOVE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|folder: &Path| {
+                    std::fs::write(folder.join("late.txt"), b"arrived after the scan")
+                        .expect("a file added in the window");
+                }));
+            });
+            let code = run_auto(
+                &scan,
+                scan.proven().expect("proven"),
+                &removal(Rule::Shortest),
+                &context(&tree, &Effort::default()),
+                None,
+            );
+            BEFORE_MOVE.with(|hook| hook.borrow_mut().take());
+            assert_eq!(code, 0);
+            assert!(late.exists(), "the folder that changed was not moved");
+            assert!(tree.root.join("Photos copy/a.bin").exists());
+            assert!(tree.root.join("Photos/a.bin").exists());
+        }
     }
 }

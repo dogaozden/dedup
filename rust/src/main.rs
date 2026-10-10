@@ -156,8 +156,12 @@ fn print_report(folders: &[FolderGroup], groups: &[Vec<&str>]) {
         for (position, folder) in group.folders.iter().enumerate() {
             let marker = if position == 0 { "keep" } else { "    " };
             if position == 0 {
+                // The browser's word for a group proved at apply, not before. Only
+                // folder groups are labelled here: file groups are not, and a
+                // label on them would change every warm `--list`.
+                let candidate = if group.attested { "  candidate" } else { "" };
                 println!(
-                    "    {marker} {}/   ({} files, {} each copy)",
+                    "    {marker} {}/   ({} files, {} each copy){candidate}",
                     folder.path,
                     group.files(),
                     size::human_size(group.bytes())
@@ -313,6 +317,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             scan.reported(),
             &context,
             options.cloud,
+            cache.as_mut(),
             &mut folder_unreadable,
         );
         scan.unreadable.extend(folder_unreadable);
