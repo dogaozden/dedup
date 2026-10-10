@@ -3181,6 +3181,10 @@ The reasons, each stated once:
 
 ### The move policy
 
+Tests cover a refused rename three ways: a missing destination folder, a
+read-only source parent, and a read-only destination folder. Each leaves the
+source and the destination as they were.
+
 A failed rename falls back to copy-then-remove only when it failed with
 `CrossesDevices` (EXDEV). Any other rename failure, such as a permission, a busy
 file, or a name too long, is returned as it is, and the source is not touched.

@@ -1543,6 +1543,46 @@ mod selection {
         }
 
         #[test]
+        fn a_rename_refused_by_permissions_leaves_the_source_in_place() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = scratch("permissions");
+            let locked = root.join("locked");
+            std::fs::create_dir_all(&locked).expect("a folder");
+            let source = locked.join("keep.bin");
+            std::fs::write(&source, b"still here").expect("a file");
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("a folder");
+            let folder = root.join("tree");
+            std::fs::create_dir_all(folder.join("sub")).expect("a tree");
+            std::fs::write(folder.join("sub/a.bin"), b"inside").expect("a file");
+
+            // A read-only parent refuses the rename of anything in it (EACCES),
+            // which is no volume boundary, so nothing may be copied.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+                .expect("read-only");
+            let into_parent = move_to(&source, &elsewhere.join("keep.bin"));
+            // A read-only destination folder refuses the rename into it.
+            std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o555))
+                .expect("read-only");
+            let into_destination = move_to(&folder, &elsewhere.join("tree"));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("restored");
+            std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755))
+                .expect("restored");
+
+            assert!(into_parent.is_err(), "a refused rename is an error");
+            assert_eq!(std::fs::read(&source).expect("the source"), b"still here");
+            assert!(!elsewhere.join("keep.bin").exists(), "nothing was copied");
+            assert!(into_destination.is_err());
+            assert_eq!(
+                std::fs::read(folder.join("sub/a.bin")).expect("the folder's file"),
+                b"inside"
+            );
+            assert!(!elsewhere.join("tree").exists(), "no tree was copied");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
         fn only_a_volume_boundary_is_a_reason_to_copy() {
             assert!(crosses_devices(&std::io::Error::from(
                 ErrorKind::CrossesDevices

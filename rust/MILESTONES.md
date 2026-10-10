@@ -4733,7 +4733,7 @@ rescan), then the fix round, `9b89fd6` (code) and `be136b6` (evidence). Evidence
 
 ### Gate lines (final binary)
 
-- `cargo test`: `test result: ok. 311 passed; 0 failed` (was 277).
+- `cargo test`: `test result: ok. 312 passed; 0 failed` (was 277).
 - `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
 - `m10_folders.py`: `ALL CHECKS PASSED`, 36 checks. Scenario A: the cold scan
   reads bytes; the warm scan reads 0 and labels the group `candidate`; `--auto`
@@ -4769,7 +4769,8 @@ the test pass again.
 - A folder's age for `--auto oldest` and `newest` is the newest entry inside it.
 - The listing cost is bounded at the top level only. A pair whose top levels
   agree, and which differs further down, still lists both trees whole (LOG).
-- The copy fallback has not run on a real second volume.
+- The copy fallback has not run on a real second volume. The permission tests
+  were checked by mutation: an any-error fallback fails the read-only test.
 
 ### Hazards, recorded
 
