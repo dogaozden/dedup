@@ -4695,83 +4695,90 @@ cannot protect against SIGTERM.
 ## M10 — identical folders, phase 1 — CLAIMED
 
 Branch `m10-folders`, based on `main@35997af`. Not pushed, not merged. Phase 2
-(the browser) is not started. Code: `3c24931`, then the warm-rescan round below.
-Evidence: `rust/evidence/m10-*.txt`.
+(the browser) is not started. Commits: `3c24931` (folders), `adb044d` and
+`04ed251` (script, evidence, claim), `68e99eb`, `cf9e782`, `e97c75a` (warm
+rescan), then the fix round, `9b89fd6` (code) and `be136b6` (evidence). Evidence: `rust/evidence/m10-*.txt`.
 
 ### What was built
 
-- **Detection** (`folders.rs`). Candidate folder pairs are seeded from the file
-  groups the scan proved, never from a walk for folders. Each pair is listed
-  unfiltered with `std::fs`, never following a link. Pairs are settled from
-  bytes the scan compares (through `split_identical`, so reads land in the
-  `--report-json` counters), from a whole-file digest the cache remembers, or
-  from a file the scan already proved. Groups come from union-find over those
-  settlements, maximal only.
-- **Warm rescan (the maintainer's option b).** A folder group settled partly
-  from the cache is attested: `--list` labels it `candidate`, the browser's word
-  for it. A cold scan learns the whole-file digest of every file its folder pass
-  reads, in the existing `Full` column, so no schema changes. A warm scan of an
-  untouched tree reads nothing.
+- **Detection** (`folders.rs`). Candidate pairs are seeded from the file groups
+  the scan proved, never from a walk for folders. A candidate folder is read at
+  its top level first, and rejected there if its top level differs. Only a pair
+  whose top levels agree is listed whole, unfiltered, with `std::fs`, never
+  following a link. Pairs are settled from bytes compared in this scan (through
+  `split_identical`, so reads land in the `--report-json` counters), from a
+  whole-file digest the cache remembers, or from a file the scan already proved.
+  Groups come from union-find over those settlements, maximal only.
+- **Warm rescan.** A folder group settled partly from the cache is attested:
+  `--list` labels it `candidate`, the browser's word. A cold scan learns the
+  whole-file digest of every file its folder pass reads, in the existing `Full`
+  column, so no schema changes. A warm scan of an untouched tree reads nothing.
 - **Re-proof before a move.** `--auto` compares every attested folder with its
   kept copy, byte for byte, before it prints the plan. A folder that fails is
-  held: none of its folders move, its files are kept as copies, the cache
-  entries for it are dropped, and the message names the folder.
+  held: none of its folders move, its files stay as copies, the cache entries
+  for it are dropped, and the message names the folder.
 - **Folding and the survivor law.** A file group folds into a folder group when
   it has exactly one member per folder. `folders::stranded` is the one survivor
   check, run on the `--auto` plan and on the browser's selection guard.
 - **`--auto`** plans folders first, then files. A folder that would tear a kept
   folder, or strand a group, is dropped from the plan and listed as left alone.
   Each folder and its kept twin are listed again just before the move. A folder
-  moves as one directory rename. The cross-device fallback copies the whole tree
-  and removes the source only once the copy is complete. `--hard` removes the
-  tree.
+  moves as one directory rename. Only a volume-boundary failure falls back to
+  copying the tree, and the source goes only once the copy is complete. `--hard`
+  removes the tree.
 - **`--list`, `--report-json`, `--no-folders`.** Folder groups print first. The
   `folders` key appears only when non-empty. `--no-folders` has a FLAGS row and
   a menu row; the menu's minimum height went from 17 to 18 for it.
 - **Live path.** Untouched. No folder groups reach the browser yet.
 
-### Gate lines
+### Gate lines (final binary)
 
-- `cargo test`: `test result: ok. 304 passed; 0 failed` (was 277).
+- `cargo test`: `test result: ok. 311 passed; 0 failed` (was 277).
 - `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
-- `m10_folders.py`: `ALL CHECKS PASSED`, 36 checks. Scenario A: cold scan reads
-  bytes, the warm scan reads 0 and labels the group `candidate`, `--auto` moves
-  the twin as one directory, a second run finds nothing. Scenario B: the warm
-  scan's folder group is forged (same size, mtime put back); `--auto` refuses
+- `m10_folders.py`: `ALL CHECKS PASSED`, 36 checks. Scenario A: the cold scan
+  reads bytes; the warm scan reads 0 and labels the group `candidate`; `--auto`
+  moves the twin as one directory; a second run finds nothing. Scenario B: a
+  same-size, mtime-restored forgery in the warm scan's folder; `--auto` refuses
   that group, names it, and leaves both folders intact; the next scan reads
   again.
 - Freeze vs `main`, defaults: `84 cases compared, 0 differing`.
 - Freeze vs `main` under `--no-folders` on a corpus with folder candidates
   (`m10_no_folders_freeze.py`): `98 cases compared, 0 differing`. At defaults on
   that corpus 13 cases differ, as they must.
-- Conformance at defaults: `33 check(s), 0 failed`. `m3-warm` read 0.0 MB, down
-  from 8.1%.
+- Conformance at defaults: `33 check(s), 0 failed`. `m3-warm` read 0.0 MB.
 - Conformance under `--no-folders`: `33 check(s), 0 failed`.
+- Listing cost, scratch tree (`m10-listing-cost.txt`): `main` 0.03 s, the
+  previous commit 0.11 s, this round 0.05 s. Output identical to the previous
+  commit.
 
 ### Mutation check
 
 Disabling the re-proof makes the forged-file test fail, and restoring it makes
-the test pass again. So the test catches the case it exists for.
+the test pass again.
 
 ### Deviations, for the record
 
 - `run_selected` has no folder path yet. The phase-1 browser has no folder
-  marks, so nothing reaches it that could move a folder. The re-proof for
-  browser folder marks belongs with phase 2.
+  marks, so nothing it can run moves a folder. The re-proof for browser folder
+  marks belongs with phase 2.
 - Only folder groups get the `candidate` label in `--list`. File groups have
   never been labelled there, and a label on them would change every warm
   `--list` and break the freeze fence.
 - A folder group that would strand a file group is dropped from the plan rather
   than refusing the whole run. Keeping more is always safe.
 - A folder's age for `--auto oldest` and `newest` is the newest entry inside it.
-  Phase 1 needs the rule, so it is defined here (LOG).
+- The listing cost is bounded at the top level only. A pair whose top levels
+  agree, and which differs further down, still lists both trees whole (LOG).
+- The copy fallback has not run on a real second volume.
 
 ### Hazards, recorded
 
 - Early in the session I ran a broad `find` from `/` while looking for the
   conformance state directory. It listed directory names under `/Volumes` and
   `~/Library/CloudStorage` before it was killed. It opened no file and removed
-  nothing. Nothing like it was run in the warm-rescan round.
+  nothing. Nothing like it was run in the later rounds.
 - The end-to-end script uses the real `~/.Trash`. Every name it creates carries
   a random nonce, and its cleanup removes only new entries carrying that nonce.
   The Trash was back at its nine-entry baseline afterwards.
+- The listing cost was measured only on scratch trees I made. Nothing outside
+  the scratch root was scanned.

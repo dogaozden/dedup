@@ -3177,3 +3177,49 @@ The reasons, each stated once:
   a second time.
 * Conformance M3 warm: 0.0 MB, down from 1,048,576 bytes (8.1%).
 
+## 2026-10-10 — M10 phase 1, the fix round: the move policy and the listing cost
+
+### The move policy
+
+A failed rename falls back to copy-then-remove only when it failed with
+`CrossesDevices` (EXDEV). Any other rename failure, such as a permission, a busy
+file, or a name too long, is returned as it is, and the source is not touched.
+Copying after such a failure would repeat it, or leave two copies of something
+that was meant to move. A copy that fails part-way is cleaned up, and the
+source is removed only after the copy is complete. The move policy is tested
+through `move_to`, which takes its destination, so the tests never name the
+real Trash. The copy path itself has not run on a real second volume.
+
+### The listing cost, and the cost model
+
+Every file group whose members sit in two different folders proposes a candidate
+folder pair: the two nearest parents, and each ancestor pair while the names
+match. So two copies of one file in two directories always propose one pair,
+whatever else sits in those directories.
+
+Each candidate folder is now read in two steps, and only as far as a pair needs:
+
+* **The top level first.** The names and sizes of its files and links, and the
+  names of its subfolders that hold at least one file or link somewhere below.
+  An empty subfolder is only read as far as its first entry, and it is left
+  out, because empty directories are ignored. Two folders whose top levels
+  differ cannot be identical, so the pair is rejected here and neither folder
+  is listed below its top level.
+* **The whole tree, only for a pair whose top levels agree**, and each folder
+  once, however many pairs it is in.
+
+What this costs: one directory read per candidate folder, one `lstat` per
+top-level file, and a short look into each subfolder. What is still paid in full:
+two identical trees (they have to be compared), and a pair whose top levels agree
+but which differs further down. A streaming comparison that stopped at the first
+differing name would cut that second case. It is not built, because the top level
+settles the common case, and the maintainer's measurement on real trees decides
+whether it is needed.
+
+Measured on a scratch tree (`rust/evidence/m10-listing-cost.txt`): the folder
+pass added about 0.02 seconds over `main`, against about 0.07 seconds for the
+eager listing of the previous commit. The output was identical.
+
+Not measured: real home directories and `/Applications`. Those were left to the
+maintainer, and nothing outside the scratch trees was scanned for this entry.
+
