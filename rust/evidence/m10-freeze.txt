@@ -1,0 +1,34 @@
+=== the base this branch is measured against ===
+$ git merge-base main HEAD
+35997afefcd58d097017fc9a2ab06fe0cd45063e
+$ git log --oneline -1 main
+35997af docs: commission M10 — identical folders, as one group
+
+$ rm -rf /tmp/m9-freeze-base-checkout && git archive main | tar -x -C /tmp/m9-freeze-base-checkout
+$ (cd /tmp/m9-freeze-base-checkout/rust && cargo build --release)
+    Finished `release` profile [optimized] target(s) in 1m 39s
+
+$ cargo build --release   (the branch)
+    Finished `release` profile [optimized] target(s) in 55.60s
+
+$ shasum -a 256 (both binaries, for the record)
+2b487d7844fdc3fe1721c7b1049b7530f79d5c97ba8005a0e2b2faeffe93598d  /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs
+0bc6fe001254e3ac4dedf5a9b4b5583293fae67cde35020b4fc30645d9f93230  rust/target/release/dedup-rs
+
+$ m8_freeze.py capture /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs /tmp/m9-freeze-cap-base
+captured 84 cases from /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs
+  -> /tmp/m9-freeze-cap-base/capture.json
+
+$ m8_freeze.py capture rust/target/release/dedup-rs /tmp/m9-freeze-cap-ours
+captured 84 cases from /Users/dogaozden/AI_Projects/dedup-m10/rust/target/release/dedup-rs
+  -> /tmp/m9-freeze-cap-ours/capture.json
+
+$ m8_freeze.py compare /tmp/m9-freeze-cap-base /tmp/m9-freeze-cap-ours
+
+84 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+
+$ ls /Volumes   (nothing here should have touched it)
+\]
+My New Passport
+exit=0

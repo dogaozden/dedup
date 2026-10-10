@@ -1,0 +1,61 @@
+== build the scratch tree /private/tmp/claude-501/m10-scratch/e2e-b00eb25f
+  pass  nothing named Holiday b00eb25f copy in the Trash yet
+  pass  nothing named near-big-b00eb25f.jpg in the Trash yet
+  pass  nothing named third-b00eb25f.jpg in the Trash yet
+== --list
+
+  1 folder group(s) and 2 file group(s)
+
+    keep Holiday b00eb25f/   (3 files, 10.0 MiB each copy)
+         Holiday b00eb25f copy/
+
+    keep Holiday b00eb25f/big-b00eb25f.jpg
+         Loose b00eb25f/third-b00eb25f.jpg
+         Near b00eb25f/near-big-b00eb25f.jpg
+         Holiday b00eb25f copy/big-b00eb25f.jpg
+
+    keep Near b00eb25f/notes-b00eb25f.txt
+         Holiday b00eb25f/notes-b00eb25f.txt
+         Holiday b00eb25f copy/notes-b00eb25f.txt
+
+
+  pass  --list exits 0 (exit 0)
+  pass  --list shows the folder group, its twin and the kept folder
+  pass  --list does not offer the near-copy as a folder
+  pass  report-json has folders = [[kept, twin]] (got [['Holiday b00eb25f', 'Holiday b00eb25f copy']])
+== --auto shortest -y
+
+  Keeping the shortest copy in each of 1 folder group(s) and 3 file group(s).
+  Move to Trash: 1 folder(s) (3 files) and 3 file(s) · 31505020 bytes reclaimed
+
+      Holiday b00eb25f copy/
+      Loose b00eb25f/third-b00eb25f.jpg
+      Near b00eb25f/near-big-b00eb25f.jpg
+      Near b00eb25f/notes-b00eb25f.txt
+
+
+  1 folder(s) (3 files) and 3 files moved to Trash · 31505020 bytes reclaimed
+
+
+  pass  --auto exits 0 (exit 0)
+== checks
+  pass  the twin folder left the tree
+  pass  the twin is in the Trash as one directory: /Users/dogaozden/.Trash/Holiday b00eb25f copy
+  pass  every file of the moved folder is byte-identical to before, its .DS_Store included
+  pass  the kept twin is intact, byte for byte
+  pass  the near-copy folder is still there
+  pass  the near-copy's differing small file is untouched
+  pass  the near-copy's identical files left as ordinary file duplicates of the kept folder
+  pass  that big duplicate is in the Trash by name
+  pass  the loose third copy left the tree
+  pass  the loose third copy is in the Trash by name
+== the second run
+
+  Nothing to remove.
+
+
+  pass  second --auto exits 0 (exit 0)
+  pass  the second run finds nothing to remove
+  pass  the second --list finds no duplicates
+
+ALL CHECKS PASSED
