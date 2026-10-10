@@ -4692,74 +4692,86 @@ recorded rather than quietly fixed because it is exactly the stale-mutant
 failure the rule exists for, and because the scripts' own `finally` blocks
 cannot protect against SIGTERM.
 
-## M10 — identical folders, phase 1 — CLAIMED, one gate open
+## M10 — identical folders, phase 1 — CLAIMED
 
 Branch `m10-folders`, based on `main@35997af`. Not pushed, not merged. Phase 2
-(the browser) is not started. The code is `3c24931`; this claim's evidence is
-in `rust/evidence/m10-*.txt`.
+(the browser) is not started. Code: `3c24931`, then the warm-rescan round below.
+Evidence: `rust/evidence/m10-*.txt`.
 
 ### What was built
 
 - **Detection** (`folders.rs`). Candidate folder pairs are seeded from the file
-  groups the scan already proved, never from a walk for folders. Each pair is
-  listed unfiltered with `std::fs`, never following links, and byte-compared
-  through the scan's own `split_identical`, so reads land in the `--report-json`
-  counters. Groups are built by union-find over proven comparisons, so every
-  member is identical to every other. Maximal groups only.
+  groups the scan proved, never from a walk for folders. Each pair is listed
+  unfiltered with `std::fs`, never following a link. Pairs are settled from
+  bytes the scan compares (through `split_identical`, so reads land in the
+  `--report-json` counters), from a whole-file digest the cache remembers, or
+  from a file the scan already proved. Groups come from union-find over those
+  settlements, maximal only.
+- **Warm rescan (the maintainer's option b).** A folder group settled partly
+  from the cache is attested: `--list` labels it `candidate`, the browser's word
+  for it. A cold scan learns the whole-file digest of every file its folder pass
+  reads, in the existing `Full` column, so no schema changes. A warm scan of an
+  untouched tree reads nothing.
+- **Re-proof before a move.** `--auto` compares every attested folder with its
+  kept copy, byte for byte, before it prints the plan. A folder that fails is
+  held: none of its folders move, its files are kept as copies, the cache
+  entries for it are dropped, and the message names the folder.
 - **Folding and the survivor law.** A file group folds into a folder group when
   it has exactly one member per folder. `folders::stranded` is the one survivor
-  check; `--auto` runs it on its plan and the browser's `run_selected` guard runs
-  it on its selection.
+  check, run on the `--auto` plan and on the browser's selection guard.
 - **`--auto`** plans folders first, then files. A folder that would tear a kept
   folder, or strand a group, is dropped from the plan and listed as left alone.
   Each folder and its kept twin are listed again just before the move. A folder
-  moves as one directory rename; the cross-device fallback copies the whole tree
-  and removes the source only after the copy is complete.
+  moves as one directory rename. The cross-device fallback copies the whole tree
+  and removes the source only once the copy is complete. `--hard` removes the
+  tree.
 - **`--list`, `--report-json`, `--no-folders`.** Folder groups print first. The
-  `folders` key is present only when non-empty. `--no-folders` has a FLAGS row
-  and a menu row; the menu's minimum height went from 17 to 18 for it.
+  `folders` key appears only when non-empty. `--no-folders` has a FLAGS row and
+  a menu row; the menu's minimum height went from 17 to 18 for it.
 - **Live path.** Untouched. No folder groups reach the browser yet.
 
 ### Gate lines
 
-- `cargo test`: `test result: ok. 300 passed; 0 failed` (was 277).
+- `cargo test`: `test result: ok. 304 passed; 0 failed` (was 277).
 - `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
-- `m10_folders.py`: `ALL CHECKS PASSED`. The folder went to the Trash as one
-  directory, its twin is byte-identical, the near-copy's differing file is
-  untouched, and a second run says `Nothing to remove.`
-- Freeze vs `main`, defaults: `84 cases compared, 0 differing`. None of the
-  freeze corpora has a folder candidate: every duplicate pair sits in one
-  directory, so this run proves the fence on trees without candidates, which is
-  the premise.
-- Freeze vs `main` under `--no-folders`, with a new candidate corpus
-  (`m10_no_folders_freeze.py`): `98 cases compared, 0 differing`.
+- `m10_folders.py`: `ALL CHECKS PASSED`, 36 checks. Scenario A: cold scan reads
+  bytes, the warm scan reads 0 and labels the group `candidate`, `--auto` moves
+  the twin as one directory, a second run finds nothing. Scenario B: the warm
+  scan's folder group is forged (same size, mtime put back); `--auto` refuses
+  that group, names it, and leaves both folders intact; the next scan reads
+  again.
+- Freeze vs `main`, defaults: `84 cases compared, 0 differing`.
+- Freeze vs `main` under `--no-folders` on a corpus with folder candidates
+  (`m10_no_folders_freeze.py`): `98 cases compared, 0 differing`. At defaults on
+  that corpus 13 cases differ, as they must.
+- Conformance at defaults: `33 check(s), 0 failed`. `m3-warm` read 0.0 MB, down
+  from 8.1%.
 - Conformance under `--no-folders`: `33 check(s), 0 failed`.
-- Conformance at defaults: **`33 check(s), 1 failed`**. `m3-warm`: the warm scan
-  read 1,048,576 bytes, 8.1% of the cold scan's 12,969,560 against a 5% ceiling.
-  The M3 tree holds an identical folder pair (`archive` and `docs/old`), and the
-  folder pass re-reads it on every scan. Every other check passes.
 
-### Open: the warm rescan
+### Mutation check
 
-§D says a folder group is reported only when every pair was compared in the same
-scan, and the README and the spec both promise a warm rescan reads under 5% of
-the bytes. Those cannot both hold, and the M3 result is the proof. I have not
-changed either rule. The choice is the maintainer's: (a) keep the reads and
-amend the README and the M3 ceiling for trees with folder candidates, or (b)
-report cache-attested folder groups the way attested file groups are reported
-today, and re-prove them by byte comparison before any move.
+Disabling the re-proof makes the forged-file test fail, and restoring it makes
+the test pass again. So the test catches the case it exists for.
 
-### Hazard recorded
+### Deviations, for the record
 
-Early in the session I started a broad `find` from `/` while looking for the
-conformance state directory. It listed directory names under `/Volumes` and
-`~/Library/CloudStorage` before I killed it. It opened no file, changed nothing,
-and removed nothing, but it was outside the rules and is recorded here.
+- `run_selected` has no folder path yet. The phase-1 browser has no folder
+  marks, so nothing reaches it that could move a folder. The re-proof for
+  browser folder marks belongs with phase 2.
+- Only folder groups get the `candidate` label in `--list`. File groups have
+  never been labelled there, and a label on them would change every warm
+  `--list` and break the freeze fence.
+- A folder group that would strand a file group is dropped from the plan rather
+  than refusing the whole run. Keeping more is always safe.
+- A folder's age for `--auto oldest` and `newest` is the newest entry inside it.
+  Phase 1 needs the rule, so it is defined here (LOG).
 
-### Standards
+### Hazards, recorded
 
-The Trash was checked by name only. Every name the end-to-end run creates
-carries a random nonce, and its cleanup removes only new `~/.Trash` entries that
-carry that nonce. The real Trash was back at its nine-entry baseline afterwards.
-Earlier manual runs had left four entries behind, which I checked by timestamp
-and content and removed by name.
+- Early in the session I ran a broad `find` from `/` while looking for the
+  conformance state directory. It listed directory names under `/Volumes` and
+  `~/Library/CloudStorage` before it was killed. It opened no file and removed
+  nothing. Nothing like it was run in the warm-rescan round.
+- The end-to-end script uses the real `~/.Trash`. Every name it creates carries
+  a random nonce, and its cleanup removes only new entries carrying that nonce.
+  The Trash was back at its nine-entry baseline afterwards.

@@ -3139,3 +3139,41 @@ with its reason.
 * `--no-folders` on the freeze corpora and on a corpus that has candidates:
   98 of 98 identical, counters included.
 * Defaults on the candidate corpus differ, as they must. That is the feature.
+
+## 2026-10-10 — M10 phase 1, the warm rescan (maintainer's option b)
+
+The open conflict in the entry above is settled. A folder pair is settled from
+the cache when both files have a remembered whole-file digest that matches.
+The reasons, each stated once:
+
+* **Why the existing `Full` column and no new field.** `Full` is learned only
+  from bytes that were compared to the end, and it is keyed by inode with size
+  and mtime checked, so the racily-clean rule applies unchanged. A new column
+  would only restate what `Full` already says.
+* **Cold scans learn.** The folder pass runs its comparisons with `learn` set
+  whenever there is a cache, so every file it reads leaves its digest behind.
+  The warm scan then has what it needs without reading anything.
+* **A remembered difference is believed.** The cache may only narrow, and a
+  difference it reports can cost a missed group, never a wrong removal.
+* **`--auto` re-proves attested groups and nothing else.** That matches
+  `verify_attested`: a group matched from memory is read again before anything
+  moves, and a group proved this scan is not read a second time. The re-proof
+  reads every file pair in full, ignoring the cache, and it runs before the plan
+  is printed.
+* **A failing re-proof holds the group, whole.** Its folders stay, its files are
+  kept as copies, and its cache entries are dropped, so the next scan reads
+  again. Its files also still shelter other members of their file groups, so
+  the ordinary file rule can still remove copies elsewhere.
+* **The cost is honest.** A warm `--auto` reads every byte of each attested
+  folder it is about to move, which a warm `--list` does not. That is the price
+  of the cache never being the reason anything is removed.
+
+### Measured
+
+* Warm `--list` on the scratch tree: `bytes_read` 0, folder group labelled
+  `candidate`. Cold: 46,097,180 bytes. That is the file groups' reads, about
+  44 MB, plus the small files the folder pass compares for the first time, about
+  2 MB. The big files in those groups were settled by their group and not read
+  a second time.
+* Conformance M3 warm: 0.0 MB, down from 1,048,576 bytes (8.1%).
+
