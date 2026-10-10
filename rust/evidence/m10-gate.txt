@@ -37,7 +37,7 @@ M2 gate
 
 M3 gate
   m3-cold                  pass (13.0 MB read)
-  m3-warm                  warm scan of an unchanged tree read 1048576 bytes, 8.1% of the cold scan's 12969560 — nothing was reused
+  m3-warm                  pass (0.0 MB read)
   m3-poison-refusal        pass
   m3-same-second           pass
 
@@ -46,11 +46,9 @@ M4 gate
   m4-links                 pass
   m4-trashes               pass
 
-33 check(s), 1 failed
-
-GATE FAILURE
-  m3-warm: warm scan of an unchanged tree read 1048576 bytes, 8.1% of the cold scan's 12969560 — nothing was reused
-   exit 1
+33 check(s), 0 failed
+gate all: green
+   exit 0
 
 $ ls /Volumes   (after)
 \]
@@ -62,5 +60,5 @@ $ diff <(ls /Volumes before) <(ls /Volumes after)
 $ hdiutil info | grep -c dedupconf   (0 = the check detached its image)
 0
 
-FAILED: gate exit 1, mount table changed=0, images left=0
-exit=1
+gate green, mount table unchanged, no image left attached
+exit=0

@@ -75,12 +75,11 @@ DIFFERS: folders/warm-cold
     report.opens: 12 != 16
     report.seeks: 132 != 136
 DIFFERS: folders/warm-warm
-    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
-    report.bytes_read: 14096 != 63034150
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)  candidate\n         Photos copy/\n\n    keep Near/big.jpg\n     … (325 chars)
+    report.bytes_read: 14096 != 34096
     report.folders: None != [['Photos', 'Photos copy']]
-    report.opens: 5 != 21
-    report.seeks: 5 != 153
+    report.opens: 5 != 9
+    report.seeks: 5 != 9
 
 98 cases compared, 13 differing
 FENCE BROKEN
-exit=0

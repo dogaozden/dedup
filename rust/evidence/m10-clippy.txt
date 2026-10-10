@@ -1,2 +1,3 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
+    Checking dedup-rs v0.1.0 (/Users/dogaozden/AI_Projects/dedup-m10/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.82s
 exit=0
