@@ -19,6 +19,7 @@ use crate::consts::{DEEP_HEAD, HANDLE_BUDGET, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_
 use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
+use crate::folders::{self, FolderGroup};
 use crate::ordered::Ordered;
 use crate::pulse::{self, Pulse};
 use crate::stages::{has_tail, hash_stage, release, small_file_stage, Probe, Reader};
@@ -44,6 +45,12 @@ pub struct Scan {
     /// report, where a size bucket is an honest answer; and `proven`, for
     /// deletion, where it is not.
     groups: Vec<DupGroup>,
+    /// Folder groups, from `attach_folders`. Empty until somebody asks for
+    /// them, and never on the live path.
+    folders: Vec<FolderGroup>,
+    /// For each file group, the folder group it folds into, if any. Parallel
+    /// to `groups`, or empty when there are no folder groups.
+    folded: Vec<Option<usize>>,
     proven: bool,
     pub files_seen: u64,
     pub bytes_seen: u64,
@@ -52,18 +59,27 @@ pub struct Scan {
 
 /// A borrow of groups that trace to bytes compared this scan — or to a cache
 /// attestation that `verify_attested` re-proves from bytes before anything is
-/// removed.
+/// removed. Folder groups travel with them: a folder is removable only through
+/// this token too (M10-FOLDERS.md §D).
 ///
 /// `Scan::proven` is the only way to obtain one and it returns `None` for a
 /// scan that merely grouped by size, so the deletion path cannot be reached
 /// from one. The guard is the type: `run_auto` will not accept anything else,
 /// and no later caller can reintroduce the hole by forgetting a comparison on
 /// a mode string.
-pub struct ProvenGroups<'a>(&'a [DupGroup]);
+#[derive(Clone, Copy)]
+pub struct ProvenGroups<'a> {
+    groups: &'a [DupGroup],
+    folders: &'a [FolderGroup],
+}
 
 impl<'a> ProvenGroups<'a> {
     pub fn groups(self) -> &'a [DupGroup] {
-        self.0
+        self.groups
+    }
+
+    pub fn folders(self) -> &'a [FolderGroup] {
+        self.folders
     }
 }
 
@@ -76,7 +92,29 @@ impl Scan {
     /// The groups deletion may act on, or `None` when nothing has read a byte
     /// of any file's contents.
     pub fn proven(&self) -> Option<ProvenGroups<'_>> {
-        self.proven.then_some(ProvenGroups(&self.groups))
+        self.proven.then_some(ProvenGroups {
+            groups: &self.groups,
+            folders: &self.folders,
+        })
+    }
+
+    /// The folder groups found, in the order they are reported.
+    pub fn folder_groups(&self) -> &[FolderGroup] {
+        &self.folders
+    }
+
+    /// Whether a file group is folded into a folder group, and so hidden from
+    /// every listing that shows groups one by one.
+    pub fn is_folded(&self, group: usize) -> bool {
+        self.folded.get(group).copied().flatten().is_some()
+    }
+
+    /// Adopt the folder groups found for this scan and fold the file groups
+    /// they cover. Called once, by `main`, after the file groups are proven.
+    pub fn attach_folders(&mut self, found: Vec<FolderGroup>) {
+        let active: Vec<usize> = (0..found.len()).collect();
+        self.folded = folders::fold(&self.records, &self.groups, &found, &active);
+        self.folders = found;
     }
 }
 
@@ -135,6 +173,8 @@ pub fn size_stage(root: &Path, filters: Filters, pulse: &Pulse, cloud: &Cloud) -
         profile: Profile::Flash,
         hint: None,
         groups,
+        folders: Vec::new(),
+        folded: Vec::new(),
         // Files that merely share a length. Nothing here has read a byte.
         proven: false,
         files_seen,
@@ -199,6 +239,8 @@ pub fn find_duplicates(
         profile: Profile::Flash,
         hint: None,
         groups: Vec::new(),
+        folders: Vec::new(),
+        folded: Vec::new(),
         proven: true,
         files_seen,
         bytes_seen,
@@ -694,6 +736,9 @@ pub fn serve(
         profile: context.profile,
         hint: None,
         groups,
+        // The live path finds no folder groups yet (M10-FOLDERS.md phase 2).
+        folders: Vec::new(),
+        folded: Vec::new(),
         // Honest: every group here is either compared this scan or flagged
         // `attested`, and `run_selected` sends every attested group through a
         // full byte comparison before removing anything from it.

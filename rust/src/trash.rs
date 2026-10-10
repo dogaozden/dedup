@@ -8,7 +8,7 @@
 //! §3.2: a group always keeps one copy, enforced here rather than by whatever
 //! is asking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,6 +16,7 @@ use std::process::Command;
 use crate::cache::ScanCache;
 use crate::compare::{verify_attested, Compare};
 use crate::device::mount_point;
+use crate::folders::{self, Lost};
 use crate::pipeline::{DupGroup, ProvenGroups, Scan};
 use crate::tui::model::Mark;
 use crate::walk::{name_order, FileRec};
@@ -25,6 +26,9 @@ pub struct Removal {
     pub rule: Rule,
     pub hard: bool,
     pub assume_yes: bool,
+    /// The `--cloud` setting of the scan, so a folder is listed again the way
+    /// it was proven.
+    pub cloud: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +91,7 @@ impl Rule {
         .expect("a group always has members")
     }
 
-    fn keeper(self, records: &[FileRec], members: &[usize]) -> usize {
+    pub(crate) fn keeper(self, records: &[FileRec], members: &[usize]) -> usize {
         let pairs: Vec<(&str, f64)> = members
             .iter()
             .map(|&index| (records[index].path(), oracle_mtime(&records[index])))
@@ -118,24 +122,16 @@ pub fn oracle_mtime(record: &FileRec) -> f64 {
     seconds as f64 + 1e-9 * nanoseconds as f64
 }
 
-/// Pick one keeper per group and return the records to remove.
+/// The file records `--auto` removes when no folder group is in play.
 ///
-/// The survivor guard is this function: the keeper is never added to the list,
+/// The survivor guard is the planner: the keeper is never added to the list,
 /// so no caller can arrange for a group to lose every copy. A record the scan
 /// cannot free — because a name outside the tree still pins the inode — is
 /// never a victim however duplicate it is, since removing what we can see
 /// would free nothing.
+#[cfg(test)]
 fn plan_auto(records: &[FileRec], groups: &[DupGroup], rule: Rule) -> Vec<usize> {
-    let mut doomed = Vec::new();
-    for group in groups {
-        let keeper = rule.keeper(records, &group.members);
-        for (position, &index) in group.members.iter().enumerate() {
-            if position != keeper && records[index].deletable() {
-                doomed.push(index);
-            }
-        }
-    }
-    doomed
+    folders::plan(records, groups, &[], rule).files
 }
 
 /// The mount point of the volume holding `path`.
@@ -197,19 +193,32 @@ fn unique_destination(directory: &Path, name: &str) -> PathBuf {
     directory.join(format!("{stem} {}{extension}", crate::cache::now_seconds()))
 }
 
-/// Move one file to the Trash of its own volume.
+/// Move one file or one whole folder to the Trash of its own volume.
+///
+/// A folder is one directory rename (M10-FOLDERS.md §D), not a move per file.
+/// The cross-device fallback copies the whole tree before it removes anything,
+/// so the source is only ever gone once the copy is complete, and a copy that
+/// fails part-way is cleaned up rather than left in the Trash.
 fn send_to_trash(path: &Path) -> Result<(), String> {
     let directory = trash_dir_for(path);
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let name = path
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let is_folder = path.symlink_metadata().is_ok_and(|meta| meta.is_dir());
     // Rename first: within a volume it is one atomic operation. A cross-device
     // rename cannot happen here, because the Trash was chosen on the file's own
     // volume, but fall back to copy-then-remove rather than lose the file.
     let destination = unique_destination(&directory, &name);
     match std::fs::rename(path, &destination) {
         Ok(()) => Ok(()),
+        Err(_) if is_folder => {
+            if let Err(error) = copy_tree(path, &destination) {
+                let _ = std::fs::remove_dir_all(&destination);
+                return Err(error.to_string());
+            }
+            std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+        }
         Err(_) => {
             std::fs::copy(path, &destination).map_err(|error| error.to_string())?;
             std::fs::remove_file(path).map_err(|error| error.to_string())
@@ -217,24 +226,50 @@ fn send_to_trash(path: &Path) -> Result<(), String> {
     }
 }
 
-fn delete_permanently(path: &Path) -> Result<(), String> {
-    std::fs::remove_file(path).map_err(|error| error.to_string())
+/// Copy a folder tree, links as links. Nothing is followed, so a link cannot
+/// pull in a file from outside the folder.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+        } else if kind.is_dir() {
+            copy_tree(&source, &target)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
 }
 
-/// Remove every name pointing at this record's inode.
-///
-/// Storage is only released once the last hardlink is gone, so a partial
-/// success here would free nothing while looking like it worked.
-pub fn remove_record(root: &Path, record: &FileRec, hard: bool) -> Result<(), String> {
+/// Delete a file, or a folder and everything in it. `remove_dir_all` does not
+/// follow links, so only the folder's own tree goes.
+fn delete_permanently(path: &Path) -> Result<(), String> {
+    let is_folder = path.symlink_metadata().is_ok_and(|meta| meta.is_dir());
+    if is_folder {
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        std::fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
+/// One path, removed the way the run asked: to the Trash, or for good.
+fn remove_path(path: &Path, hard: bool) -> Result<(), String> {
+    if hard {
+        delete_permanently(path)
+    } else {
+        send_to_trash(path)
+    }
+}
+
+/// Remove the named paths under `root`, every one or none of them reported.
+fn remove_names(root: &Path, names: &[&str], hard: bool) -> Result<(), String> {
     let mut errors = Vec::new();
-    for name in &record.names {
-        let path = root.join(name);
-        let outcome = if hard {
-            delete_permanently(&path)
-        } else {
-            send_to_trash(&path)
-        };
-        if let Err(error) = outcome {
+    for name in names {
+        if let Err(error) = remove_path(&root.join(name), hard) {
             errors.push(format!("{name}: {error}"));
         }
     }
@@ -243,6 +278,15 @@ pub fn remove_record(root: &Path, record: &FileRec, hard: bool) -> Result<(), St
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// Remove every name pointing at this record's inode.
+///
+/// Storage is only released once the last hardlink is gone, so a partial
+/// success here would free nothing while looking like it worked.
+pub fn remove_record(root: &Path, record: &FileRec, hard: bool) -> Result<(), String> {
+    let names: Vec<&str> = record.names.iter().map(String::as_str).collect();
+    remove_names(root, &names, hard)
 }
 
 /// Non-interactive cleanup: keep one copy per group by `rule`, remove the rest.
@@ -272,32 +316,111 @@ pub fn run_auto(
     let (groups, refused) = verify_attested(context, &scan.records, candidates, cache);
     report_refusals(&scan.records, &refused);
 
-    let doomed = plan_auto(&scan.records, &groups, removal.rule);
-    if doomed.is_empty() {
+    let folders = proven.folders();
+    let plan = folders::plan(&scan.records, &groups, folders, removal.rule);
+    for &number in &plan.refused {
+        let group = &folders[number];
+        eprintln!(
+            "\n  Left alone: the folder group at {}/ (+{} more). Moving its copies \
+             would leave a file with no copy, or tear a folder another group keeps.",
+            group.folders[0].path,
+            group.folders.len() - 1
+        );
+    }
+
+    // The plan is correct by construction; this says so again against the disk
+    // before anything moves, and refuses the whole run if it is ever wrong.
+    let moved: HashMap<&str, usize> = plan
+        .folders
+        .iter()
+        .map(|&(number, at)| (folders[number].folders[at].path.as_str(), number))
+        .collect();
+    let doomed: HashSet<usize> = plan.files.iter().copied().collect();
+    let on_disk = |name: &str| context.root.join(name).symlink_metadata().is_ok();
+    if let Some(lost) =
+        folders::stranded(&scan.records, &groups, folders, &doomed, &moved, &on_disk)
+    {
+        let which = match lost {
+            Lost::File(number) => format!("group {}", number + 1),
+            Lost::Folder(number) => format!("folder group {}", number + 1),
+        };
+        eprintln!(
+            "  Refusing: this plan would leave {which} with no copy at all. Nothing was removed."
+        );
+        return 1;
+    }
+
+    if plan.folders.is_empty() && plan.files.is_empty() {
         println!("\n  Nothing to remove.\n");
         return 0;
     }
 
-    let total: u64 = doomed.iter().map(|&index| scan.records[index].size).sum();
+    let folder_files: usize = plan
+        .folders
+        .iter()
+        .map(|&(number, at)| folders[number].folders[at].listing.files())
+        .sum();
+    let folder_freed: u64 = plan
+        .folders
+        .iter()
+        .map(|&(number, at)| folders[number].folders[at].listing.freed())
+        .sum();
+    let total: u64 = plan
+        .files
+        .iter()
+        .map(|&index| scan.records[index].size)
+        .sum::<u64>()
+        + folder_freed;
     let verb = if removal.hard {
         "Delete permanently"
     } else {
         "Move to Trash"
     };
-    println!(
-        "\n  Keeping the {} copy in each of {} groups.",
-        removal.rule,
-        groups.len()
-    );
-    println!(
-        "  {verb}: {} files · {total} bytes reclaimed\n",
-        doomed.len()
-    );
-    for &index in doomed.iter().take(15) {
-        println!("      {}", scan.records[index].path());
+    if folders.is_empty() {
+        println!(
+            "\n  Keeping the {} copy in each of {} groups.",
+            removal.rule,
+            groups.len()
+        );
+        println!(
+            "  {verb}: {} files · {total} bytes reclaimed\n",
+            plan.files.len()
+        );
+    } else {
+        println!(
+            "\n  Keeping the {} copy in each of {} folder group(s) and {} file group(s).",
+            removal.rule,
+            folders.len(),
+            groups.len()
+        );
+        if plan.folders.is_empty() {
+            println!(
+                "  {verb}: {} files · {total} bytes reclaimed\n",
+                plan.files.len()
+            );
+        } else {
+            println!(
+                "  {verb}: {} folder(s) ({folder_files} files) and {} file(s) · {total} bytes reclaimed\n",
+                plan.folders.len(),
+                plan.files.len()
+            );
+        }
     }
-    if doomed.len() > 15 {
-        println!("      … and {} more", doomed.len() - 15);
+    let lines: Vec<String> = plan
+        .folders
+        .iter()
+        .map(|&(number, at)| format!("{}/", folders[number].folders[at].path))
+        .chain(
+            plan.files
+                .iter()
+                .map(|&index| scan.records[index].path().to_string()),
+        )
+        .collect();
+    for line in lines.iter().take(15) {
+        println!("      {line}");
+    }
+    if lines.len() > 15 {
+        println!("      … and {} more", lines.len() - 15);
     }
     println!();
 
@@ -316,13 +439,45 @@ pub fn run_auto(
         }
     }
 
+    // Folders first: a file inside a folder that is going must not be touched
+    // separately, and a folder that refuses to move leaves its files where they
+    // are. Each folder and its kept twin are listed again immediately before the
+    // move, and a folder that has changed since the proof stays where it is.
     let (mut done, mut freed) = (0_usize, 0_u64);
+    let (mut folders_done, mut folder_files_done) = (0_usize, 0_usize);
     let mut failures = Vec::new();
-    for &index in &doomed {
-        let record = &scan.records[index];
-        match remove_record(context.root, record, removal.hard) {
+    for &(number, at) in &plan.folders {
+        let group = &folders[number];
+        let folder = &group.folders[at];
+        let twin = &group.folders[folders::keep_folder(removal.rule, &group.folders)];
+        let proof_holds = folders::unchanged(context.root, folder, removal.cloud)
+            .and_then(|()| folders::unchanged(context.root, twin, removal.cloud));
+        if let Err(why) = proof_holds {
+            failures.push(format!("{}/: {why}", folder.path));
+            continue;
+        }
+        match remove_path(&context.root.join(&folder.path), removal.hard) {
             Ok(()) => {
-                done += record.names.len();
+                folders_done += 1;
+                folder_files_done += folder.listing.files();
+                freed += folder.listing.freed();
+            }
+            Err(error) => failures.push(format!("{}/: {error}", folder.path)),
+        }
+    }
+    for &index in &plan.files {
+        let record = &scan.records[index];
+        // A name inside a folder the plan moves has gone with the folder, or is
+        // being kept with it, and is not removed separately.
+        let names: Vec<&str> = record
+            .names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| folders::within(name, &moved).is_none())
+            .collect();
+        match remove_names(context.root, &names, removal.hard) {
+            Ok(()) => {
+                done += names.len();
                 freed += record.size;
             }
             Err(error) => failures.push(error),
@@ -334,7 +489,13 @@ pub fn run_auto(
     } else {
         "moved to Trash"
     };
-    println!("\n  {done} files {where_to} · {freed} bytes reclaimed");
+    if folders.is_empty() {
+        println!("\n  {done} files {where_to} · {freed} bytes reclaimed");
+    } else {
+        println!(
+            "\n  {folders_done} folder(s) ({folder_files_done} files) and {done} files {where_to} · {freed} bytes reclaimed"
+        );
+    }
     if !failures.is_empty() {
         eprintln!("  {} could not be removed:", failures.len());
         for line in failures.iter().take(10) {
@@ -356,14 +517,6 @@ pub struct Removed {
     /// Groups whose copies no longer matched, left whole and untouched.
     pub refused: Vec<DupGroup>,
     pub failures: Vec<String>,
-}
-
-/// Whether any name this record wears is still on disk.
-fn still_there(root: &Path, record: &FileRec) -> bool {
-    record
-        .names
-        .iter()
-        .any(|name| root.join(name).symlink_metadata().is_ok())
 }
 
 /// Remove exactly the records the browser marked.
@@ -405,21 +558,32 @@ pub fn run_selected(
         }
         wanted.entry(group).or_default().push(record);
     }
-    for (&group, chosen) in wanted.iter_mut() {
+    for chosen in wanted.values_mut() {
         chosen.sort_unstable();
         chosen.dedup();
-        let survivors = groups[group]
-            .members
-            .iter()
-            .filter(|index| !chosen.contains(index))
-            .filter(|&&index| still_there(context.root, &scan.records[index]))
-            .count();
-        if survivors == 0 {
-            return Err(format!(
+    }
+    // The survivor law, checked over everything this selection touches. A
+    // browser selection names records only, so no folder is moved here.
+    let removed: HashSet<usize> = wanted.values().flatten().copied().collect();
+    let on_disk = |name: &str| context.root.join(name).symlink_metadata().is_ok();
+    if let Some(lost) = folders::stranded(
+        &scan.records,
+        groups,
+        proven.folders(),
+        &removed,
+        &HashMap::new(),
+        &on_disk,
+    ) {
+        return Err(match lost {
+            Lost::File(group) => format!(
                 "refusing the whole selection: it would leave group {} with no copy at all",
                 group + 1
-            ));
-        }
+            ),
+            Lost::Folder(group) => format!(
+                "refusing the whole selection: it would leave folder group {} with no copy at all",
+                group + 1
+            ),
+        });
     }
 
     let mut outcome = Removed::default();
