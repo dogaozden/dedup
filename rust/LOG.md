@@ -3075,3 +3075,67 @@ the happy path, and the tree has to be checked, not assumed.
   is only reachable on the non-interactive path today.
 * SIGHUP and SIGTERM still leave the terminal raw (M5), Ctrl+C at the menu is
   still ignored (M5.1). Neither touched, both pre-existing.
+
+## 2026-10-10 — M10 phase 1, identical folders
+
+Branch `m10-folders`. The decisions the spec asked to see written down, each
+with its reason.
+
+* **Folder age for `--auto oldest` and `newest`** is the newest entry inside
+  the folder (its largest modification time). A folder's own mtime moves
+  whenever an entry is added or removed, and `cp -R` does not keep it, so it
+  says when the folder was changed rather than when its content was written.
+  Ties fall to the shortest path, then lexicographic, as the file rules do.
+* **`--list` order**: folder groups first, by reclaimable bytes (every copy
+  after the first, times the bytes in one copy), then shortest path; file groups
+  after, in their existing order. A folder group is the bigger decision, so it
+  comes first. Phase 2 may interleave them in the browser.
+* **Folding is exact**: a file group folds into a folder group only when it has
+  one member in each folder and no folder has two. A group missing a copy from
+  one folder says something the folder group does not, so it stays visible.
+* **Folders that would break the law are dropped, not the whole run.** A folder
+  group whose move would tear a kept folder, or leave a group with no copy, is
+  left alone and listed. The planner repeats until nothing more is dropped. Each
+  pass only keeps more, so it always ends, and keeping more is always safe.
+* **Bytes freed** for a moved folder count only files with `nlink == 1`. A
+  hardlink with a name outside the folder keeps its data alive.
+* **Cloud placeholders**: a dataless file or folder disqualifies the folder
+  unless `--cloud` is on. It is not counted in `skipped_cloud`, because that
+  count is for files the walk saw and dropped; a disqualified folder is simply
+  not a group.
+* **Names**: any non-UTF-8 name disqualifies the folder rather than being
+  compared under a lossy spelling. `.DS_Store` is ignored only where it is a
+  regular file, at every depth.
+* **Cross-device fallback** copies a folder with `copy_tree`, keeping links as
+  links, and removes the source only after the copy finishes. A failed copy is
+  removed from the Trash. Hardlinks inside the copy become separate files: the
+  data survives, the link between them does not. This path runs only when the
+  Trash is on another volume.
+* **The survivor check** is one function, `folders::stranded`, for file and
+  folder groups alike. The browser's selection guard calls it too. It only
+  examines groups a removal touches, which is what the old guard did, so the
+  browser's behaviour for file groups is unchanged.
+* **Candidate limit and cost.** A group of k members seeds k(k-1)/2 pairs of
+  folders, so a 1000-copy group seeds about 500,000. Each candidate folder is
+  listed once: a readdir and an lstat per entry, and no byte is read to list it.
+  Only pairs whose listings match are compared, and a folder that is already in
+  one group is never compared again. Two copies of one file in two directories
+  already make a candidate pair, so a home directory with many such copies pays
+  for listing those folders even when nothing is identical. Not measured on a
+  real home directory; measured here only on the scratch trees.
+* **The warm rescan is the open conflict.** §D reports a folder group only when
+  every pair was compared in this scan, so a warm run re-reads candidate folders.
+  On the M3 conformance tree that is 1 MB, 8.1% of the cold read, against the 5%
+  ceiling. See MILESTONES.md, M10 claim, for the two ways out. Until the
+  maintainer decides, the README's rescan floor does not hold for trees that
+  have folder candidates.
+* **The live path** does not call the folder pass. The finished-scan browser
+  shows folded file groups as it always has; phase 2 hides them.
+
+### Fence, as measured
+
+* Defaults on the freeze corpora: 84 of 84 identical. None of them has a folder
+  candidate; every duplicate pair sits in one directory.
+* `--no-folders` on the freeze corpora and on a corpus that has candidates:
+  98 of 98 identical, counters included.
+* Defaults on the candidate corpus differ, as they must. That is the feature.

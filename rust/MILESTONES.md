@@ -4691,3 +4691,75 @@ every other measurement here was taken with before anything else ran. It is
 recorded rather than quietly fixed because it is exactly the stale-mutant
 failure the rule exists for, and because the scripts' own `finally` blocks
 cannot protect against SIGTERM.
+
+## M10 — identical folders, phase 1 — CLAIMED, one gate open
+
+Branch `m10-folders`, based on `main@35997af`. Not pushed, not merged. Phase 2
+(the browser) is not started. The code is `3c24931`; this claim's evidence is
+in `rust/evidence/m10-*.txt`.
+
+### What was built
+
+- **Detection** (`folders.rs`). Candidate folder pairs are seeded from the file
+  groups the scan already proved, never from a walk for folders. Each pair is
+  listed unfiltered with `std::fs`, never following links, and byte-compared
+  through the scan's own `split_identical`, so reads land in the `--report-json`
+  counters. Groups are built by union-find over proven comparisons, so every
+  member is identical to every other. Maximal groups only.
+- **Folding and the survivor law.** A file group folds into a folder group when
+  it has exactly one member per folder. `folders::stranded` is the one survivor
+  check; `--auto` runs it on its plan and the browser's `run_selected` guard runs
+  it on its selection.
+- **`--auto`** plans folders first, then files. A folder that would tear a kept
+  folder, or strand a group, is dropped from the plan and listed as left alone.
+  Each folder and its kept twin are listed again just before the move. A folder
+  moves as one directory rename; the cross-device fallback copies the whole tree
+  and removes the source only after the copy is complete.
+- **`--list`, `--report-json`, `--no-folders`.** Folder groups print first. The
+  `folders` key is present only when non-empty. `--no-folders` has a FLAGS row
+  and a menu row; the menu's minimum height went from 17 to 18 for it.
+- **Live path.** Untouched. No folder groups reach the browser yet.
+
+### Gate lines
+
+- `cargo test`: `test result: ok. 300 passed; 0 failed` (was 277).
+- `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
+- `m10_folders.py`: `ALL CHECKS PASSED`. The folder went to the Trash as one
+  directory, its twin is byte-identical, the near-copy's differing file is
+  untouched, and a second run says `Nothing to remove.`
+- Freeze vs `main`, defaults: `84 cases compared, 0 differing`. None of the
+  freeze corpora has a folder candidate: every duplicate pair sits in one
+  directory, so this run proves the fence on trees without candidates, which is
+  the premise.
+- Freeze vs `main` under `--no-folders`, with a new candidate corpus
+  (`m10_no_folders_freeze.py`): `98 cases compared, 0 differing`.
+- Conformance under `--no-folders`: `33 check(s), 0 failed`.
+- Conformance at defaults: **`33 check(s), 1 failed`**. `m3-warm`: the warm scan
+  read 1,048,576 bytes, 8.1% of the cold scan's 12,969,560 against a 5% ceiling.
+  The M3 tree holds an identical folder pair (`archive` and `docs/old`), and the
+  folder pass re-reads it on every scan. Every other check passes.
+
+### Open: the warm rescan
+
+§D says a folder group is reported only when every pair was compared in the same
+scan, and the README and the spec both promise a warm rescan reads under 5% of
+the bytes. Those cannot both hold, and the M3 result is the proof. I have not
+changed either rule. The choice is the maintainer's: (a) keep the reads and
+amend the README and the M3 ceiling for trees with folder candidates, or (b)
+report cache-attested folder groups the way attested file groups are reported
+today, and re-prove them by byte comparison before any move.
+
+### Hazard recorded
+
+Early in the session I started a broad `find` from `/` while looking for the
+conformance state directory. It listed directory names under `/Volumes` and
+`~/Library/CloudStorage` before I killed it. It opened no file, changed nothing,
+and removed nothing, but it was outside the rules and is recorded here.
+
+### Standards
+
+The Trash was checked by name only. Every name the end-to-end run creates
+carries a random nonce, and its cleanup removes only new `~/.Trash` entries that
+carry that nonce. The real Trash was back at its nine-entry baseline afterwards.
+Earlier manual runs had left four entries behind, which I checked by timestamp
+and content and removed by name.
