@@ -1,36 +1,36 @@
-== scenario A: /private/tmp/claude-501/m10-scratch/e2e-a-af387609 (cache /private/tmp/claude-501/m10-scratch/cache-a-af387609)
-  pass  nothing named Holiday af387609 copy in the Trash yet
-  pass  nothing named near-big-af387609.jpg in the Trash yet
-  pass  nothing named third-af387609.jpg in the Trash yet
+== scenario A: /private/tmp/claude-501/m10-scratch/e2e-a-b80d66e8 (cache /private/tmp/claude-501/m10-scratch/cache-a-b80d66e8)
+  pass  nothing named Holiday b80d66e8 copy in the Trash yet
+  pass  nothing named near-big-b80d66e8.jpg in the Trash yet
+  pass  nothing named third-b80d66e8.jpg in the Trash yet
 -- cold --list
 
   1 folder group(s) and 1 file group(s)
 
-    keep Holiday af387609/   (3 files, 10.0 MiB each copy)
-         Holiday af387609 copy/
+    keep Holiday b80d66e8/   (3 files, 10.0 MiB each copy)
+         Holiday b80d66e8 copy/
 
-    keep Holiday af387609/big-af387609.jpg
-         Loose af387609/third-af387609.jpg
-         Near af387609/near-big-af387609.jpg
-         Holiday af387609 copy/big-af387609.jpg
+    keep Holiday b80d66e8/big-b80d66e8.jpg
+         Loose b80d66e8/third-b80d66e8.jpg
+         Near b80d66e8/near-big-b80d66e8.jpg
+         Holiday b80d66e8 copy/big-b80d66e8.jpg
 
 
   pass  cold --list exits 0
   pass  cold --list shows the folder group, its twin and the kept folder
   pass  a cold scan's folder group is proven, not a candidate
-  pass  report-json has folders = [[kept, twin]] (got [['Holiday af387609', 'Holiday af387609 copy']])
+  pass  report-json has folders = [[kept, twin]] (got [['Holiday b80d66e8', 'Holiday b80d66e8 copy']])
   pass  the cold scan read bytes (44107172)
 -- warm --list (untouched tree)
 
   1 folder group(s) and 1 file group(s)
 
-    keep Holiday af387609/   (3 files, 10.0 MiB each copy)  candidate
-         Holiday af387609 copy/
+    keep Holiday b80d66e8/   (3 files, 10.0 MiB each copy)  candidate
+         Holiday b80d66e8 copy/
 
-    keep Holiday af387609/big-af387609.jpg
-         Loose af387609/third-af387609.jpg
-         Near af387609/near-big-af387609.jpg
-         Holiday af387609 copy/big-af387609.jpg
+    keep Holiday b80d66e8/big-b80d66e8.jpg
+         Loose b80d66e8/third-b80d66e8.jpg
+         Near b80d66e8/near-big-b80d66e8.jpg
+         Holiday b80d66e8 copy/big-b80d66e8.jpg
 
 
   pass  warm --list exits 0
@@ -42,9 +42,9 @@
   Keeping the shortest copy in each of 1 folder group(s) and 1 file group(s).
   Move to Trash: 1 folder(s) (3 files) and 2 file(s) · 31505010 bytes reclaimed
 
-      Holiday af387609 copy/
-      Loose af387609/third-af387609.jpg
-      Near af387609/near-big-af387609.jpg
+      Holiday b80d66e8 copy/
+      Loose b80d66e8/third-b80d66e8.jpg
+      Near b80d66e8/near-big-b80d66e8.jpg
 
 
   1 folder(s) (3 files) and 2 files moved to Trash · 31505010 bytes reclaimed
@@ -68,7 +68,7 @@
 
 
   pass  the second run finds nothing to remove
-== scenario B: /private/tmp/claude-501/m10-scratch/e2e-b-7ca0b4e1 (cache /private/tmp/claude-501/m10-scratch/cache-b-7ca0b4e1)
+== scenario B: /private/tmp/claude-501/m10-scratch/e2e-b-0fbbae85 (cache /private/tmp/claude-501/m10-scratch/cache-b-0fbbae85)
   pass  the warm scan before the forgery reads 0 bytes and labels the group candidate
   pass  the forged file keeps its size
   pass  the forged file keeps its mtime
@@ -77,15 +77,15 @@
   Keeping the shortest copy in each of 0 folder group(s) and 1 file group(s).
   Move to Trash: 2 files · 21000000 bytes reclaimed
 
-      Loose 7ca0b4e1/third-7ca0b4e1.jpg
-      Near 7ca0b4e1/near-big-7ca0b4e1.jpg
+      Loose 0fbbae85/third-0fbbae85.jpg
+      Near 0fbbae85/near-big-0fbbae85.jpg
 
 
   0 folder(s) (0 files) and 2 files moved to Trash · 21000000 bytes reclaimed
 
 
 
-  Refusing the folder group at Holiday 7ca0b4e1/: Holiday 7ca0b4e1 copy/ its files no longer match the copy beside it, or could not be read in full, so nothing in it was moved. What the cache remembered about the group has been dropped.
+  Refusing the folder group at Holiday 0fbbae85/: Holiday 0fbbae85 copy/ its files no longer match the copy beside it, or could not be read in full, so nothing in it was moved. What the cache remembered about the group has been dropped.
 
   pass  --auto exits 0 (exit 0)
   pass  --auto says which folder it refused, and why
@@ -97,8 +97,8 @@
 
   1 duplicate group(s)
 
-    keep Holiday 7ca0b4e1/big-7ca0b4e1.jpg
-         Holiday 7ca0b4e1 copy/big-7ca0b4e1.jpg
+    keep Holiday 0fbbae85/big-0fbbae85.jpg
+         Holiday 0fbbae85 copy/big-0fbbae85.jpg
 
 
   pass  the refused cache entries were dropped, so the next scan reads again (22048596)

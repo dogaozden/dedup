@@ -1,0 +1,17 @@
+# M10 listing cost, measured on a scratch tree (rust/evidence/m10-listing-cost.txt)
+# Tree: 'Big A/deep' and 'Big B/deeper', 20,000 small files each, one 10.5 MB file
+# 'shared.jpg' at the top of both. 'Same 1' and 'Same 2': 3,000 small files each,
+# same top-level names, different bytes. --list --no-cache, three runs each.
+# main = 35997af's binary (no folder pass); previous = e97c75a (eager listing); new = this round.
+
+main run 1: 0.08 s, opens=4, bytes_read=44097152
+main run 2: 0.03 s, opens=4, bytes_read=44097152
+main run 3: 0.03 s, opens=4, bytes_read=44097152
+old run 1: 0.12 s, opens=6, bytes_read=44097156
+old run 2: 0.11 s, opens=6, bytes_read=44097156
+old run 3: 0.11 s, opens=6, bytes_read=44097156
+new run 1: 0.05 s, opens=6, bytes_read=44097156
+new run 2: 0.05 s, opens=6, bytes_read=44097156
+new run 3: 0.05 s, opens=6, bytes_read=44097156
+
+new vs previous: groups identical = True , folders identical = True
