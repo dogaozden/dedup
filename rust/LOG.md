@@ -3227,3 +3227,60 @@ eager listing of the previous commit. The output was identical.
 Not measured: real home directories and `/Applications`. Those were left to the
 maintainer, and nothing outside the scratch trees was scanned for this entry.
 
+## 2026-10-10 — M10 phase 2, the browser
+
+The decisions the spec left to the builder, each with its reason.
+
+* **Folder group ids.** A folder group's browser id is `FOLDER_BASE + k`, with
+  `FOLDER_BASE` at 2^40. A file group keeps its id. The two id spaces never meet,
+  so marks, the cursor and the id index treat every row alike, and a mark tells a
+  file from a folder by its id alone.
+* **The folder age for bulk rules** is `Listing::age`, the newest entry inside
+  the folder, as in phase 1. The bulk rules reach it through `folders::keep_index`,
+  which `--auto` also calls. Nothing ranks a folder group in two places.
+* **Folder marks take the files inside them with them.** A file mark inside a
+  marked folder is removed, so the confirmation never counts a file twice. A file
+  inside a marked folder cannot be marked on its own.
+* **The bulk rules never remove a copy out of a kept folder.** A file group with
+  a copy inside a kept folder keeps that copy, as `--auto` does. Only the other
+  copies are marked. Every bulk result is checked against the survivor law before
+  the marks are replaced, and a result that would strand a group marks nothing.
+* **The survivor law is one function.** `folders::first_without_copy` takes, for
+  each group, whether each member would stay. The scan's `stranded` and the
+  browser's guard both build that pattern and call it, so they cannot disagree.
+* **Folder proof in the browser.** `run_selected` proves each marked folder group
+  with `folders::reprove`, listing and every file pair, and never reads the cache
+  to decide. `--auto` proves only its attested groups, before its plan, and lists
+  the rest at the move. Both reach the same `trash::move_folder`.
+* **Refused means refused whole, and comes back apart.** A folder group whose
+  proof fails loses none of its folders. The browser puts its folded file groups
+  back as visible groups. The flash names the folder.
+* **Live candidates are cheap to find and proved at apply.** Detection reads a
+  folder's top level first (names, file sizes, and the names of subfolders that
+  hold something). Only a pair that agrees there is listed whole. Then the first
+  and last 4 KiB of each file pair are compared. That is a probe, not a proof, and
+  the candidate is labelled `candidate` until an apply proves it.
+* **Live candidates are recomputed after every apply.** Folding depends on
+  membership, and membership changes with every move. A refused pair is kept in a
+  set for the session, so it is not offered again. Without that set a refused
+  folder would return as a candidate on the next pass.
+* **The finished browser sorts by reclaim.** `Browser::arrange` puts every row in
+  the same order the live list keeps. For two-copy groups this is the same order
+  as before. For groups of three or more it differs: they are now ranked by what
+  they would give back.
+* **Unfolding is for the session.** The browser remembers each unfolded folder
+  group by its first folder's path, so a rebuilt list does not fold it up again.
+* **The cursor follows the fold.** A cursor on a file group that a folder group
+  folds lands on the folder group when it arrives. An unfold puts the cursor on
+  the first file group it shows.
+
+### Fence and gates, as measured
+
+* Freeze vs `main` at defaults: 84 of 84 identical. The freeze corpora have no
+  folder candidate, as in phase 1.
+* `--no-folders` on the candidate corpus: 98 of 98 identical.
+* Conformance at defaults and under `--no-folders`: 33 of 33 each.
+* m8 live end-to-end: 5 of 5. m8 tty matrix: every row as the fence requires.
+* `m10_live.py` and `m10_folders.py`: all checks pass. Both use a scratch `HOME`,
+  so no real Trash entry was created or removed.
+

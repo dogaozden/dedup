@@ -36,6 +36,43 @@ Nothing is ever deleted on the strength of a hash. Hashes only narrow the
 field; the last stage compares the actual bytes. That stays true when a repeat
 scan reuses what it learned last time — see [Repeat scans](#repeat-scans).
 
+## Identical folders
+
+Two folders are copies of each other when they hold the same files, at the
+same relative paths, with the same bytes. Their names don't matter, so `Photos`
+and `Photos copy` can match. dedup shows a set of identical folders as one
+group, with one row per folder. Marking a folder moves the whole folder to the
+Trash.
+
+The rules, plainly:
+
+- Everything inside a folder counts. That includes small files, files that
+  `--min-size`, `-x` or `--ext` would hide, and every kind of file. One
+  different small file means the folders are not copies.
+- Two things are ignored: `.DS_Store` files, at any depth, and empty folders.
+  Nothing else is.
+- A symbolic link must point at the same text. Links are never followed.
+- A folder is never called a copy if it holds something dedup can't read: a
+  pipe, a socket, a file it can't open, or a cloud placeholder when `--cloud` is
+  off.
+- Three or more identical folders make one group.
+- Only the largest match is shown. If `Photos` and `Photos copy` match, their
+  subfolders are not listed again.
+- A file with a copy inside a folder group is not listed on its own; the folder
+  group already says so. A file with a third copy outside the folders is still
+  listed, with all its copies.
+
+The limits:
+
+- dedup finds folders by starting from duplicate files. It only compares the
+  folders those files sit in. Two folders whose files are all under
+  `--min-size` are never found.
+- Proving a folder means reading every file in it, small ones included. The
+  first scan pays for that. A repeat scan doesn't (see
+  [Repeat scans](#repeat-scans)).
+- In the live browser a folder group appears as a candidate, marked as one. It
+  is proved when you apply, before anything moves.
+
 ## Speed
 
 The scan avoids reading files it doesn't have to:
@@ -159,6 +196,11 @@ tells you which one, and forgets what it thought it knew:
 So the worst a stale — or deliberately forged — cache entry can do is show you
 a group that isn't really a group. It cannot cost you a file.
 
+**Folders.** Folder groups are remembered the same way. A repeat scan of an
+untouched tree reads nothing for them. Before a folder that was matched from
+memory is moved, dedup reads every file in it again and compares them, and it
+does that for the folder's copy as well, the same as it does for a file group.
+
 **Turning it off.** `--no-cache` reads everything and remembers nothing, which
 is exactly how the tool behaved before any of this existed.
 
@@ -180,6 +222,7 @@ the tree would free nothing. Those entries show `⊘` and can't be marked.
 space           mark / unmark the highlighted copy
 a               mark every copy except the highlighted one
 u               clear marks in this group
+o               unfold a folder group into its files, for this session
 g / G           first / last group
 b               bulk actions across every group
 ENTER           review and apply
@@ -187,14 +230,20 @@ ENTER           review and apply
 q               quit without deleting
 ```
 
-Groups are sorted by file size, largest first.
+A folder group is a row of folder paths, each ending in `/`. Its header says
+how many files each copy holds and how many bytes. Press `o` to see the file
+groups the folder group stands for. Unfolding lasts for the session.
+
+Groups are sorted by how much they would give back, largest first.
 
 Bulk actions (`b`) mark every group at once — keep the oldest, the newest, or
 the shortest path — which is how you deal with hundreds of groups without
 stepping through them one at a time.
 
 **At least one copy in every group always survives.** The tool won't let you
-mark them all.
+mark them all. That holds across groups too: a folder you mark takes the files
+inside it with it, so marking the last copy of a file that lives in a marked
+folder is refused.
 
 ## Deletion
 
@@ -220,8 +269,13 @@ dedup --auto newest       # keep the most recent
 dedup --auto -y           # skip the confirmation prompt
 ```
 
-It prints the full plan — how many files, how much space, and a sample of what
-goes — then asks once before doing anything. Without a terminal to prompt on it
+Folder groups are planned first. Each one keeps a single folder and moves the
+others whole. Files are planned after that, and a copy inside a kept folder is
+the one that stays. A folder that would strand a file, or that holds a folder
+another group keeps, is left alone and listed.
+
+It prints the full plan — how many folders, how many files, how much space, and
+a sample of what goes — then asks once before doing anything. Without a terminal to prompt on it
 refuses outright rather than guessing, so a piped or scripted run can't delete
 anything unless you passed `-y`.
 
@@ -236,6 +290,7 @@ anything unless you passed `-y`.
 -p, --parallel N    directories to scan at once (default: 4 on an SSD, 1 on a
                     spinning disk)
     --min-size N    ignore files smaller than N bytes (default 10485760, 10 MB)
+    --no-folders    do not look for identical folders; group single files only
 -x, --exclude GLOB  skip names matching GLOB (repeatable)
     --ext LIST      only scan these extensions, comma-separated (repeatable)
     --skip-ext LIST skip these extensions, comma-separated (repeatable)

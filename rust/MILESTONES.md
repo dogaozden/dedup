@@ -4783,3 +4783,85 @@ the test pass again.
   The Trash was back at its nine-entry baseline afterwards.
 - The listing cost was measured only on scratch trees I made. Nothing outside
   the scratch root was scanned.
+
+## M10 — phase 2, the browser — CLAIMED
+
+Branch `m10-folders`, on top of `21f6fb4`, which the maintainer accepted as
+phase 1. Not pushed, not merged. Evidence: `rust/evidence/m10-*.txt`.
+
+### What was built
+
+- **Browser** (`tui/model.rs`, `tui/view.rs`). Folder groups sit in the list
+  with the file groups. A folder group is a row of folder paths, each ending in
+  `/`, and its header says how many files and bytes each copy holds. Folded file
+  groups are hidden. Space, `a`, `u` and `b` work on folder groups. A new `o`
+  key unfolds a folder group for the session. The confirmation counts folders as
+  folders, with their files: `1 folder(s) (3 files)`. A file inside a marked
+  folder shows `with its folder`, and the guard refuses any mark that would leave
+  a group with no copy, across groups too.
+- **One survivor law.** `folders::first_without_copy` decides the survivor law
+  for the scan's guard (`stranded`) and for the browser's guard, which asks it of
+  the names on screen. The bulk rules call `folders::keep_index`, the function
+  `--auto` uses, so both rank folders the same way.
+- **`run_selected`** takes folder marks. Each marked folder group is proved
+  again, listing and every file pair, through `folders::reprove`, never trusting
+  the cache. A failed proof refuses that folder group whole, and its folded file
+  groups come back. Every folder moves through `trash::move_folder`, which
+  `--auto` also uses, and which lists the folder and its kept twin just before
+  the move.
+- **Live path.** Folder candidates appear once the stages have settled, labelled
+  `candidate`. Detection lists folders top level first, then names and sizes,
+  then the first and last 4 KiB of each file. No file is read in full. The proof
+  happens at apply. After every apply the candidates and the folding are
+  recomputed, and a refused folder pair is never offered again in the session.
+- **Cursor.** A folder group arriving folds the file groups it covers. A cursor
+  on one of them lands on the folder group. A cursor elsewhere does not move.
+  Unfolding puts the cursor on the first file group it shows.
+
+### Gate lines (final binary)
+
+- `cargo test`: `test result: ok. 332 passed; 0 failed` (phase 1: 312).
+- `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
+- Freeze vs `main`, defaults: `84 cases compared, 0 differing`.
+- Freeze vs `main` under `--no-folders` on the candidate corpus:
+  `98 cases compared, 0 differing`. At defaults on that corpus 13 cases differ,
+  as they must.
+- Conformance at defaults: `33 check(s), 0 failed`. `m3-warm` read 0.0 MB.
+- Conformance under `--no-folders`: `33 check(s), 0 failed`.
+- m8 live end-to-end: `5 case(s), 0 failed`. m8 tty matrix: every row as the
+  fence requires.
+- `m10_live.py`: `3 case(s), 0 failed`. It covers a marked folder that applies
+  through the live browser, a file added after the scan that refuses the group
+  whole, and the finished-scan browser applying a folder the same way.
+- `m10_folders.py`: `ALL CHECKS PASSED`.
+
+### Model and screen tests
+
+Fifteen model tests (`tui::model::folder_groups`) cover marks, the cross-group
+trap, the guard against the scan's law, unfolding, the cursor when a folder group
+arrives, the bulk rules, and what an apply hands back. Five screen snapshots
+(`tui::view`, TestBackend) cover a folder row, the candidate label, the
+folder-aware confirmation, unfolding, and a refusal that names its folder.
+
+### Deviations, for the record
+
+- **The pty scripts use a scratch `HOME`**, as the m8 script does. Their Trash is
+  a scratch directory, and the real `~/.Trash` is never named, listed or changed.
+  The brief asked for cleanup of only our own entries in `~/.Trash`. Using a
+  scratch home makes that unnecessary.
+- **The finished-scan browser orders every group by reclaim**, not by size. The
+  two orders are the same for groups of two copies, and differ for groups of three
+  or more.
+- **Refused folders are reported in the browser**, on its status line and in its
+  summary. Nothing is printed to stderr from inside the browser.
+- **Unfold is `o`.** `u` already clears a group's marks.
+- **The live probe is not counted in the report counters.** The live path writes
+  no report. The probe reads at most 8 KiB per file pair.
+
+### Open
+
+- Live candidate detection lists the candidate folders again after every apply.
+  Its cost on large real trees is not measured here.
+- `run_selected` in a live apply reads each marked folder in full, as the proof
+  requires. A large folder costs its full read at apply.
+
