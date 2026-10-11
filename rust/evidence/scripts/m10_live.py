@@ -33,9 +33,11 @@ import m8_live_end_to_end as m8  # noqa: E402
 ENTER = m8.ENTER
 
 
-def build(root, nonce):
+def build(root, nonce, loose=False):
     """Two identical folders, each with a file over the default 10 MiB floor, a
-    small file, and a stray .DS_Store that differs. Nothing else."""
+    small file, and a stray .DS_Store that differs. With `loose`, a third copy of
+    the big file sits in a folder of its own, whose name sorts after the kept one
+    so the kept copy is the first member of their file group."""
     rng = random.Random(nonce)
     big = rng.randbytes(10_500_000)
     tiny = rng.randbytes(5000)
@@ -53,6 +55,10 @@ def build(root, nonce):
         fh.write(b"view from the first copy")
     with open(os.path.join(root, twin, ".DS_Store"), "wb") as fh:
         fh.write(b"view from the second copy")
+    if loose:
+        os.makedirs(os.path.join(root, "Zzz Loose " + nonce))
+        with open(os.path.join(root, "Zzz Loose " + nonce, "big.jpg"), "wb") as fh:
+            fh.write(big)
     m8.age(root)
     return kept, twin
 
@@ -71,6 +77,65 @@ def tree_snapshot(base):
             with open(path, "rb") as fh:
                 out[os.path.relpath(path, base)] = fh.read()
     return out
+
+
+def run_mixed_case(binary, scratch, nonce):
+    """The selection that once half-applied: the copy folder, and the file in the
+    kept folder that has a copy outside both. The loose copy must stay."""
+    root = os.path.join(scratch, "live-mixed-%s" % nonce)
+    home = root + "-home"
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(root)
+    os.makedirs(os.path.join(home, ".Trash"))
+    kept, twin = build(root, nonce, loose=True)
+    loose = "Zzz Loose " + nonce
+    before = tree_snapshot(root)
+    problems = []
+    keys = [
+        (m8.at_menu, ENTER),
+        # The file group (kept, twin, loose) is first; its kept copy is the
+        # cursor's member, so space marks the kept copy of the big file.
+        (lambda t: m8.at_browser(t) and folder_shown(twin)(t), b" "),
+        (lambda t: "marked" in m8.squeeze(t), b"n"),
+        (lambda t: "marked" in m8.squeeze(t), b"j"),
+        (lambda t: "marked" in m8.squeeze(t), b" "),
+        # ratatui repaints only the cells that changed, so the count "2 marked"
+        # never appears as one string. Each mark draws one glyph, so wait for two.
+        (lambda t: t.count("●") >= 2, ENTER),
+        (lambda t: "Confirm" in m8.squeeze(t), b"y"),
+    ]
+    code, text, seen = m8.drive(binary, root, home, keys, extra=[])
+    squeezed = m8.squeeze(text)
+    if "Confirm" not in squeezed:
+        problems.append("the confirmation never appeared")
+    if "1folder(3files)and1file" not in squeezed:
+        problems.append("the confirmation did not count one folder and one file")
+    if "refused" in squeezed:
+        problems.append("the selection was refused: it half-applied before")
+    if code != 0:
+        problems.append("exit %d, wanted 0" % code)
+    after = tree_snapshot(root)
+    trashed = os.path.join(home, ".Trash", twin)
+    if os.path.exists(os.path.join(root, twin)):
+        problems.append("the copy folder is still in the tree")
+    if not os.path.isdir(trashed):
+        problems.append("the copy folder is not in the Trash as one directory")
+    elif tree_snapshot(trashed) != {name[len(twin) + 1:]: body for name, body in before.items()
+                                  if name.startswith(twin + os.sep)}:
+        problems.append("the moved folder is not byte-identical to the copy")
+    if os.path.exists(os.path.join(root, kept, "big.jpg")):
+        problems.append("the file in the kept folder is still in the tree")
+    if not os.path.isfile(os.path.join(home, ".Trash", "big.jpg")):
+        problems.append("the kept folder's copy of the file is not in the Trash")
+    if after.get(os.path.join(loose, "big.jpg")) != before.get(os.path.join(loose, "big.jpg")):
+        problems.append("the loose third copy changed or went")
+    for name in (os.path.join(kept, "notes.txt"), os.path.join(kept, "sub", "tiny.bin")):
+        if after.get(name) != before.get(name):
+            problems.append("%s changed" % name)
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
+    return problems
 
 
 def run_case(binary, scratch, nonce, refuse, finished=False):
@@ -169,6 +234,8 @@ def run_case(binary, scratch, nonce, refuse, finished=False):
 
 
 CASES = [
+    ("a folder and a file in the kept folder apply together, loose copy intact",
+     lambda binary, scratch, nonce: run_mixed_case(binary, scratch, nonce)),
     ("a marked folder applies: one directory to the Trash, twin intact",
      lambda binary, scratch, nonce: run_case(binary, scratch, nonce, refuse=False)),
     ("a file added after the scan refuses the folder group whole",

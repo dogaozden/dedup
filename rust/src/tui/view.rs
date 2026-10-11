@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use super::model::{elide_left, Browser, Mode, MIN_HEIGHT, MIN_WIDTH};
 use crate::folders;
-use crate::size::{human_count, human_size};
+use crate::size::{counted, human_count, human_size};
 
 const ACCENT: Color = Color::Cyan;
 const MARK: Color = Color::Red;
@@ -353,19 +353,19 @@ pub fn confirmation(browser: &Browser) -> Vec<String> {
     // folders is two folders, never four hundred separate removals.
     let (folders, folder_files, files) = browser.marked_split();
     let counts = if folders == 0 {
-        format!("{} files", human_count(browser.marked_count() as u64))
+        counted(browser.marked_count() as u64, "file", "files")
     } else if files == 0 {
         format!(
-            "{} folder(s) ({} files)",
-            human_count(folders as u64),
-            human_count(folder_files as u64)
+            "{} ({})",
+            counted(folders as u64, "folder", "folders"),
+            counted(folder_files as u64, "file", "files")
         )
     } else {
         format!(
-            "{} folder(s) ({} files) and {} files",
-            human_count(folders as u64),
-            human_count(folder_files as u64),
-            human_count(files as u64)
+            "{} ({}) and {}",
+            counted(folders as u64, "folder", "folders"),
+            counted(folder_files as u64, "file", "files"),
+            counted(files as u64, "file", "files")
         )
     };
     let mut lines = vec![
@@ -742,7 +742,7 @@ mod tests {
         let screen = render(&browser, 80, 16);
         let body = screen.join("\n");
         assert!(body.contains("Confirm"), "{body}");
-        assert!(body.contains("Move to Trash: 1 files"), "{body}");
+        assert!(body.contains("Move to Trash: 1 file"), "{body}");
         assert!(body.contains("Reclaims 4.0 KiB"), "{body}");
         assert!(body.contains("y  confirm      n  cancel"), "{body}");
         assert!(
@@ -758,7 +758,7 @@ mod tests {
         browser.on_key(Key::KeepOnlyThis);
         browser.on_key(Key::Apply);
         let body = render(&browser, 80, 16).join("\n");
-        assert!(body.contains("Delete permanently: 1 files"), "{body}");
+        assert!(body.contains("Delete permanently: 1 file"), "{body}");
         assert!(body.contains("This cannot be undone."), "{body}");
     }
 
@@ -1180,12 +1180,12 @@ mod tests {
         browser.on_key(Key::Apply);
         let lines = confirmation(&browser);
         assert!(
-            lines[0].contains("1 folder(s) (3 files)"),
+            lines[0].contains("1 folder (3 files)"),
             "the confirmation counted files, not folders: {lines:?}"
         );
         let body = render(&browser, 90, 20).join("\n");
         assert!(body.contains("Move to Trash"), "{body}");
-        assert!(body.contains("1 folder(s) (3 files)"), "{body}");
+        assert!(body.contains("1 folder (3 files)"), "{body}");
     }
 
     #[test]

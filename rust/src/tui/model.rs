@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::folders;
-use crate::size::human_count;
+use crate::size::{counted, human_count};
 use crate::trash::Rule;
 
 /// Browser ids for folder groups start here, above every file group's id.
@@ -1038,7 +1038,7 @@ impl Browser {
             )
         } else {
             let verb = if self.hard { "deleted" } else { "moved" };
-            format!("{verb} {} files", human_count(outcome.files as u64))
+            format!("{verb} {}", counted(outcome.files as u64, "file", "files"))
         };
         // An empty list ends the session — unless a scan is still running
         // behind it, where empty only means "nothing found YET" and quitting
@@ -2432,5 +2432,118 @@ mod folder_groups {
             .folder
             .as_ref()
             .is_some_and(|row| row.folded.is_empty()));
+    }
+
+    /// The browser's guard asks by name, and the scan's law asks by record. A
+    /// record can wear several names, so the two could differ. This enumerates
+    /// the small shapes that can differ and every selection over them, and checks
+    /// the one direction that matters: a selection the browser allows is never a
+    /// selection the record law forbids.
+    #[test]
+    fn the_browser_guard_never_allows_what_the_record_law_forbids() {
+        use crate::folders::{stranded, Folder, FolderGroup, Listing};
+        use crate::pipeline::DupGroup;
+        use crate::walk::FileRec;
+
+        let record = |names: &[&str]| FileRec {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            size: 10,
+            dev: 1,
+            ino: 1,
+            nlink: names.len() as u64,
+            mtime_ns: 0,
+            retained: None,
+        };
+        let folder = |path: &str| FolderGroup {
+            folders: vec![
+                Folder {
+                    path: path.to_string(),
+                    listing: Listing::default(),
+                },
+                Folder {
+                    path: "B".to_string(),
+                    listing: Listing::default(),
+                },
+            ],
+            attested: false,
+        };
+
+        // r0 wears a canonical name and maybe one more; r1 is one name. The
+        // canonical name is the first, as the scan sorts them.
+        let first_names = ["A/x", "C/x"];
+        let extra_names = [None, Some("A/z"), Some("C/z")];
+        let second_names = ["A/q", "C/q"];
+        let mut checked = 0;
+        let mut browser_stricter = 0;
+        for first in first_names {
+            for extra in extra_names {
+                for second in second_names {
+                    let mut names = vec![first];
+                    names.extend(extra);
+                    let records = vec![record(&names), record(&[second])];
+                    let groups = vec![DupGroup {
+                        members: vec![0, 1],
+                        attested: false,
+                    }];
+                    let folders = vec![folder("A")];
+
+                    let browser = Browser::new(
+                        vec![
+                            folder_row(0, &["A", "B"], &[1, 2], 10, Vec::new()),
+                            Group {
+                                index: 5,
+                                size: 10,
+                                proven: true,
+                                folder: None,
+                                members: vec![
+                                    file_member(0, first, 1.0),
+                                    file_member(1, second, 1.0),
+                                ],
+                            },
+                        ],
+                        "/root".into(),
+                        false,
+                    );
+                    // Every selection over: the folder A, record 0, record 1.
+                    for bits in 0..8_u8 {
+                        let mut marked = BTreeSet::new();
+                        let mut removed = HashSet::new();
+                        let mut moved = HashMap::new();
+                        if bits & 1 != 0 {
+                            marked.insert((FOLDER_BASE, 0));
+                            moved.insert("A", 0_usize);
+                        }
+                        if bits & 2 != 0 {
+                            marked.insert((5, 0));
+                            removed.insert(0);
+                        }
+                        if bits & 4 != 0 {
+                            marked.insert((5, 1));
+                            removed.insert(1);
+                        }
+                        let by_name = browser.strands(&marked);
+                        let by_record =
+                            stranded(&records, &groups, &folders, &removed, &moved, &|_| true);
+                        checked += 1;
+                        assert!(
+                            by_name.is_some() || by_record.is_none(),
+                            "the browser allowed {names:?} + {second}, bits {bits:03b}, \
+                             which the record law forbids: {by_record:?}"
+                        );
+                        if by_name.is_some() && by_record.is_none() {
+                            browser_stricter += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
+        // The browser is stricter in one corner: a canonical name inside a moved
+        // folder, with a surviving second name outside it. Refusing there costs a
+        // selection, never a file.
+        assert!(
+            browser_stricter > 0,
+            "the corner this test exists for never arose"
+        );
     }
 }

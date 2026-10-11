@@ -35,7 +35,7 @@ use crate::walk::FileRec;
 /// window resized while nobody is typing redraws while they are still looking.
 const WAIT_FOR_KEY: std::time::Duration = std::time::Duration::from_millis(250);
 
-use crate::size::{human_count, human_size};
+use crate::size::{counted, human_count, human_size};
 use model::FolderRow;
 use model::{Browser, Group, Key, Mark, Member, Mode, Outcome, Step, FOLDER_BASE};
 
@@ -266,8 +266,8 @@ fn summarise_live(browser: &Browser, wants_cloud: bool) {
             "moved to Trash"
         };
         println!(
-            "\n  {} files {where_to} · {} reclaimed\n",
-            human_count(browser.applied_files as u64),
+            "\n  {} {where_to} · {} reclaimed\n",
+            counted(browser.applied_files as u64, "file", "files"),
             human_size(browser.applied_bytes)
         );
     }
@@ -700,8 +700,8 @@ fn summarise(browser: &Browser, records: &[FileRec], refused: &[DupGroup]) {
             "moved to Trash"
         };
         println!(
-            "\n  {} files {where_to} · {} reclaimed\n",
-            human_count(browser.applied_files as u64),
+            "\n  {} {where_to} · {} reclaimed\n",
+            counted(browser.applied_files as u64, "file", "files"),
             human_size(browser.applied_bytes)
         );
     }
