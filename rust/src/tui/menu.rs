@@ -36,7 +36,7 @@ use crate::cli::{flag_named, Flag, Takes};
 /// to anyone who uses the menu — safe, but not what was intended. So the list
 /// is guarded from the other side as well: `EXPECTED_FIELDS` below names every
 /// flag the form is MEANT to carry, and a test fails if the two disagree.
-const FIELDS: [&str; 9] = [
+const FIELDS: [&str; 10] = [
     "--min-size",
     "--ext",
     "--skip-ext",
@@ -45,6 +45,7 @@ const FIELDS: [&str; 9] = [
     "--profile",
     "--cloud",
     "--no-cache",
+    "--no-folders",
     "--force",
 ];
 
@@ -57,7 +58,7 @@ const FIELDS: [&str; 9] = [
 /// decide what happens to the scan rather than what the scan is, and which
 /// M5_1-MENU.md keeps off the form because it runs before any scan exists.
 #[cfg(test)]
-const MENU_EXPOSURE: [(&str, bool); 18] = [
+const MENU_EXPOSURE: [(&str, bool); 19] = [
     ("--min-size", true),
     ("--ext", true),
     ("--skip-ext", true),
@@ -70,6 +71,10 @@ const MENU_EXPOSURE: [(&str, bool); 18] = [
     // one who just read "12 files in cloud" on the screen before this one.
     ("--cloud", true),
     ("--no-cache", true),
+    // Whether the scan looks for whole folders as well as single files: the
+    // same kind of question as `--cloud`, what the scan is, not what is done
+    // with it.
+    ("--no-folders", true),
     ("--force", true),
     // Below: what to DO about what is found, or how to report it. The form is
     // the front door to the browser, so a form offering `--list` or `--auto`
@@ -89,8 +94,9 @@ const MENU_EXPOSURE: [(&str, bool); 18] = [
 /// side by side, the root line, one row per `FIELDS` entry, the hint, and the
 /// frame around it. One taller than M8 left it, because `--cloud` is a ninth
 /// row and a form whose last row is off the bottom is a form nobody agreed to.
+/// M10 adds `--no-folders` as a tenth row, and takes one more line for it.
 pub const LEAST_WIDTH: u16 = 54;
-pub const LEAST_HEIGHT: u16 = 17;
+pub const LEAST_HEIGHT: u16 = 18;
 
 pub struct Row {
     pub flag: &'static Flag,
@@ -921,11 +927,11 @@ mod tests {
         // typed into the field — the three ways a size reaches this row, all
         // of them showing what the scan will actually use.
         let screen = render(&form(&["/tmp/tree"]), 72, 20).join("\n");
-        assert!(screen.contains("min-size  10 MiB"), "{screen}");
+        assert!(screen.contains("min-size    10 MiB"), "{screen}");
         assert!(!screen.contains("10485760"), "{screen}");
 
         let screen = render(&form(&["/tmp/tree", "--min-size", "104857600"]), 72, 20).join("\n");
-        assert!(screen.contains("min-size  100 MiB"), "{screen}");
+        assert!(screen.contains("min-size    100 MiB"), "{screen}");
 
         let mut form = form(&["/tmp/tree"]);
         form.on_key(Key::Edit);
@@ -935,7 +941,7 @@ mod tests {
         form.on_key(Key::Enter);
         assert_eq!(form.error, None);
         let screen = render(&form, 72, 20).join("\n");
-        assert!(screen.contains("min-size  100mb"), "{screen}");
+        assert!(screen.contains("min-size    100mb"), "{screen}");
         assert_eq!(options(&form.to_arguments()).min_size, 100 * 1024 * 1024);
     }
 

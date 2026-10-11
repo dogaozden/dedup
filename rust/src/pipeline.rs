@@ -19,10 +19,13 @@ use crate::consts::{DEEP_HEAD, HANDLE_BUDGET, HEAD_BYTES, RETAIN_BUDGET, SAMPLE_
 use crate::device::{Profile, VolumeProbe, Wanted};
 use crate::effort::Effort;
 use crate::filters::Filters;
+use crate::folders::{self, FolderGroup};
 use crate::ordered::Ordered;
 use crate::pulse::{self, Pulse};
 use crate::stages::{has_tail, hash_stage, release, small_file_stage, Probe, Reader};
+use crate::tui::model::{Mark, FOLDER_BASE};
 use crate::walk::{basename, candidates, name_order, walk, FileRec};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct DupGroup {
@@ -44,6 +47,15 @@ pub struct Scan {
     /// report, where a size bucket is an honest answer; and `proven`, for
     /// deletion, where it is not.
     groups: Vec<DupGroup>,
+    /// Folder groups, from `attach_folders`. Empty until somebody asks for
+    /// them, and never on the live path.
+    pub(crate) folders: Vec<FolderGroup>,
+    /// Whether the folder pass read cloud placeholders. A folder group is proved
+    /// again with the same setting before it moves.
+    pub cloud: bool,
+    /// For each file group, the folder group it folds into, if any. Parallel
+    /// to `groups`, or empty when there are no folder groups.
+    folded: Vec<Option<usize>>,
     proven: bool,
     pub files_seen: u64,
     pub bytes_seen: u64,
@@ -52,18 +64,27 @@ pub struct Scan {
 
 /// A borrow of groups that trace to bytes compared this scan — or to a cache
 /// attestation that `verify_attested` re-proves from bytes before anything is
-/// removed.
+/// removed. Folder groups travel with them: a folder is removable only through
+/// this token too (M10-FOLDERS.md §D).
 ///
 /// `Scan::proven` is the only way to obtain one and it returns `None` for a
 /// scan that merely grouped by size, so the deletion path cannot be reached
 /// from one. The guard is the type: `run_auto` will not accept anything else,
 /// and no later caller can reintroduce the hole by forgetting a comparison on
 /// a mode string.
-pub struct ProvenGroups<'a>(&'a [DupGroup]);
+#[derive(Clone, Copy)]
+pub struct ProvenGroups<'a> {
+    groups: &'a [DupGroup],
+    folders: &'a [FolderGroup],
+}
 
 impl<'a> ProvenGroups<'a> {
     pub fn groups(self) -> &'a [DupGroup] {
-        self.0
+        self.groups
+    }
+
+    pub fn folders(self) -> &'a [FolderGroup] {
+        self.folders
     }
 }
 
@@ -76,7 +97,35 @@ impl Scan {
     /// The groups deletion may act on, or `None` when nothing has read a byte
     /// of any file's contents.
     pub fn proven(&self) -> Option<ProvenGroups<'_>> {
-        self.proven.then_some(ProvenGroups(&self.groups))
+        self.proven.then_some(ProvenGroups {
+            groups: &self.groups,
+            folders: &self.folders,
+        })
+    }
+
+    /// The folder groups found, in the order they are reported.
+    pub fn folder_groups(&self) -> &[FolderGroup] {
+        &self.folders
+    }
+
+    /// Whether a file group is folded into a folder group, and so hidden from
+    /// every listing that shows groups one by one.
+    pub fn is_folded(&self, group: usize) -> bool {
+        self.folded_into(group).is_some()
+    }
+
+    /// The folder group a file group folds into, if it does.
+    pub fn folded_into(&self, group: usize) -> Option<usize> {
+        self.folded.get(group).copied().flatten()
+    }
+
+    /// Adopt the folder groups found for this scan and fold the file groups
+    /// they cover. Called once, by `main`, after the file groups are proven.
+    pub fn attach_folders(&mut self, found: Vec<FolderGroup>, cloud: bool) {
+        let active: Vec<usize> = (0..found.len()).collect();
+        self.folded = folders::fold(&self.records, &self.groups, &found, &active);
+        self.folders = found;
+        self.cloud = cloud;
     }
 }
 
@@ -135,6 +184,9 @@ pub fn size_stage(root: &Path, filters: Filters, pulse: &Pulse, cloud: &Cloud) -
         profile: Profile::Flash,
         hint: None,
         groups,
+        folders: Vec::new(),
+        cloud: false,
+        folded: Vec::new(),
         // Files that merely share a length. Nothing here has read a byte.
         proven: false,
         files_seen,
@@ -199,6 +251,9 @@ pub fn find_duplicates(
         profile: Profile::Flash,
         hint: None,
         groups: Vec::new(),
+        folders: Vec::new(),
+        cloud: false,
+        folded: Vec::new(),
         proven: true,
         files_seen,
         bytes_seen,
@@ -651,7 +706,12 @@ pub fn serve(
     let Some(crate::live::Ask::Apply { marks, hard }) = live.taken_ask() else {
         return false;
     };
-    let mut want: Vec<usize> = marks.iter().map(|mark| mark.group).collect();
+    // File marks are proved group by group, as they always were. Folder marks
+    // are proved by `run_selected`, which is the same code `--auto` runs.
+    let (folder_marks, file_marks): (Vec<Mark>, Vec<Mark>) = marks
+        .into_iter()
+        .partition(|mark| mark.group >= FOLDER_BASE);
+    let mut want: Vec<usize> = file_marks.iter().map(|mark| mark.group).collect();
     want.sort_unstable();
     want.dedup();
 
@@ -676,9 +736,10 @@ pub fn serve(
 
     // Only marks on groups that survived their proof go anywhere near the
     // remover, and the marks on a group that came apart are simply dropped.
-    let keeping: Vec<crate::tui::model::Mark> = marks
+    let keeping: Vec<Mark> = file_marks
         .into_iter()
         .filter(|mark| standing.contains(&mark.group))
+        .chain(folder_marks)
         .collect();
 
     let groups: Vec<DupGroup> = live
@@ -694,6 +755,9 @@ pub fn serve(
         profile: context.profile,
         hint: None,
         groups,
+        folders: live.take_folders(),
+        cloud: live.cloud(),
+        folded: Vec::new(),
         // Honest: every group here is either compared this scan or flagged
         // `attested`, and `run_selected` sends every attested group through a
         // full byte comparison before removing anything from it.
@@ -710,18 +774,44 @@ pub fn serve(
             None => Err("these groups were never compared byte for byte".to_string()),
         }
     };
+    // The folder candidates go back before anything else, so a refused one can
+    // be struck off the list and the list rebuilt from what is now on disk.
+    let candidates = std::mem::take(&mut lent.folders);
+    live.put_folders(candidates);
     *records = std::mem::take(&mut lent.records);
 
     let answer = match answer {
         Ok(mut removed) => {
-            let gone = std::mem::take(&mut removed.records);
+            for &browser_id in &removed.refused_folders {
+                live.refute(browser_id - FOLDER_BASE);
+            }
+            // Records inside a folder that moved are gone with it.
+            let moved: Vec<String> = removed
+                .folders_moved
+                .iter()
+                .flat_map(|mark| live.folder_paths(mark.group - FOLDER_BASE))
+                .collect();
+            let moved_map: HashMap<&str, ()> =
+                moved.iter().map(|path| (path.as_str(), ())).collect();
+            let mut gone = std::mem::take(&mut removed.records);
+            for (index, record) in records.iter().enumerate() {
+                let under = record
+                    .names
+                    .iter()
+                    .any(|name| crate::folders::within(name, &moved_map).is_some());
+                if under && !gone.contains(&index) {
+                    gone.push(index);
+                }
+            }
             live.forget(records, &gone);
             crate::live::Answer::Applied(Box::new(crate::tui::model::Outcome {
                 files: removed.files,
                 bytes: removed.bytes,
                 removed: gone,
-                refused: removed.refused.len() + broke,
+                refused: removed.refused.len() + removed.refused_folders.len() + broke,
                 failures: std::mem::take(&mut removed.failures),
+                folders_moved: std::mem::take(&mut removed.folders_moved),
+                refused_folders: std::mem::take(&mut removed.refused_folders),
             }))
         }
         // Nothing was removable, but the proof still changed what the list

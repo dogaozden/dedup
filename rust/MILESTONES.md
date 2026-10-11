@@ -4691,3 +4691,215 @@ every other measurement here was taken with before anything else ran. It is
 recorded rather than quietly fixed because it is exactly the stale-mutant
 failure the rule exists for, and because the scripts' own `finally` blocks
 cannot protect against SIGTERM.
+
+## M10 — identical folders, phase 1 — CLAIMED
+
+Branch `m10-folders`, based on `main@35997af`. Not pushed, not merged. Phase 2
+(the browser) is not started. Commits: `3c24931` (folders), `adb044d` and
+`04ed251` (script, evidence, claim), `68e99eb`, `cf9e782`, `e97c75a` (warm
+rescan), then the fix round, `9b89fd6` (code) and `be136b6` (evidence). Evidence: `rust/evidence/m10-*.txt`.
+
+### What was built
+
+- **Detection** (`folders.rs`). Candidate pairs are seeded from the file groups
+  the scan proved, never from a walk for folders. A candidate folder is read at
+  its top level first, and rejected there if its top level differs. Only a pair
+  whose top levels agree is listed whole, unfiltered, with `std::fs`, never
+  following a link. Pairs are settled from bytes compared in this scan (through
+  `split_identical`, so reads land in the `--report-json` counters), from a
+  whole-file digest the cache remembers, or from a file the scan already proved.
+  Groups come from union-find over those settlements, maximal only.
+- **Warm rescan.** A folder group settled partly from the cache is attested:
+  `--list` labels it `candidate`, the browser's word. A cold scan learns the
+  whole-file digest of every file its folder pass reads, in the existing `Full`
+  column, so no schema changes. A warm scan of an untouched tree reads nothing.
+- **Re-proof before a move.** `--auto` compares every attested folder with its
+  kept copy, byte for byte, before it prints the plan. A folder that fails is
+  held: none of its folders move, its files stay as copies, the cache entries
+  for it are dropped, and the message names the folder.
+- **Folding and the survivor law.** A file group folds into a folder group when
+  it has exactly one member per folder. `folders::stranded` is the one survivor
+  check, run on the `--auto` plan and on the browser's selection guard.
+- **`--auto`** plans folders first, then files. A folder that would tear a kept
+  folder, or strand a group, is dropped from the plan and listed as left alone.
+  Each folder and its kept twin are listed again just before the move. A folder
+  moves as one directory rename. Only a volume-boundary failure falls back to
+  copying the tree, and the source goes only once the copy is complete. `--hard`
+  removes the tree.
+- **`--list`, `--report-json`, `--no-folders`.** Folder groups print first. The
+  `folders` key appears only when non-empty. `--no-folders` has a FLAGS row and
+  a menu row; the menu's minimum height went from 17 to 18 for it.
+- **Live path.** Untouched. No folder groups reach the browser yet.
+
+### Gate lines (final binary)
+
+- `cargo test`: `test result: ok. 312 passed; 0 failed` (was 277).
+- `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
+- `m10_folders.py`: `ALL CHECKS PASSED`, 36 checks. Scenario A: the cold scan
+  reads bytes; the warm scan reads 0 and labels the group `candidate`; `--auto`
+  moves the twin as one directory; a second run finds nothing. Scenario B: a
+  same-size, mtime-restored forgery in the warm scan's folder; `--auto` refuses
+  that group, names it, and leaves both folders intact; the next scan reads
+  again.
+- Freeze vs `main`, defaults: `84 cases compared, 0 differing`.
+- Freeze vs `main` under `--no-folders` on a corpus with folder candidates
+  (`m10_no_folders_freeze.py`): `98 cases compared, 0 differing`. At defaults on
+  that corpus 13 cases differ, as they must.
+- Conformance at defaults: `33 check(s), 0 failed`. `m3-warm` read 0.0 MB.
+- Conformance under `--no-folders`: `33 check(s), 0 failed`.
+- Listing cost, scratch tree (`m10-listing-cost.txt`): `main` 0.03 s, the
+  previous commit 0.11 s, this round 0.05 s. Output identical to the previous
+  commit.
+
+### Mutation check
+
+Disabling the re-proof makes the forged-file test fail, and restoring it makes
+the test pass again.
+
+### Deviations, for the record
+
+- `run_selected` has no folder path yet. The phase-1 browser has no folder
+  marks, so nothing it can run moves a folder. The re-proof for browser folder
+  marks belongs with phase 2.
+- Only folder groups get the `candidate` label in `--list`. File groups have
+  never been labelled there, and a label on them would change every warm
+  `--list` and break the freeze fence.
+- A folder group that would strand a file group is dropped from the plan rather
+  than refusing the whole run. Keeping more is always safe.
+- A folder's age for `--auto oldest` and `newest` is the newest entry inside it.
+- The listing cost is bounded at the top level only. A pair whose top levels
+  agree, and which differs further down, still lists both trees whole (LOG).
+- The copy fallback has not run on a real second volume. The permission tests
+  were checked by mutation: an any-error fallback fails the read-only test.
+
+### Hazards, recorded
+
+- Early in the session I ran a broad `find` from `/` while looking for the
+  conformance state directory. It listed directory names under `/Volumes` and
+  `~/Library/CloudStorage` before it was killed. It opened no file and removed
+  nothing. Nothing like it was run in the later rounds.
+- The end-to-end script uses the real `~/.Trash`. Every name it creates carries
+  a random nonce, and its cleanup removes only new entries carrying that nonce.
+  The Trash was back at its nine-entry baseline afterwards.
+- The listing cost was measured only on scratch trees I made. Nothing outside
+  the scratch root was scanned.
+
+## M10 — phase 2, the browser — CLAIMED
+
+Branch `m10-folders`, on top of `21f6fb4`, which the maintainer accepted as
+phase 1. Not pushed, not merged. Evidence: `rust/evidence/m10-*.txt`.
+
+### What was built
+
+- **Browser** (`tui/model.rs`, `tui/view.rs`). Folder groups sit in the list
+  with the file groups. A folder group is a row of folder paths, each ending in
+  `/`, and its header says how many files and bytes each copy holds. Folded file
+  groups are hidden. Space, `a`, `u` and `b` work on folder groups. A new `o`
+  key unfolds a folder group for the session. The confirmation counts folders as
+  folders, with their files: `1 folder(s) (3 files)`. A file inside a marked
+  folder shows `with its folder`, and the guard refuses any mark that would leave
+  a group with no copy, across groups too.
+- **One survivor law.** `folders::first_without_copy` decides the survivor law
+  for the scan's guard (`stranded`) and for the browser's guard, which asks it of
+  the names on screen. The bulk rules call `folders::keep_index`, the function
+  `--auto` uses, so both rank folders the same way.
+- **`run_selected`** takes folder marks. Each marked folder group is proved
+  again, listing and every file pair, through `folders::reprove`, never trusting
+  the cache. A failed proof refuses that folder group whole, and its folded file
+  groups come back. Every folder moves through `trash::move_folder`, which
+  `--auto` also uses, and which lists the folder and its kept twin just before
+  the move.
+- **Live path.** Folder candidates appear once the stages have settled, labelled
+  `candidate`. Detection lists folders top level first, then names and sizes,
+  then the first and last 4 KiB of each file. No file is read in full. The proof
+  happens at apply. After every apply the candidates and the folding are
+  recomputed, and a refused folder pair is never offered again in the session.
+- **Cursor.** A folder group arriving folds the file groups it covers. A cursor
+  on one of them lands on the folder group. A cursor elsewhere does not move.
+  Unfolding puts the cursor on the first file group it shows.
+
+### Gate lines (final binary)
+
+- `cargo test`: `test result: ok. 332 passed; 0 failed` (phase 1: 312).
+- `cargo clippy --all-targets -- -D warnings`: exit 0. `cargo fmt --check`: exit 0.
+- Freeze vs `main`, defaults: `84 cases compared, 0 differing`.
+- Freeze vs `main` under `--no-folders` on the candidate corpus:
+  `98 cases compared, 0 differing`. At defaults on that corpus 13 cases differ,
+  as they must.
+- Conformance at defaults: `33 check(s), 0 failed`. `m3-warm` read 0.0 MB.
+- Conformance under `--no-folders`: `33 check(s), 0 failed`.
+- m8 live end-to-end: `5 case(s), 0 failed`. m8 tty matrix: every row as the
+  fence requires.
+- `m10_live.py`: `3 case(s), 0 failed`. It covers a marked folder that applies
+  through the live browser, a file added after the scan that refuses the group
+  whole, and the finished-scan browser applying a folder the same way.
+- `m10_folders.py`: `ALL CHECKS PASSED`.
+
+### Model and screen tests
+
+Fifteen model tests (`tui::model::folder_groups`) cover marks, the cross-group
+trap, the guard against the scan's law, unfolding, the cursor when a folder group
+arrives, the bulk rules, and what an apply hands back. Five screen snapshots
+(`tui::view`, TestBackend) cover a folder row, the candidate label, the
+folder-aware confirmation, unfolding, and a refusal that names its folder.
+
+### Deviations, for the record
+
+- **The pty scripts use a scratch `HOME`**, as the m8 script does. Their Trash is
+  a scratch directory, and the real `~/.Trash` is never named, listed or changed.
+  The brief asked for cleanup of only our own entries in `~/.Trash`. Using a
+  scratch home makes that unnecessary.
+- **The finished-scan browser orders every group by reclaim**, not by size. The
+  two orders are the same for groups of two copies, and differ for groups of three
+  or more.
+- **Refused folders are reported in the browser**, on its status line and in its
+  summary. Nothing is printed to stderr from inside the browser.
+- **Unfold is `o`.** `u` already clears a group's marks.
+- **The live probe is not counted in the report counters.** The live path writes
+  no report. The probe reads at most 8 KiB per file pair.
+
+### Open
+
+- Live candidate detection lists the candidate folders again after every apply.
+  Its cost on large real trees is not measured here.
+- `run_selected` in a live apply reads each marked folder in full, as the proof
+  requires. A large folder costs its full read at apply.
+
+### Fix round after review of phase 2
+
+The team lead drove the live browser and found a selection that half-applied:
+the copy folder, and a file inside the kept folder whose third copy sat outside
+both. The folder went through its proof after the file had already been removed
+from the kept folder, so the proof failed and the group was refused part-way.
+
+- **The order in `run_selected` is now: prove, then move, then remove.** Cache-
+  attested file groups are read again first, and nothing is removed. Every marked
+  folder group is proved. Folders then move, each proved against a kept twin that
+  nothing in the request has touched. Files go last. A file inside a folder that
+  is going, or inside a folder of a refused group, is kept.
+- **Tests.** `folder_selection` reproduces the reported selection through
+  `run_selected` on a scratch tree: the folder and the file go, the loose copy
+  stays. A second test checks that a refused group protects every file in its
+  folders. Both fail on the previous ordering. `m10_live.py` reproduces the same
+  selection through the pty. The previous binary refuses it and leaves the twin
+  in place. The new binary moves the folder and the file, and keeps the loose copy.
+- **The hardlink question.** A browser name guard and the record law can differ
+  for a record with several names. `the_browser_guard_never_allows_what_the_record_law_forbids`
+  enumerates the small shapes and every mark over them, 96 combinations in all,
+  and checks the direction that matters: the browser never allows a selection the
+  record law forbids. The browser is stricter in one corner, where a record's
+  canonical name lies in a folder being moved and a second name survives outside
+  it. That refuses a valid selection, and removes no file.
+- **Grammar.** The browser's confirmation, status lines and summaries say `1 file`
+  and `2 files`, `1 folder` and `2 folders`. The folder branch of `--auto` does
+  too. The plain `--auto` line keeps its old wording, because the freeze fence
+  compares it byte for byte.
+
+Gates on the fixed binary: `cargo test` 335 passed, clippy and fmt clean, freeze
+84 of 84 at defaults, the no-folders freeze 98 of 98, conformance 33 of 33 at
+defaults and under `--no-folders`, `m10_live.py` 4 of 4, `m10_folders.py` all
+checks passed. The m8 live script ran twice on the fixed binary: one run passed
+all five cases, one failed "quitting mid-scan". The same case fails on the
+previous commit too (`evidence/m10-m8-quit-flake.txt`), so it is a pre-existing
+timing sensitivity, not a regression from this round.
+

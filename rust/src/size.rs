@@ -126,6 +126,13 @@ pub fn exact_size(bytes: u64) -> String {
     shown
 }
 
+/// A count in words, with the noun in the singular for one and the plural for
+/// anything else: `1 file`, `2 files`, `1,000 files`.
+pub fn counted(n: u64, one: &str, many: &str) -> String {
+    let noun = if n == 1 { one } else { many };
+    format!("{} {noun}", human_count(n))
+}
+
 pub fn human_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);

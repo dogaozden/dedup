@@ -5,10 +5,19 @@
 //! be tested by calling functions instead of by driving a terminal. The paint
 //! layer reads this and never writes to it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::size::human_count;
+use crate::folders;
+use crate::size::{counted, human_count};
 use crate::trash::Rule;
+
+/// Browser ids for folder groups start here, above every file group's id.
+///
+/// A file group is named by its position in the scan's list (or its arrival
+/// number on the live path), and a folder group by its position in the folder
+/// list, offset by this. The two spaces never meet, so a mark, a cursor and the
+/// id index can all treat every row alike. Nothing here is ever a real index.
+pub const FOLDER_BASE: usize = 1 << 40;
 
 /// Below this the columns stop meaning anything and the paint layer draws a
 /// resize message instead of the browser.
@@ -58,6 +67,20 @@ pub struct Member {
     pub mtime: f64,
 }
 
+/// What a folder group carries beyond its rows.
+pub struct FolderRow {
+    /// Files in one copy, and bytes in one copy: the header says both.
+    pub files: usize,
+    pub bytes: u64,
+    /// Each folder's newest entry, in nanoseconds, parallel to the members. The
+    /// bulk rules rank folders by this through `folders::keep_index`, which is
+    /// the same function `--auto` uses.
+    pub ages: Vec<i64>,
+    /// The file groups this folder group folds. Shown again when it is unfolded,
+    /// and when an apply refuses it.
+    pub folded: Vec<Group>,
+}
+
 pub struct Group {
     /// Where this group sits in the scan's own list. It never changes, even
     /// once a round of deletion has renumbered what the browser shows, and it
@@ -68,8 +91,13 @@ pub struct Group {
     /// arrives later may be drawn above this one, and neither the cursor nor
     /// any mark may move because of it.
     pub index: usize,
+    /// Bytes a removal of one copy frees: the group's size. For a folder group,
+    /// the bytes that would be freed by moving one folder, which excludes a
+    /// hardlink whose other name is outside the folder.
     pub size: u64,
     pub members: Vec<Member>,
+    /// Present for a folder group, whose members are folders and not files.
+    pub folder: Option<FolderRow>,
     /// Whether the bytes behind this group have actually been compared.
     ///
     /// False means candidate: the narrowing stages agree, which is a very
@@ -139,6 +167,9 @@ pub enum Key {
     Toggle,
     KeepOnlyThis,
     ClearGroup,
+    /// Replace the highlighted folder group with the file groups it folds, for
+    /// the rest of the session.
+    Unfold,
     Bulk,
     Apply,
     Help,
@@ -166,6 +197,10 @@ pub struct Outcome {
     /// Names removed, not records: a hardlinked record removes several.
     pub files: usize,
     pub bytes: u64,
+    /// Folders moved, as marks: the folder group and the folder's position.
+    pub folders_moved: Vec<Mark>,
+    /// Folder groups refused, by browser id. Their folded groups come back.
+    pub refused_folders: Vec<usize>,
     /// Records that are actually gone, for rebuilding the groups.
     pub removed: Vec<usize>,
     /// Groups whose copies no longer matched and which were left alone whole.
@@ -218,6 +253,9 @@ pub struct Browser {
     pub in_cloud: u64,
     /// True when the scan stopped because the user asked it to.
     pub cancelled: bool,
+    /// Folder groups the user has unfolded, by the first folder's path. Kept
+    /// for the session, so a rebuilt list does not fold them up again.
+    unfolded: HashSet<String>,
 }
 
 /// A snapshot of what the scan is doing, for the browser to draw.
@@ -265,6 +303,7 @@ impl Browser {
             in_cloud: 0,
             scanning: false,
             cancelled: false,
+            unfolded: HashSet::new(),
         };
         browser.reindex();
         browser
@@ -305,6 +344,143 @@ impl Browser {
                 self.group = position;
             }
         }
+    }
+
+    /// The key an unfolded folder group is remembered by.
+    fn folder_key(group: &Group) -> String {
+        group.members[0].name.clone()
+    }
+
+    /// Put the rows in the order the list is kept in: most reclaimable first.
+    /// Used once, when a finished scan is turned into rows.
+    pub fn arrange(&mut self) {
+        self.groups
+            .sort_by(|left, right| left.order().cmp(&right.order()));
+        self.reindex();
+    }
+
+    /// Put a group in the list in its order, whatever it is.
+    ///
+    /// A folder group that the user has unfolded is not put back: the file
+    /// groups it folds go in instead, as they were before it folded them.
+    fn place(&mut self, mut group: Group) {
+        if group.folder.is_some() && self.unfolded.contains(&Self::folder_key(&group)) {
+            let folded = group
+                .folder
+                .as_mut()
+                .map(|row| std::mem::take(&mut row.folded))
+                .unwrap_or_default();
+            for file_group in folded {
+                if !self
+                    .groups
+                    .iter()
+                    .any(|existing| existing.index == file_group.index)
+                {
+                    self.place(file_group);
+                }
+            }
+            return;
+        }
+        let at = self
+            .groups
+            .partition_point(|existing| existing.order() < group.order());
+        self.groups.insert(at, group);
+        self.reindex();
+    }
+
+    /// Every mark's file, by name, and every marked folder, by path, as the
+    /// survivor law wants them.
+    fn names_marked<'a>(
+        marked: &BTreeSet<(usize, usize)>,
+        groups: &'a [Group],
+        at: &HashMap<usize, usize>,
+    ) -> (HashSet<&'a str>, HashMap<&'a str, ()>) {
+        let mut files = HashSet::new();
+        let mut folders = HashMap::new();
+        for &(id, member) in marked {
+            let Some(&position) = at.get(&id) else {
+                continue;
+            };
+            let Some(member) = groups[position].members.get(member) else {
+                continue;
+            };
+            if id >= FOLDER_BASE {
+                folders.insert(member.name.as_str(), ());
+            } else {
+                files.insert(member.name.as_str());
+            }
+        }
+        (files, folders)
+    }
+
+    /// The first group, by screen position, that a selection would leave with no
+    /// copy on disk, or `None` if every group keeps one.
+    ///
+    /// This is the browser's copy of the survivor law, and it is the same law:
+    /// the function that decides it is `folders::first_without_copy`, which the
+    /// scan's own guard also calls. Only the names differ — the browser has no
+    /// records, so it asks by name, which is the same question for the names a
+    /// group shows.
+    fn strands(&self, marked: &BTreeSet<(usize, usize)>) -> Option<usize> {
+        let (files, folders) = Self::names_marked(marked, &self.groups, &self.at);
+        let alive: Vec<Vec<bool>> = self
+            .groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .map(|member| {
+                        !files.contains(member.name.as_str())
+                            && folders::within(&member.name, &folders).is_none()
+                    })
+                    .collect()
+            })
+            .collect();
+        folders::first_without_copy(&alive)
+    }
+
+    /// Whether a file lies inside a folder that is marked: it goes with it.
+    fn goes_with_a_folder(&self, name: &str) -> bool {
+        let (_, folders) = Self::names_marked(&self.marked, &self.groups, &self.at);
+        folders::within(name, &folders).is_some()
+    }
+
+    /// What the marks would remove, split the way the confirmation names it:
+    /// folders, the files those folders hold, and loose files.
+    pub fn marked_split(&self) -> (usize, usize, usize) {
+        let (mut folders, mut folder_files, mut files) = (0, 0, 0);
+        for &(id, _) in &self.marked {
+            let Some(&position) = self.at.get(&id) else {
+                continue;
+            };
+            if id >= FOLDER_BASE {
+                folders += 1;
+                folder_files += self.groups[position]
+                    .folder
+                    .as_ref()
+                    .map_or(0, |row| row.files);
+            } else {
+                files += 1;
+            }
+        }
+        (folders, folder_files, files)
+    }
+
+    /// The paths of the marked folders, for the screen to say which files go
+    /// with them.
+    pub fn folders_marked(&self) -> Vec<&str> {
+        self.marked
+            .iter()
+            .filter(|(id, _)| *id >= FOLDER_BASE)
+            .filter_map(|&(id, member)| {
+                let &position = self.at.get(&id)?;
+                self.groups[position]
+                    .members
+                    .get(member)
+                    .map(|m| m.name.as_str())
+            })
+            .collect()
     }
 
     pub fn is_marked(&self, group: usize, member: usize) -> bool {
@@ -389,18 +565,49 @@ impl Browser {
         &self.groups[self.group]
     }
 
+    /// File marks that lie inside a folder being marked go with the folder, so
+    /// they are not also counted as separate removals.
+    fn settle(&self, marked: &mut BTreeSet<(usize, usize)>) {
+        let (_, folders) = Self::names_marked(marked, &self.groups, &self.at);
+        if folders.is_empty() {
+            return;
+        }
+        let inside: Vec<(usize, usize)> = self
+            .groups
+            .iter()
+            .filter(|group| group.folder.is_none())
+            .flat_map(|group| {
+                group
+                    .members
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, member)| folders::within(&member.name, &folders).is_some())
+                    .map(move |(position, _)| (group.index, position))
+            })
+            .collect();
+        for key in inside {
+            marked.remove(&key);
+        }
+    }
+
     /// Mark or unmark the highlighted member.
     ///
-    /// Two refusals, both the oracle's: a record pinned from outside the tree
-    /// frees nothing, and a group may never have every copy marked. The second
-    /// is checked before the mark goes in, so the count it compares is the
-    /// count without it.
+    /// Refusals, all of them the oracle's or the survivor law's: a record pinned
+    /// from outside the tree frees nothing; a group may never have every copy
+    /// marked; a file inside a marked folder goes with the folder; and no mark
+    /// may leave any group with no copy. The count the first two compare is the
+    /// count without the new mark, and the law is checked on the marks with it.
     pub fn toggle(&mut self) {
         let key = (self.id_at(self.group), self.member);
         if self.marked.remove(&key) {
             return;
         }
-        if !self.current().members[self.member].deletable {
+        let member = &self.current().members[self.member];
+        if self.current().folder.is_none() && self.goes_with_a_folder(&member.name) {
+            self.flash = "it goes with its folder — unmark the folder to keep it".into();
+            return;
+        }
+        if !member.deletable {
             self.flash = "hardlinked outside this tree — deleting it frees nothing".into();
             return;
         }
@@ -408,20 +615,40 @@ impl Browser {
             self.flash = "at least one copy has to stay".into();
             return;
         }
-        self.marked.insert(key);
+        let mut next = self.marked.clone();
+        next.insert(key);
+        self.settle(&mut next);
+        if let Some(position) = self.strands(&next) {
+            self.flash = format!(
+                "that would leave group {} with no copy",
+                human_count(position as u64 + 1)
+            );
+            return;
+        }
+        self.marked = next;
     }
 
     /// Keep the highlighted copy, mark every other one that can be freed.
     pub fn keep_only_current(&mut self) {
         let id = self.id_at(self.group);
+        let mut next = self.marked.clone();
         for position in 0..self.current().members.len() {
             let key = (id, position);
             if position == self.member || !self.current().members[position].deletable {
-                self.marked.remove(&key);
+                next.remove(&key);
             } else {
-                self.marked.insert(key);
+                next.insert(key);
             }
         }
+        self.settle(&mut next);
+        if let Some(position) = self.strands(&next) {
+            self.flash = format!(
+                "that would leave group {} with no copy",
+                human_count(position as u64 + 1)
+            );
+            return;
+        }
+        self.marked = next;
     }
 
     pub fn clear_group(&mut self) {
@@ -431,27 +658,91 @@ impl Browser {
 
     /// Apply a keep rule across every group at once, replacing the marks.
     ///
-    /// The keeper comes from `Rule`, the same code `--auto` uses, fed the same
-    /// strings `--auto` feeds it. Both halves matter: calling the same function
-    /// on the display path ranked a name whose shape depends on the working
-    /// directory, and "keep the shortest path" then kept a different copy here
-    /// than it did there. Sharing the function is not sharing the rule.
-    pub fn apply_bulk(&mut self, rule: Rule) -> usize {
-        self.marked.clear();
+    /// Folder groups are decided first, one folder kept per group by
+    /// `folders::keep_index` — the function `--auto` uses. A file group then
+    /// keeps the copy the rule names among the copies that do not go with a
+    /// marked folder, so the two halves cannot strand each other. Whatever the
+    /// result, the survivor law is checked before the marks are replaced.
+    pub fn apply_bulk(&mut self, rule: Rule) -> Result<usize, String> {
+        let mut next = BTreeSet::new();
         for group in self.groups.iter() {
-            let members: Vec<(&str, f64)> = group
+            let Some(row) = group.folder.as_ref() else {
+                continue;
+            };
+            let names: Vec<&str> = group
                 .members
                 .iter()
-                .map(|member| (member.name.as_str(), member.mtime))
+                .map(|member| member.name.as_str())
                 .collect();
-            let keeper = rule.keeper_of(&members);
+            let keeper = folders::keep_index(rule, &names, &row.ages);
             for (position, member) in group.members.iter().enumerate() {
                 if position != keeper && member.deletable {
-                    self.marked.insert((group.index, position));
+                    next.insert((group.index, position));
                 }
             }
         }
-        self.marked.len()
+        // What the folder choices move, and what they keep. A file inside a kept
+        // folder is the keeper if there is one, as `--auto` makes it, so the bulk
+        // rule never removes a copy out of a folder it is keeping.
+        let (_, moved) = Self::names_marked(&next, &self.groups, &self.at);
+        let mut kept: HashMap<&str, ()> = HashMap::new();
+        for group in self.groups.iter().filter(|group| group.folder.is_some()) {
+            for (position, member) in group.members.iter().enumerate() {
+                if !next.contains(&(group.index, position)) {
+                    kept.insert(member.name.as_str(), ());
+                }
+            }
+        }
+        for group in self.groups.iter().filter(|group| group.folder.is_none()) {
+            let candidates: Vec<usize> = group
+                .members
+                .iter()
+                .enumerate()
+                .filter(|(_, member)| folders::within(&member.name, &moved).is_none())
+                .map(|(position, _)| position)
+                .collect();
+            let sheltered: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&position| folders::within(&group.members[position].name, &kept).is_some())
+                .collect();
+            if !sheltered.is_empty() {
+                for &position in &candidates {
+                    let member = &group.members[position];
+                    if !sheltered.contains(&position) && member.deletable {
+                        next.insert((group.index, position));
+                    }
+                }
+                continue;
+            }
+            let pairs: Vec<(&str, f64)> = candidates
+                .iter()
+                .map(|&position| {
+                    let member = &group.members[position];
+                    (member.name.as_str(), member.mtime)
+                })
+                .collect();
+            if pairs.is_empty() {
+                continue;
+            }
+            let keeper = candidates[rule.keeper_of(&pairs)];
+            for &position in &candidates {
+                let member = &group.members[position];
+                if position != keeper && member.deletable {
+                    next.insert((group.index, position));
+                }
+            }
+        }
+        self.settle(&mut next);
+        if let Some(position) = self.strands(&next) {
+            return Err(format!(
+                "the {rule} rule would leave group {} with no copy, so nothing was marked",
+                human_count(position as u64 + 1)
+            ));
+        }
+        let marked = next.len();
+        self.marked = next;
+        Ok(marked)
     }
 
     /// Tell the model how big the last frame was.
@@ -512,12 +803,14 @@ impl Browser {
             Key::Digit(3) => Rule::Shortest,
             _ => return Step::Stay,
         };
-        let marked = self.apply_bulk(rule);
         self.mode = Mode::Browse;
-        self.flash = format!(
-            "{} files marked — keeping the {rule} copy",
-            human_count(marked as u64)
-        );
+        self.flash = match self.apply_bulk(rule) {
+            Ok(marked) => format!(
+                "{} files marked — keeping the {rule} copy",
+                human_count(marked as u64)
+            ),
+            Err(why) => why,
+        };
         Step::Stay
     }
 
@@ -573,6 +866,7 @@ impl Browser {
             Key::Toggle => self.toggle(),
             Key::KeepOnlyThis => self.keep_only_current(),
             Key::ClearGroup => self.clear_group(),
+            Key::Unfold => self.unfold(),
             Key::Bulk => self.mode = Mode::Bulk,
             Key::Apply => {
                 if self.marked.is_empty() {
@@ -586,45 +880,165 @@ impl Browser {
         Step::Stay
     }
 
+    /// Replace a folder group with the file groups it folds, for the session.
+    ///
+    /// The cursor lands on the first of them, and the marks on the folder group
+    /// go with it.
+    pub fn unfold(&mut self) {
+        let position = self.group;
+        let id = self.groups[position].index;
+        let Some(row) = self.groups[position].folder.as_mut() else {
+            self.flash = "only a folder group can be unfolded".into();
+            return;
+        };
+        let folded = std::mem::take(&mut row.folded);
+        let count = folded.len();
+        self.unfolded
+            .insert(Self::folder_key(&self.groups[position]));
+        self.marked.retain(|&(group, _)| group != id);
+        self.groups.remove(position);
+        let first = folded.first().map(|group| group.index);
+        for group in folded {
+            if !self
+                .groups
+                .iter()
+                .any(|existing| existing.index == group.index)
+            {
+                self.place(group);
+            }
+        }
+        self.reindex();
+        self.group = first
+            .and_then(|first| self.at.get(&first).copied())
+            .unwrap_or(position.min(self.groups.len().saturating_sub(1)));
+        self.member = 0;
+        self.flash = format!("unfolded — {} groups of files", human_count(count as u64));
+    }
+
     /// Fold a round of deletion back in: drop what is gone, keep the tallies,
     /// and forget every mark, including the ones a refused group still holds.
+    ///
+    /// A folder group that lost folders keeps its other folders and loses the
+    /// file groups it folded, which named the folders that moved. A folder group
+    /// the apply refused comes back apart: its folded file groups are visible
+    /// again, as the scan would show them.
     pub fn absorb(&mut self, outcome: Outcome) -> Step {
         self.applied_files += outcome.files;
         self.applied_bytes += outcome.bytes;
         self.refused += outcome.refused;
         self.failures.extend(outcome.failures);
 
+        let moved: HashSet<(usize, usize)> = outcome
+            .folders_moved
+            .iter()
+            .map(|mark| (mark.group, mark.record))
+            .collect();
+        let refused: HashSet<usize> = outcome.refused_folders.into_iter().collect();
+        let mut moved_paths: Vec<String> = Vec::new();
+        for group in &self.groups {
+            if group.folder.is_some() {
+                for (position, member) in group.members.iter().enumerate() {
+                    if moved.contains(&(group.index, position)) {
+                        moved_paths.push(member.name.clone());
+                    }
+                }
+            }
+        }
+        let moved_map: HashMap<&str, ()> =
+            moved_paths.iter().map(|path| (path.as_str(), ())).collect();
         let gone: BTreeSet<usize> = outcome.removed.into_iter().collect();
+        // The folder groups the apply refused, named by their first folder, read
+        // before the list is rebuilt.
+        let refused_names: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|group| refused.contains(&group.index))
+            .map(|group| format!("{}/", group.members[0].name))
+            .collect();
+
         let mut kept = Vec::with_capacity(self.groups.len());
+        let mut restored = Vec::new();
         for group in std::mem::take(&mut self.groups) {
-            let members: Vec<Member> = group
-                .members
+            let Group {
+                index,
+                size,
+                members,
+                folder,
+                proven,
+            } = group;
+            if let Some(mut row) = folder {
+                if refused.contains(&index) {
+                    restored.extend(std::mem::take(&mut row.folded));
+                    continue;
+                }
+                let keep: Vec<bool> = (0..members.len())
+                    .map(|position| !moved.contains(&(index, position)))
+                    .collect();
+                let mut ages = Vec::new();
+                let mut remaining = Vec::new();
+                for (position, member) in members.into_iter().enumerate() {
+                    if keep[position] {
+                        ages.push(row.ages[position]);
+                        remaining.push(member);
+                    }
+                }
+                // One folder left is not a duplicate, and the file groups it
+                // folded named folders that have gone.
+                if remaining.len() > 1 {
+                    kept.push(Group {
+                        index,
+                        size,
+                        members: remaining,
+                        folder: Some(FolderRow {
+                            files: row.files,
+                            bytes: row.bytes,
+                            ages,
+                            folded: Vec::new(),
+                        }),
+                        proven,
+                    });
+                }
+                continue;
+            }
+            let members: Vec<Member> = members
                 .into_iter()
-                .filter(|member| !gone.contains(&member.record))
+                .filter(|member| {
+                    !gone.contains(&member.record)
+                        && folders::within(&member.name, &moved_map).is_none()
+                })
                 .collect();
             // One copy left is not a duplicate any more.
             if members.len() > 1 {
                 kept.push(Group {
-                    index: group.index,
-                    size: group.size,
+                    index,
+                    size,
                     members,
-                    proven: group.proven,
+                    folder: None,
+                    proven,
                 });
             }
         }
         self.groups = kept;
         self.reindex();
+        for group in restored {
+            self.place(group);
+        }
+        self.reindex();
         self.marked.clear();
         self.group = self.group.min(self.groups.len().saturating_sub(1));
         self.member = 0;
-        self.flash = if outcome.refused > 0 {
+        self.flash = if let Some(first) = refused_names.first() {
+            format!(
+                "folder group at {first} refused — its files no longer match the copy beside it"
+            )
+        } else if outcome.refused > 0 {
             format!(
                 "{} group(s) refused — their copies no longer match",
                 human_count(outcome.refused as u64)
             )
         } else {
             let verb = if self.hard { "deleted" } else { "moved" };
-            format!("{verb} {} files", human_count(outcome.files as u64))
+            format!("{verb} {}", counted(outcome.files as u64, "file", "files"))
         };
         // An empty list ends the session — unless a scan is still running
         // behind it, where empty only means "nothing found YET" and quitting
@@ -641,44 +1055,88 @@ impl Browser {
     /// `replaced` says the scan rebuilt the list rather than adding to it,
     /// which is what happens after a deletion: the scan owns the records, so
     /// it is the side that decides what is left.
+    ///
+    /// A folder group arriving on its own removes the file groups it folds from
+    /// the list. A cursor on one of those lands on the folder group instead.
     pub fn absorb_found(&mut self, found: Vec<Group>, replaced: bool) {
         if replaced {
             let anchor = self.groups.get(self.group).map(|group| group.index);
             self.groups.clear();
             self.reindex();
             for group in found {
-                self.insert(group);
+                self.place(group);
             }
-            self.group = anchor
-                .and_then(|anchor| self.at.get(&anchor).copied())
+            // A cursor on a group that is now folded into a folder group lands
+            // on that folder group, the same rule as an arrival.
+            let target = anchor.and_then(|anchor| {
+                if self.at.contains_key(&anchor) {
+                    return Some(anchor);
+                }
+                self.groups
+                    .iter()
+                    .find(|group| {
+                        group.folder.as_ref().is_some_and(|row| {
+                            row.folded.iter().any(|folded| folded.index == anchor)
+                        })
+                    })
+                    .map(|group| group.index)
+            });
+            self.group = target
+                .and_then(|target| self.at.get(&target).copied())
                 .unwrap_or(0)
                 .min(self.groups.len().saturating_sub(1));
             self.member = 0;
-            // Every mark goes, which is the rule `absorb` already states two
-            // methods up: "forget every mark, including the ones a refused
-            // group still holds".
-            //
-            // Pruning by group id alone was not enough, and pruning by member
-            // position as well would not have been either. A rebuilt list only
-            // ever arrives after a proof or a deletion, and both REWRITE
-            // membership: a group that failed its proof comes back as its
-            // first real byte-equality class, so position 1 of the rebuilt
-            // group need not be the record the user marked at position 1. A
-            // mark that survived would be in range and name a different file,
-            // which is the same class of defect as keying marks by screen
-            // position — and on this path it is a file nobody chose being
-            // deleted.
-            //
-            // REVIEW-M8 item 1: the `Refused` answer was the one path that
-            // republished a shorter list without clearing, and `selection()`
-            // then indexed past the end of a group that had got smaller.
-            // Clearing here rather than at that one call site is what stops
-            // the next republishing path from having to remember.
+            // Every mark goes, which is the rule `absorb` states: a rebuilt list
+            // only ever arrives after a proof or a deletion, and both rewrite
+            // membership. A mark that survived would name a different file.
             self.marked.clear();
             return;
         }
-        for group in found {
+        for mut group in found {
+            let anchor = self.groups.get(self.group).map(|group| group.index);
+            if group.folder.is_none() {
+                self.insert(group);
+                continue;
+            }
+            let key = Self::folder_key(&group);
+            if self.unfolded.contains(&key) {
+                let folded = group
+                    .folder
+                    .as_mut()
+                    .map(|row| std::mem::take(&mut row.folded))
+                    .unwrap_or_default();
+                for file_group in folded {
+                    if !self
+                        .groups
+                        .iter()
+                        .any(|existing| existing.index == file_group.index)
+                    {
+                        self.place(file_group);
+                    }
+                }
+                continue;
+            }
+            let folded_ids: HashSet<usize> = group
+                .folder
+                .as_ref()
+                .map(|row| row.folded.iter().map(|folded| folded.index).collect())
+                .unwrap_or_default();
+            let cursor_was_folded = anchor.is_some_and(|anchor| folded_ids.contains(&anchor));
+            self.groups
+                .retain(|existing| !folded_ids.contains(&existing.index));
+            self.marked.retain(|&(id, _)| !folded_ids.contains(&id));
+            self.reindex();
+            let folder_id = group.index;
+            self.group = match anchor {
+                Some(anchor) if !cursor_was_folded => self.at.get(&anchor).copied().unwrap_or(0),
+                _ => 0,
+            };
             self.insert(group);
+            if cursor_was_folded {
+                if let Some(&position) = self.at.get(&folder_id) {
+                    self.group = position;
+                }
+            }
         }
     }
 }
@@ -744,12 +1202,16 @@ mod tests {
                         member(1, "bb.bin", 100.0),
                         member(2, "ccc.bin", 200.0),
                     ],
+
+                    folder: None,
                 },
                 Group {
                     index: 1,
                     size: 10,
                     proven: true,
                     members: vec![member(3, "d.bin", 5.0), member(4, "ee.bin", 9.0)],
+
+                    folder: None,
                 },
             ],
             "/scratch".into(),
@@ -829,7 +1291,7 @@ mod tests {
         browser.keep_only_current();
         assert_eq!(browser.marked_count(), 0);
         // A bulk rule still marks the other group, and still nothing here.
-        browser.apply_bulk(Rule::Shortest);
+        browser.apply_bulk(Rule::Shortest).unwrap();
         assert!(
             (0..3).all(|position| !browser.is_marked(0, position)),
             "a bulk rule marked a pinned record"
@@ -850,7 +1312,7 @@ mod tests {
     #[test]
     fn clearing_a_group_leaves_the_other_groups_marks_alone() {
         let mut browser = browser();
-        browser.apply_bulk(Rule::Shortest);
+        browser.apply_bulk(Rule::Shortest).unwrap();
         assert_eq!(browser.marked_count(), 3);
         browser.clear_group();
         assert_eq!(browser.marked_count(), 1);
@@ -861,7 +1323,7 @@ mod tests {
     fn every_bulk_rule_keeps_one_copy_in_every_group() {
         for rule in [Rule::Shortest, Rule::Oldest, Rule::Newest] {
             let mut browser = browser();
-            browser.apply_bulk(rule);
+            browser.apply_bulk(rule).unwrap();
             for (index, group) in browser.groups.iter().enumerate() {
                 let marked = (0..group.members.len())
                     .filter(|&position| browser.is_marked(index, position))
@@ -878,11 +1340,11 @@ mod tests {
     #[test]
     fn the_bulk_rules_keep_the_copy_they_name() {
         let mut browser = browser();
-        browser.apply_bulk(Rule::Oldest);
+        browser.apply_bulk(Rule::Oldest).unwrap();
         assert!(!browser.is_marked(0, 1), "bb.bin is the oldest");
-        browser.apply_bulk(Rule::Newest);
+        browser.apply_bulk(Rule::Newest).unwrap();
         assert!(!browser.is_marked(0, 0), "a.bin is the newest");
-        browser.apply_bulk(Rule::Shortest);
+        browser.apply_bulk(Rule::Shortest).unwrap();
         assert!(!browser.is_marked(0, 0), "a.bin has the shortest name");
     }
 
@@ -902,11 +1364,13 @@ mod tests {
                     shown_as(0, "b.bin", "/scratch/tree/b.bin", 1.0),
                     shown_as(1, "photos/aaaa.bin", "aaaa.bin", 2.0),
                 ],
+
+                folder: None,
             }],
             "/scratch/tree".into(),
             false,
         );
-        assert_eq!(browser.apply_bulk(Rule::Shortest), 1);
+        assert_eq!(browser.apply_bulk(Rule::Shortest).unwrap(), 1);
         assert!(
             !browser.is_marked(0, 0),
             "the shortest name in the scan was marked for deletion"
@@ -924,11 +1388,13 @@ mod tests {
                     shown_as(0, "b.bin", "b.bin", 1.0),
                     shown_as(1, "photos/aaaa.bin", "photos/aaaa.bin", 2.0),
                 ],
+
+                folder: None,
             }],
             "/scratch/tree".into(),
             false,
         );
-        swapped.apply_bulk(Rule::Shortest);
+        swapped.apply_bulk(Rule::Shortest).unwrap();
         assert_eq!(plan(&swapped), plan(&browser));
     }
 
@@ -944,6 +1410,8 @@ mod tests {
                     shown_as(0, "b.bin", "/scratch/tree/b.bin", 1.0),
                     shown_as(1, "photos/aaaa.bin", "aaaa.bin", 2.0),
                 ],
+
+                folder: None,
             }],
             "/scratch/tree".into(),
             false,
@@ -1014,7 +1482,7 @@ mod tests {
         let mut browser = browser();
         browser.member = 2;
         browser.keep_only_current(); // keeps ccc.bin
-        browser.apply_bulk(Rule::Shortest); // keeps a.bin
+        browser.apply_bulk(Rule::Shortest).unwrap(); // keeps a.bin
         assert!(!browser.is_marked(0, 0));
         assert!(browser.is_marked(0, 2), "the old keeper is a victim now");
     }
@@ -1103,7 +1571,7 @@ mod tests {
     #[test]
     fn the_bulk_menu_clears_every_mark_on_zero() {
         let mut browser = browser();
-        browser.apply_bulk(Rule::Shortest);
+        browser.apply_bulk(Rule::Shortest).unwrap();
         browser.on_key(Key::Bulk);
         browser.on_key(Key::Digit(0));
         assert_eq!(browser.marked_count(), 0);
@@ -1145,6 +1613,8 @@ mod tests {
             removed: vec![0, 2],
             refused: 0,
             failures: Vec::new(),
+
+            ..Default::default()
         });
         assert_eq!(step, Step::Stay);
         assert_eq!(browser.groups.len(), 1, "the emptied group stayed");
@@ -1170,6 +1640,8 @@ mod tests {
             removed: vec![1, 2],
             refused: 0,
             failures: Vec::new(),
+
+            ..Default::default()
         });
         assert_eq!(browser.groups.len(), 1);
         assert_eq!(browser.group, 0, "the browser renumbered as expected");
@@ -1198,6 +1670,8 @@ mod tests {
             removed: vec![1, 2],
             refused: 0,
             failures: Vec::new(),
+
+            ..Default::default()
         });
         assert_eq!(step, Step::Quit);
         assert!(browser.groups.is_empty());
@@ -1215,6 +1689,8 @@ mod tests {
             removed: Vec::new(),
             refused: 1,
             failures: Vec::new(),
+
+            ..Default::default()
         });
         assert_eq!(browser.groups.len(), 2, "a refusal removed something");
         assert_eq!(browser.groups[0].members.len(), 3);
@@ -1264,6 +1740,7 @@ mod tests {
             members: (0..copies)
                 .map(|position| member(id * 100 + position, &format!("g{id}/m{position}.bin"), 1.0))
                 .collect(),
+            folder: None,
         }
     }
 
@@ -1400,6 +1877,8 @@ mod tests {
             removed: vec![1],
             refused: 0,
             failures: Vec::new(),
+
+            ..Default::default()
         });
         assert_eq!(step, Step::Stay, "the browser quit while the scan ran");
 
@@ -1414,6 +1893,8 @@ mod tests {
             removed: vec![100, 101],
             refused: 0,
             failures: Vec::new(),
+
+            ..Default::default()
         });
         assert_eq!(step, Step::Quit);
     }
@@ -1564,5 +2045,505 @@ mod tests {
         // Counted in characters, not bytes, or a multi-byte path would be cut
         // to the wrong width and split a character while it was at it.
         assert_eq!(elide_left("αβγδε", 3), "…δε");
+    }
+}
+
+#[cfg(test)]
+mod folder_groups {
+    //! The folder side of the browser, with no terminal anywhere in it: rows,
+    //! marks, the guard, unfolding, the cursor when a folder group arrives, the
+    //! bulk rules, and what an apply hands back.
+
+    use super::*;
+
+    /// A file member at a record number, shown under its own name.
+    fn file_member(record: usize, name: &str, mtime: f64) -> Member {
+        Member {
+            record,
+            name: name.into(),
+            path: name.into(),
+            date: "2026-08-23".into(),
+            extra_links: 0,
+            deletable: true,
+            mtime,
+        }
+    }
+
+    /// A file group, its records numbered from `index * 100`.
+    fn file_group(index: usize, size: u64, names: &[&str]) -> Group {
+        Group {
+            index,
+            size,
+            proven: true,
+            folder: None,
+            members: names
+                .iter()
+                .enumerate()
+                .map(|(position, name)| file_member(index * 100 + position, name, 1.0))
+                .collect(),
+        }
+    }
+
+    /// A folder group. `ages` are each folder's newest entry in nanoseconds, and
+    /// `folded` are the file groups it stands for.
+    fn folder_row(id: usize, paths: &[&str], ages: &[i64], size: u64, folded: Vec<Group>) -> Group {
+        Group {
+            index: FOLDER_BASE + id,
+            size,
+            proven: false,
+            folder: Some(FolderRow {
+                files: 2,
+                bytes: size * 2,
+                ages: ages.to_vec(),
+                folded,
+            }),
+            members: paths
+                .iter()
+                .enumerate()
+                .map(|(position, path)| Member {
+                    record: position,
+                    name: (*path).into(),
+                    path: format!("{path}/"),
+                    date: "2026-08-23".into(),
+                    extra_links: 0,
+                    deletable: true,
+                    mtime: ages[position] as f64 / 1e9,
+                })
+                .collect(),
+        }
+    }
+
+    fn browser(groups: Vec<Group>) -> Browser {
+        Browser::new(groups, "/root".into(), false)
+    }
+
+    fn press(browser: &mut Browser, group: usize, member: usize, key: Key) {
+        browser.group = group;
+        browser.member = member;
+        browser.on_key(key);
+    }
+
+    #[test]
+    fn a_marked_folder_is_named_by_its_position_and_its_group() {
+        let folded = vec![file_group(7, 10, &["A/f", "B/f"])];
+        let mut browser = browser(vec![folder_row(0, &["A", "B"], &[1, 2], 10, folded)]);
+        press(&mut browser, 0, 1, Key::Toggle);
+        assert_eq!(
+            browser.selection(),
+            vec![Mark {
+                group: FOLDER_BASE,
+                record: 1
+            }]
+        );
+        assert_eq!(
+            browser.marked_split(),
+            (1, 2, 0),
+            "one folder, two files in it"
+        );
+    }
+
+    #[test]
+    fn a_folder_group_keeps_at_least_one_folder_like_a_file_group() {
+        let mut browser = browser(vec![folder_row(0, &["A", "B"], &[1, 2], 10, Vec::new())]);
+        press(&mut browser, 0, 0, Key::Toggle);
+        press(&mut browser, 0, 1, Key::Toggle);
+        assert_eq!(browser.marked_count(), 1, "the second folder was refused");
+        assert!(
+            browser.flash.contains("at least one copy"),
+            "{}",
+            browser.flash
+        );
+    }
+
+    #[test]
+    fn a_file_inside_a_marked_folder_goes_with_it_and_cannot_be_marked_alone() {
+        let mut browser = browser(vec![
+            folder_row(0, &["A", "B"], &[1, 2], 10, Vec::new()),
+            file_group(3, 5, &["A/f", "B/f", "C/f"]),
+        ]);
+        press(&mut browser, 0, 1, Key::Toggle);
+        press(&mut browser, 1, 1, Key::Toggle);
+        assert_eq!(browser.marked_count(), 1);
+        assert!(
+            browser.flash.contains("goes with its folder"),
+            "{}",
+            browser.flash
+        );
+    }
+
+    #[test]
+    fn marking_a_folder_takes_the_file_marks_inside_it_with_it() {
+        let mut browser = browser(vec![
+            folder_row(0, &["A", "B"], &[1, 2], 10, Vec::new()),
+            file_group(3, 5, &["A/f", "B/f", "C/f"]),
+        ]);
+        press(&mut browser, 1, 1, Key::Toggle);
+        assert_eq!(browser.marked_count(), 1, "B/f is marked");
+        press(&mut browser, 0, 1, Key::Toggle);
+        assert_eq!(
+            browser.selection(),
+            vec![Mark {
+                group: FOLDER_BASE,
+                record: 1
+            }],
+            "the folder took B/f, which is not counted twice"
+        );
+    }
+
+    #[test]
+    fn the_guard_refuses_the_cross_group_trap() {
+        // Folder B is marked. A/f is then marked, which is fine: C/f is still a
+        // copy. C/f would leave {A/f, B/f, C/f} with nothing on disk, so it is
+        // refused, and the mark on A/f stays.
+        let mut browser = browser(vec![
+            folder_row(0, &["A", "B"], &[1, 2], 10, Vec::new()),
+            file_group(3, 5, &["A/f", "B/f", "C/f"]),
+        ]);
+        press(&mut browser, 0, 1, Key::Toggle);
+        press(&mut browser, 1, 0, Key::Toggle);
+        assert_eq!(browser.marked_count(), 2);
+        press(&mut browser, 1, 2, Key::Toggle);
+        assert_eq!(browser.marked_count(), 2, "the trap mark was taken");
+        assert!(browser.flash.contains("no copy"), "{}", browser.flash);
+    }
+
+    #[test]
+    fn the_guard_agrees_with_the_scan_side_law() {
+        // The browser's answer and `folders::first_without_copy` must match on
+        // the same alive pattern, since both are the one definition of the law.
+        let alive = vec![vec![true, true], vec![false, false], vec![true]];
+        assert_eq!(folders::first_without_copy(&alive), Some(1));
+        let browser = browser(vec![file_group(3, 5, &["A/f", "B/f"])]);
+        let mut marked = BTreeSet::new();
+        marked.insert((3, 0));
+        assert_eq!(browser.strands(&marked), None, "one copy still stands");
+        marked.insert((3, 1));
+        assert_eq!(browser.strands(&marked), Some(0), "both copies would go");
+    }
+
+    #[test]
+    fn unfolding_replaces_the_folder_group_and_puts_the_cursor_on_its_first_file_group() {
+        let folded = vec![
+            file_group(3, 5, &["A/f", "B/f"]),
+            file_group(4, 4, &["A/g", "B/g"]),
+        ];
+        let mut browser = browser(vec![folder_row(0, &["A", "B"], &[1, 2], 10, folded)]);
+        assert_eq!(browser.groups.len(), 1);
+        browser.on_key(Key::Unfold);
+        let indexes: Vec<usize> = browser.groups.iter().map(|group| group.index).collect();
+        assert_eq!(indexes, vec![3, 4]);
+        assert_eq!(
+            browser.groups[browser.group].index, 3,
+            "the cursor lands on the first"
+        );
+        assert!(browser.groups.iter().all(|group| group.folder.is_none()));
+    }
+
+    #[test]
+    fn an_unfolded_folder_group_stays_unfolded_when_the_list_is_rebuilt() {
+        let mut browser = browser(vec![folder_row(
+            0,
+            &["A", "B"],
+            &[1, 2],
+            10,
+            vec![file_group(3, 5, &["A/f", "B/f"])],
+        )]);
+        browser.on_key(Key::Unfold);
+        browser.absorb_found(
+            vec![folder_row(
+                0,
+                &["A", "B"],
+                &[1, 2],
+                10,
+                vec![file_group(3, 5, &["A/f", "B/f"])],
+            )],
+            true,
+        );
+        assert_eq!(browser.groups.len(), 1);
+        assert_eq!(
+            browser.groups[0].index, 3,
+            "the rebuilt list folded it back up"
+        );
+    }
+
+    #[test]
+    fn a_folder_group_arriving_folds_the_file_groups_it_covers_and_the_cursor_follows() {
+        let mut browser = browser(vec![
+            file_group(1, 100, &["X/f", "Y/f"]),
+            file_group(2, 50, &["A/f", "B/f"]),
+        ]);
+        browser.group = 1;
+        browser.absorb_found(
+            vec![folder_row(
+                0,
+                &["A", "B"],
+                &[1, 2],
+                40,
+                vec![file_group(2, 50, &["A/f", "B/f"])],
+            )],
+            false,
+        );
+        let indexes: Vec<usize> = browser.groups.iter().map(|group| group.index).collect();
+        assert!(
+            !indexes.contains(&2),
+            "the folded file group is gone: {indexes:?}"
+        );
+        assert_eq!(
+            browser.groups[browser.group].index, FOLDER_BASE,
+            "the cursor followed it"
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_a_file_group_stays_on_it_when_a_folder_group_arrives_above() {
+        let mut browser = browser(vec![
+            file_group(1, 10, &["X/f", "Y/f"]),
+            file_group(2, 5, &["Q/f", "R/f"]),
+        ]);
+        browser.group = 1;
+        browser.absorb_found(
+            vec![folder_row(
+                0,
+                &["A", "B"],
+                &[1, 2],
+                400,
+                vec![file_group(9, 1, &["A/z", "B/z"])],
+            )],
+            false,
+        );
+        assert_eq!(
+            browser.groups[0].index, FOLDER_BASE,
+            "the folder group sorts first"
+        );
+        assert_eq!(
+            browser.groups[browser.group].index, 2,
+            "the cursor did not move"
+        );
+    }
+
+    #[test]
+    fn a_bulk_rule_keeps_the_folder_it_names_and_never_marks_a_file_in_a_kept_folder() {
+        // Folder B is the newest folder, so Newest moves A. The file group has
+        // B/f inside the kept folder: it is the keeper, and C/f goes.
+        let mut browser = browser(vec![
+            folder_row(0, &["A", "B"], &[1, 9], 10, Vec::new()),
+            file_group(3, 5, &["A/f", "B/f", "C/f"]),
+        ]);
+        browser
+            .apply_bulk(Rule::Newest)
+            .expect("a rule that keeps every group");
+        let marked: Vec<(usize, usize)> = browser.marked.iter().copied().collect();
+        assert_eq!(
+            marked,
+            vec![(3, 2), (FOLDER_BASE, 0)],
+            "C/f goes, and A is moved"
+        );
+    }
+
+    #[test]
+    fn a_bulk_rule_on_folders_follows_the_same_keeper_as_the_scan() {
+        let folders = ["A", "B", "C"];
+        let ages = [5_i64, 1, 9];
+        for (rule, keep) in [(Rule::Shortest, 0), (Rule::Oldest, 1), (Rule::Newest, 2)] {
+            let mut browser = browser(vec![folder_row(0, &folders, &ages, 10, Vec::new())]);
+            browser.apply_bulk(rule).expect("a legal bulk rule");
+            let kept = (0..3)
+                .find(|position| !browser.is_marked(0, *position))
+                .expect("one folder stays");
+            assert_eq!(kept, keep, "{rule}");
+        }
+    }
+
+    #[test]
+    fn a_moved_folder_leaves_its_row_and_the_file_groups_it_folded() {
+        let mut browser = browser(vec![folder_row(
+            0,
+            &["A", "B"],
+            &[1, 2],
+            10,
+            vec![file_group(3, 5, &["A/f", "B/f"])],
+        )]);
+        let step = browser.absorb(Outcome {
+            files: 2,
+            bytes: 10,
+            folders_moved: vec![Mark {
+                group: FOLDER_BASE,
+                record: 1,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            step,
+            Step::Quit,
+            "one folder left is not a duplicate: the list is empty"
+        );
+        assert!(browser.groups.is_empty());
+    }
+
+    #[test]
+    fn a_refused_folder_group_comes_back_apart_and_says_which_folder() {
+        let mut browser = browser(vec![folder_row(
+            0,
+            &["A", "B"],
+            &[1, 2],
+            10,
+            vec![file_group(3, 5, &["A/f", "B/f"])],
+        )]);
+        browser.scanning = true;
+        browser.absorb(Outcome {
+            refused: 1,
+            refused_folders: vec![FOLDER_BASE],
+            ..Default::default()
+        });
+        let indexes: Vec<usize> = browser.groups.iter().map(|group| group.index).collect();
+        assert_eq!(indexes, vec![3], "the file group is visible again");
+        assert!(browser.flash.contains("A/"), "{}", browser.flash);
+        assert!(browser.flash.contains("refused"), "{}", browser.flash);
+    }
+
+    #[test]
+    fn a_folder_that_moved_keeps_the_others_in_its_group() {
+        let mut browser = browser(vec![folder_row(
+            0,
+            &["A", "B", "C"],
+            &[1, 2, 3],
+            10,
+            vec![file_group(3, 5, &["A/f", "B/f", "C/f"])],
+        )]);
+        browser.absorb(Outcome {
+            folders_moved: vec![Mark {
+                group: FOLDER_BASE,
+                record: 1,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            browser.groups.len(),
+            1,
+            "A and C still duplicate each other"
+        );
+        let names: Vec<&str> = browser.groups[0]
+            .members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, ["A", "C"]);
+        assert!(browser.groups[0]
+            .folder
+            .as_ref()
+            .is_some_and(|row| row.folded.is_empty()));
+    }
+
+    /// The browser's guard asks by name, and the scan's law asks by record. A
+    /// record can wear several names, so the two could differ. This enumerates
+    /// the small shapes that can differ and every selection over them, and checks
+    /// the one direction that matters: a selection the browser allows is never a
+    /// selection the record law forbids.
+    #[test]
+    fn the_browser_guard_never_allows_what_the_record_law_forbids() {
+        use crate::folders::{stranded, Folder, FolderGroup, Listing};
+        use crate::pipeline::DupGroup;
+        use crate::walk::FileRec;
+
+        let record = |names: &[&str]| FileRec {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            size: 10,
+            dev: 1,
+            ino: 1,
+            nlink: names.len() as u64,
+            mtime_ns: 0,
+            retained: None,
+        };
+        let folder = |path: &str| FolderGroup {
+            folders: vec![
+                Folder {
+                    path: path.to_string(),
+                    listing: Listing::default(),
+                },
+                Folder {
+                    path: "B".to_string(),
+                    listing: Listing::default(),
+                },
+            ],
+            attested: false,
+        };
+
+        // r0 wears a canonical name and maybe one more; r1 is one name. The
+        // canonical name is the first, as the scan sorts them.
+        let first_names = ["A/x", "C/x"];
+        let extra_names = [None, Some("A/z"), Some("C/z")];
+        let second_names = ["A/q", "C/q"];
+        let mut checked = 0;
+        let mut browser_stricter = 0;
+        for first in first_names {
+            for extra in extra_names {
+                for second in second_names {
+                    let mut names = vec![first];
+                    names.extend(extra);
+                    let records = vec![record(&names), record(&[second])];
+                    let groups = vec![DupGroup {
+                        members: vec![0, 1],
+                        attested: false,
+                    }];
+                    let folders = vec![folder("A")];
+
+                    let browser = Browser::new(
+                        vec![
+                            folder_row(0, &["A", "B"], &[1, 2], 10, Vec::new()),
+                            Group {
+                                index: 5,
+                                size: 10,
+                                proven: true,
+                                folder: None,
+                                members: vec![
+                                    file_member(0, first, 1.0),
+                                    file_member(1, second, 1.0),
+                                ],
+                            },
+                        ],
+                        "/root".into(),
+                        false,
+                    );
+                    // Every selection over: the folder A, record 0, record 1.
+                    for bits in 0..8_u8 {
+                        let mut marked = BTreeSet::new();
+                        let mut removed = HashSet::new();
+                        let mut moved = HashMap::new();
+                        if bits & 1 != 0 {
+                            marked.insert((FOLDER_BASE, 0));
+                            moved.insert("A", 0_usize);
+                        }
+                        if bits & 2 != 0 {
+                            marked.insert((5, 0));
+                            removed.insert(0);
+                        }
+                        if bits & 4 != 0 {
+                            marked.insert((5, 1));
+                            removed.insert(1);
+                        }
+                        let by_name = browser.strands(&marked);
+                        let by_record =
+                            stranded(&records, &groups, &folders, &removed, &moved, &|_| true);
+                        checked += 1;
+                        assert!(
+                            by_name.is_some() || by_record.is_none(),
+                            "the browser allowed {names:?} + {second}, bits {bits:03b}, \
+                             which the record law forbids: {by_record:?}"
+                        );
+                        if by_name.is_some() && by_record.is_none() {
+                            browser_stricter += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
+        // The browser is stricter in one corner: a canonical name inside a moved
+        // folder, with a surviving second name outside it. Refusing there costs a
+        // selection, never a file.
+        assert!(
+            browser_stricter > 0,
+            "the corner this test exists for never arose"
+        );
     }
 }

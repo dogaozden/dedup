@@ -13,6 +13,7 @@ mod consts;
 mod device;
 mod effort;
 mod filters;
+mod folders;
 mod live;
 mod ordered;
 mod pipeline;
@@ -37,6 +38,7 @@ use compare::Compare;
 use device::{Device, VolumeProbe};
 use effort::Effort;
 use filters::{resolve_extensions, Filters};
+use folders::FolderGroup;
 use pipeline::{find_duplicates, report_names, size_stage};
 use pulse::Pulse;
 use trash::{run_auto, Removal, Rule};
@@ -67,6 +69,11 @@ struct Report<'a> {
     /// scanning a tree that has nothing to say about it.
     #[serde(skip_serializing_if = "Option::is_none")]
     skipped_cloud: Option<u64>,
+    /// Folder groups, each a list of folder paths, absent from the document
+    /// when there are none. Same reasoning as `skipped_cloud`: a tree without a
+    /// folder group must produce the bytes it always did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    folders: Vec<Vec<&'a str>>,
 }
 
 /// Whether the flags on this run ask for the browser, leaving aside whether
@@ -129,12 +136,42 @@ fn live_wanted(terminal: bool, options: &Options) -> bool {
     terminal && live_flags(options)
 }
 
-fn print_report(groups: &[Vec<&str>]) {
-    if groups.is_empty() {
+/// The `--list` view: folder groups first, then the file groups that are not
+/// folded into one. Without folder groups it is exactly the list it always was.
+fn print_report(folders: &[FolderGroup], groups: &[Vec<&str>]) {
+    if folders.is_empty() && groups.is_empty() {
         println!("\n  No duplicates found.\n");
         return;
     }
-    println!("\n  {} duplicate group(s)\n", groups.len());
+    match (folders.is_empty(), groups.is_empty()) {
+        (true, _) => println!("\n  {} duplicate group(s)\n", groups.len()),
+        (false, true) => println!("\n  {} folder group(s)\n", folders.len()),
+        (false, false) => println!(
+            "\n  {} folder group(s) and {} file group(s)\n",
+            folders.len(),
+            groups.len()
+        ),
+    }
+    for group in folders {
+        for (position, folder) in group.folders.iter().enumerate() {
+            let marker = if position == 0 { "keep" } else { "    " };
+            if position == 0 {
+                // The browser's word for a group proved at apply, not before. Only
+                // folder groups are labelled here: file groups are not, and a
+                // label on them would change every warm `--list`.
+                let candidate = if group.attested { "  candidate" } else { "" };
+                println!(
+                    "    {marker} {}/   ({} files, {} each copy){candidate}",
+                    folder.path,
+                    group.files(),
+                    size::human_size(group.bytes())
+                );
+            } else {
+                println!("    {marker} {}/", folder.path);
+            }
+        }
+        println!();
+    }
     for group in groups {
         for (position, name) in group.iter().enumerate() {
             println!("    {} {name}", if position == 0 { "keep" } else { "    " });
@@ -261,6 +298,31 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     if let Some(hint) = scan.hint {
         eprintln!("{hint}");
     }
+    // Identical folders, found from the file groups this scan just proved. They
+    // are looked for only after the proof, and only when two files shared a
+    // group across different folders. `--no-folders` skips the whole pass, and
+    // the live path never reaches here.
+    if !options.no_folders && !scan.reported().is_empty() && scan.proven().is_some() {
+        let device = probe.device();
+        let context = Compare {
+            root: &root,
+            effort: &effort,
+            profile: scan.profile,
+            solid: device.all_solid_state(),
+            learn: false,
+        };
+        let mut folder_unreadable = Vec::new();
+        let found = folders::find(
+            &scan.records,
+            scan.reported(),
+            &context,
+            options.cloud,
+            cache.as_mut(),
+            &mut folder_unreadable,
+        );
+        scan.unreadable.extend(folder_unreadable);
+        scan.attach_folders(found, options.cloud);
+    }
     scan.unreadable.sort();
     scan.unreadable.dedup();
     // Which of the files that would not read live in the cloud. Asked now,
@@ -297,6 +359,17 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         opens: effort.opens(),
         seeks: effort.seeks(),
         skipped_cloud: (skipped_cloud > 0).then_some(skipped_cloud),
+        folders: scan
+            .folder_groups()
+            .iter()
+            .map(|group| {
+                group
+                    .folders
+                    .iter()
+                    .map(|folder| folder.path.as_str())
+                    .collect()
+            })
+            .collect(),
     };
 
     let destination = options
@@ -311,7 +384,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // prints one when there is no terminal to browse in, and a run that reads
     // a whole tree and says nothing looks like a hang.
     if options.list || (rule.is_none() && !options.interactive && !tui::has_terminal()) {
-        print_report(&report.groups);
+        let visible: Vec<Vec<&str>> = report
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(number, _)| !scan.is_folded(*number))
+            .map(|(_, group)| group.clone())
+            .collect();
+        print_report(scan.folder_groups(), &visible);
     }
 
     // Deletion happens after the report is written, so the report always
@@ -334,6 +414,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                     rule,
                     hard: options.hard,
                     assume_yes: options.yes,
+                    cloud: options.cloud,
                 };
                 run_auto(&scan, proven, &removal, &context, cache.as_mut())
             }
@@ -366,7 +447,7 @@ fn live_scan(
     effort: &Arc<Effort>,
     cloud: &Arc<cloud::Cloud>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    let (live, watch) = live::channel(root);
+    let (live, watch) = live::channel(root, options.cloud);
     // Counters without a painter: in live mode the browser is the progress
     // display, so nothing may write to stderr behind the alternate screen.
     let (pulse, seen) = Pulse::live(effort, cloud);
@@ -403,6 +484,11 @@ fn live_scan(
                 cloud,
                 Some(&live),
             );
+            // Folder candidates are looked for once the file groups have settled,
+            // and they arrive as candidates: nothing here reads a file in full.
+            if !options.no_folders && !live.cancelled() {
+                live.publish_folders(&scan.records);
+            }
             // The list is complete; the progress display goes away. The thread
             // stays to answer, because a user who waited for the scan to
             // finish before marking anything is the ordinary case.

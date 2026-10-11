@@ -34,6 +34,9 @@ pub struct Options {
     pub yes: bool,
     pub hard: bool,
     pub no_cache: bool,
+    /// Do not look for identical folders: file groups only, as before folders
+    /// existed. The default is to find them.
+    pub no_folders: bool,
     /// Read no verdicts from the cache this run, but still write what the
     /// scan learns. Distinct from `no_cache`, which neither reads nor writes.
     pub force: bool,
@@ -136,6 +139,7 @@ impl Flag {
             "--yes" => options.yes = true,
             "--hard" => options.hard = true,
             "--no-cache" => options.no_cache = true,
+            "--no-folders" => options.no_folders = true,
             "--force" => options.force = true,
             "--quiet" => options.quiet = true,
             "--cloud" => options.cloud = true,
@@ -227,6 +231,16 @@ pub const FLAGS: &[Flag] = &[
         takes: Takes::Nothing,
         help: "neither read nor write the scan cache",
         default: "use the scan cache",
+    },
+    Flag {
+        long: "--no-folders",
+        short: None,
+        takes: Takes::Nothing,
+        help: "do not look for identical folders; group single files only, as \
+               before. A folder group is offered when every file in two or more \
+               folders has a byte-identical twin in the others. Empty folders and \
+               .DS_Store files are ignored; nothing else is",
+        default: "find identical folders too",
     },
     Flag {
         long: "--force",

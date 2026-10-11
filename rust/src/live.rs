@@ -54,8 +54,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use crate::tui::model::{Group, Mark, Outcome};
+use crate::folders::{self, FolderGroup};
+use crate::pipeline::DupGroup;
+use crate::tui::model::{Group, Mark, Outcome, FOLDER_BASE};
 use crate::walk::FileRec;
+use std::collections::HashSet;
 
 /// What the browser has asked the scan to do, and what came back.
 ///
@@ -129,13 +132,23 @@ pub struct Live {
     /// and it is why the scan can serve that request without the browser ever
     /// holding a record.
     runs: std::cell::RefCell<Vec<(Vec<usize>, bool)>>,
+    /// Whether the folder pass may read cloud placeholders in its proof.
+    cloud: bool,
+    /// The folder candidates on screen, in the order their browser ids name them.
+    /// Recomputed after every apply, since membership changes then.
+    folders: std::cell::RefCell<Vec<FolderGroup>>,
+    /// For each folder candidate, the file groups it folds, by run id.
+    folded_of: std::cell::RefCell<Vec<Vec<usize>>>,
+    /// Folder pairs an apply has proved different this session. They are never
+    /// offered again, so a refused folder does not come back as a candidate.
+    refuted: std::cell::RefCell<HashSet<(String, String)>>,
 }
 
 /// The browser thread's end.
 pub struct Watch(Arc<Shared>);
 
 /// Build both ends of one live scan.
-pub fn channel(root: &std::path::Path) -> (Live, Watch) {
+pub fn channel(root: &std::path::Path, cloud: bool) -> (Live, Watch) {
     let shared = Arc::new(Shared {
         body: Mutex::new(Body::default()),
         stirred: Condvar::new(),
@@ -151,6 +164,10 @@ pub fn channel(root: &std::path::Path) -> (Live, Watch) {
             shown: crate::tui::Shown::new(),
             root: root.to_path_buf(),
             runs: std::cell::RefCell::new(Vec::new()),
+            cloud,
+            folders: std::cell::RefCell::new(Vec::new()),
+            folded_of: std::cell::RefCell::new(Vec::new()),
+            refuted: std::cell::RefCell::new(HashSet::new()),
         },
         Watch(shared),
     )
@@ -234,20 +251,143 @@ impl Live {
     /// resolves to nothing instead of to somebody else.
     pub fn forget(&self, records: &[FileRec], gone: &[usize]) {
         let gone: std::collections::HashSet<usize> = gone.iter().copied().collect();
-        let rows: Vec<Group> = {
+        {
             let mut runs = self.runs.borrow_mut();
             for (members, _) in runs.iter_mut() {
                 members.retain(|index| !gone.contains(index));
             }
-            runs.iter()
-                .enumerate()
-                .filter(|(_, (members, _))| members.len() > 1)
-                .map(|(id, (members, proven))| {
-                    self.shown.group(records, members, &self.root, id, *proven)
-                })
-                .collect()
-        };
+        }
+        self.recompute(records);
+        let rows = self.rows(records);
         self.republish(rows);
+    }
+
+    /// Look for folder candidates among the groups published so far, and
+    /// publish them. Called once, when the stages have settled: a folder group
+    /// may only appear then, and it arrives as a candidate.
+    pub fn publish_folders(&self, records: &[FileRec]) {
+        self.recompute(records);
+        for row in self.folder_rows(records) {
+            self.found(row);
+        }
+    }
+
+    /// Whether folder candidates may read cloud placeholders in their proof.
+    pub fn cloud(&self) -> bool {
+        self.cloud
+    }
+
+    /// The folder candidates, handed to the scan so an apply can prove them.
+    /// Given back by `put_folders` once the apply has run.
+    pub fn take_folders(&self) -> Vec<FolderGroup> {
+        std::mem::take(&mut *self.folders.borrow_mut())
+    }
+
+    pub fn put_folders(&self, folders: Vec<FolderGroup>) {
+        *self.folders.borrow_mut() = folders;
+    }
+
+    /// The folder candidates' member paths, which an apply names when it moves
+    /// one. Read before the apply, so the names are the ones it proved.
+    pub fn folder_paths(&self, number: usize) -> Vec<String> {
+        self.folders
+            .borrow()
+            .get(number)
+            .map(|group| {
+                group
+                    .folders
+                    .iter()
+                    .map(|folder| folder.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Never offer the folder pairs of a candidate an apply has proved different.
+    pub fn refute(&self, number: usize) {
+        let paths = self.folder_paths(number);
+        let mut refuted = self.refuted.borrow_mut();
+        for (at, first) in paths.iter().enumerate() {
+            for second in &paths[at + 1..] {
+                let pair = if first < second {
+                    (first.clone(), second.clone())
+                } else {
+                    (second.clone(), first.clone())
+                };
+                refuted.insert(pair);
+            }
+        }
+    }
+
+    /// Rebuild the folder candidates from the groups as they stand now, and the
+    /// file groups each one folds.
+    fn recompute(&self, records: &[FileRec]) {
+        let runs = self.runs.borrow();
+        let ids: Vec<usize> = (0..runs.len()).filter(|&id| runs[id].0.len() > 1).collect();
+        let groups: Vec<DupGroup> = ids
+            .iter()
+            .map(|&id| DupGroup {
+                members: runs[id].0.clone(),
+                // A candidate, not yet proved, is what the browser calls attested
+                // and what the apply must prove again before anything moves.
+                attested: !runs[id].1,
+            })
+            .collect();
+        let refuted = self.refuted.borrow();
+        let found = folders::live_candidates(records, &groups, &self.root, self.cloud, &refuted);
+        let active: Vec<usize> = (0..found.len()).collect();
+        let folded = folders::fold(records, &groups, &found, &active);
+        let mut folded_of = vec![Vec::new(); found.len()];
+        for (group, into) in folded.iter().enumerate() {
+            if let Some(number) = into {
+                folded_of[*number].push(ids[group]);
+            }
+        }
+        drop(runs);
+        *self.folders.borrow_mut() = found;
+        *self.folded_of.borrow_mut() = folded_of;
+    }
+
+    /// The rows the browser should show: every file group that no folder
+    /// candidate folds, and every folder candidate with the file groups it folds.
+    fn rows(&self, records: &[FileRec]) -> Vec<Group> {
+        let runs = self.runs.borrow();
+        let folded_of = self.folded_of.borrow();
+        let folded: HashSet<usize> = folded_of.iter().flatten().copied().collect();
+        let mut rows: Vec<Group> = runs
+            .iter()
+            .enumerate()
+            .filter(|(id, (members, _))| members.len() > 1 && !folded.contains(id))
+            .map(|(id, (members, proven))| {
+                self.shown.group(records, members, &self.root, id, *proven)
+            })
+            .collect();
+        drop(runs);
+        drop(folded_of);
+        rows.extend(self.folder_rows(records));
+        rows
+    }
+
+    /// The folder candidates as rows, each with the file groups it folds.
+    fn folder_rows(&self, records: &[FileRec]) -> Vec<Group> {
+        let runs = self.runs.borrow();
+        let folders = self.folders.borrow();
+        let folded_of = self.folded_of.borrow();
+        folders
+            .iter()
+            .enumerate()
+            .map(|(number, group)| {
+                let folded = folded_of[number]
+                    .iter()
+                    .map(|&id| {
+                        let (members, proven) = &runs[id];
+                        self.shown.group(records, members, &self.root, id, *proven)
+                    })
+                    .collect();
+                self.shown
+                    .folder_group(group, FOLDER_BASE + number, folded, &self.root)
+            })
+            .collect()
     }
 
     /// Mark a group as having had its bytes compared.
@@ -476,6 +616,7 @@ mod tests {
             index: id,
             size,
             proven,
+            folder: None,
             members: vec![Member {
                 record: id,
                 name: format!("f{id}.bin"),
@@ -490,7 +631,7 @@ mod tests {
 
     #[test]
     fn a_group_published_is_a_group_the_browser_sees_once() {
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         live.found(group(0, 100, false));
         live.found(group(1, 50, false));
         let fresh = watch.fresh();
@@ -508,7 +649,7 @@ mod tests {
 
     #[test]
     fn cancelling_is_seen_by_the_scan_and_survives_into_the_finish() {
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         assert!(!live.cancelled());
         watch.cancel();
         assert!(live.cancelled());
@@ -519,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_scan_that_finished_without_cancelling_says_so() {
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         live.finished();
         let fresh = watch.fresh();
         assert!(fresh.finished);
@@ -528,7 +669,7 @@ mod tests {
 
     #[test]
     fn an_apply_crosses_to_the_scan_and_the_answer_crosses_back() {
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         let scan = std::thread::spawn(move || {
             // The scan's safe-point poll, as the pipeline runs it.
             loop {
@@ -541,6 +682,7 @@ mod tests {
                         removed: vec![marks[0].record],
                         refused: 0,
                         failures: Vec::new(),
+                        ..Default::default()
                     })));
                     live.finished();
                     return;
@@ -570,7 +712,7 @@ mod tests {
         // The browser must never block on a thread that will not run again.
         // Without this the whole session wedges: the browser is inside
         // `apply`, so it is not drawing, not reading keys, and not quitting.
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         live.gone();
         match watch.apply(Vec::new(), false) {
             Answer::Refused(why) => assert!(why.contains("stopped"), "{why}"),
@@ -584,7 +726,7 @@ mod tests {
         // `gone` exists for: the user let the scan run out before marking
         // anything. A browser that could only delete DURING a scan would be a
         // worse tool than the one this milestone started from.
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         live.finished();
         let scan = std::thread::spawn(move || {
             for _ in 0..2000 {
@@ -610,7 +752,7 @@ mod tests {
         // is inside `apply`, the browser has to come back out. Otherwise the
         // terminal is never restored, because the loop that restores it is
         // blocked on a condvar nobody will notify again.
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         let scan = std::thread::spawn(move || {
             let _guard = Leaving(&live);
             panic!("the scan fell over");
@@ -626,7 +768,7 @@ mod tests {
 
     #[test]
     fn republishing_replaces_the_list_and_the_browser_is_told_it_was_replaced() {
-        let (live, watch) = channel(std::path::Path::new("/scratch"));
+        let (live, watch) = channel(std::path::Path::new("/scratch"), false);
         live.found(group(0, 100, false));
         live.found(group(1, 50, false));
         let fresh = watch.fresh();

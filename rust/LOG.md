@@ -3075,3 +3075,238 @@ the happy path, and the tree has to be checked, not assumed.
   is only reachable on the non-interactive path today.
 * SIGHUP and SIGTERM still leave the terminal raw (M5), Ctrl+C at the menu is
   still ignored (M5.1). Neither touched, both pre-existing.
+
+## 2026-10-10 — M10 phase 1, identical folders
+
+Branch `m10-folders`. The decisions the spec asked to see written down, each
+with its reason.
+
+* **Folder age for `--auto oldest` and `newest`** is the newest entry inside
+  the folder (its largest modification time). A folder's own mtime moves
+  whenever an entry is added or removed, and `cp -R` does not keep it, so it
+  says when the folder was changed rather than when its content was written.
+  Ties fall to the shortest path, then lexicographic, as the file rules do.
+* **`--list` order**: folder groups first, by reclaimable bytes (every copy
+  after the first, times the bytes in one copy), then shortest path; file groups
+  after, in their existing order. A folder group is the bigger decision, so it
+  comes first. Phase 2 may interleave them in the browser.
+* **Folding is exact**: a file group folds into a folder group only when it has
+  one member in each folder and no folder has two. A group missing a copy from
+  one folder says something the folder group does not, so it stays visible.
+* **Folders that would break the law are dropped, not the whole run.** A folder
+  group whose move would tear a kept folder, or leave a group with no copy, is
+  left alone and listed. The planner repeats until nothing more is dropped. Each
+  pass only keeps more, so it always ends, and keeping more is always safe.
+* **Bytes freed** for a moved folder count only files with `nlink == 1`. A
+  hardlink with a name outside the folder keeps its data alive.
+* **Cloud placeholders**: a dataless file or folder disqualifies the folder
+  unless `--cloud` is on. It is not counted in `skipped_cloud`, because that
+  count is for files the walk saw and dropped; a disqualified folder is simply
+  not a group.
+* **Names**: any non-UTF-8 name disqualifies the folder rather than being
+  compared under a lossy spelling. `.DS_Store` is ignored only where it is a
+  regular file, at every depth.
+* **Cross-device fallback** copies a folder with `copy_tree`, keeping links as
+  links, and removes the source only after the copy finishes. A failed copy is
+  removed from the Trash. Hardlinks inside the copy become separate files: the
+  data survives, the link between them does not. This path runs only when the
+  Trash is on another volume.
+* **The survivor check** is one function, `folders::stranded`, for file and
+  folder groups alike. The browser's selection guard calls it too. It only
+  examines groups a removal touches, which is what the old guard did, so the
+  browser's behaviour for file groups is unchanged.
+* **Candidate limit and cost.** A group of k members seeds k(k-1)/2 pairs of
+  folders, so a 1000-copy group seeds about 500,000. Each candidate folder is
+  listed once: a readdir and an lstat per entry, and no byte is read to list it.
+  Only pairs whose listings match are compared, and a folder that is already in
+  one group is never compared again. Two copies of one file in two directories
+  already make a candidate pair, so a home directory with many such copies pays
+  for listing those folders even when nothing is identical. Not measured on a
+  real home directory; measured here only on the scratch trees.
+* **The warm rescan is the open conflict.** §D reports a folder group only when
+  every pair was compared in this scan, so a warm run re-reads candidate folders.
+  On the M3 conformance tree that is 1 MB, 8.1% of the cold read, against the 5%
+  ceiling. See MILESTONES.md, M10 claim, for the two ways out. Until the
+  maintainer decides, the README's rescan floor does not hold for trees that
+  have folder candidates.
+* **The live path** does not call the folder pass. The finished-scan browser
+  shows folded file groups as it always has; phase 2 hides them.
+
+### Fence, as measured
+
+* Defaults on the freeze corpora: 84 of 84 identical. None of them has a folder
+  candidate; every duplicate pair sits in one directory.
+* `--no-folders` on the freeze corpora and on a corpus that has candidates:
+  98 of 98 identical, counters included.
+* Defaults on the candidate corpus differ, as they must. That is the feature.
+
+## 2026-10-10 — M10 phase 1, the warm rescan (maintainer's option b)
+
+The open conflict in the entry above is settled. A folder pair is settled from
+the cache when both files have a remembered whole-file digest that matches.
+The reasons, each stated once:
+
+* **Why the existing `Full` column and no new field.** `Full` is learned only
+  from bytes that were compared to the end, and it is keyed by inode with size
+  and mtime checked, so the racily-clean rule applies unchanged. A new column
+  would only restate what `Full` already says.
+* **Cold scans learn.** The folder pass runs its comparisons with `learn` set
+  whenever there is a cache, so every file it reads leaves its digest behind.
+  The warm scan then has what it needs without reading anything.
+* **A remembered difference is believed.** The cache may only narrow, and a
+  difference it reports can cost a missed group, never a wrong removal.
+* **`--auto` re-proves attested groups and nothing else.** That matches
+  `verify_attested`: a group matched from memory is read again before anything
+  moves, and a group proved this scan is not read a second time. The re-proof
+  reads every file pair in full, ignoring the cache, and it runs before the plan
+  is printed.
+* **A failing re-proof holds the group, whole.** Its folders stay, its files are
+  kept as copies, and its cache entries are dropped, so the next scan reads
+  again. Its files also still shelter other members of their file groups, so
+  the ordinary file rule can still remove copies elsewhere.
+* **The cost is honest.** A warm `--auto` reads every byte of each attested
+  folder it is about to move, which a warm `--list` does not. That is the price
+  of the cache never being the reason anything is removed.
+
+### Measured
+
+* Warm `--list` on the scratch tree: `bytes_read` 0, folder group labelled
+  `candidate`. Cold: 46,097,180 bytes. That is the file groups' reads, about
+  44 MB, plus the small files the folder pass compares for the first time, about
+  2 MB. The big files in those groups were settled by their group and not read
+  a second time.
+* Conformance M3 warm: 0.0 MB, down from 1,048,576 bytes (8.1%).
+
+## 2026-10-10 — M10 phase 1, the fix round: the move policy and the listing cost
+
+### The move policy
+
+Tests cover a refused rename three ways: a missing destination folder, a
+read-only source parent, and a read-only destination folder. Each leaves the
+source and the destination as they were.
+
+A failed rename falls back to copy-then-remove only when it failed with
+`CrossesDevices` (EXDEV). Any other rename failure, such as a permission, a busy
+file, or a name too long, is returned as it is, and the source is not touched.
+Copying after such a failure would repeat it, or leave two copies of something
+that was meant to move. A copy that fails part-way is cleaned up, and the
+source is removed only after the copy is complete. The move policy is tested
+through `move_to`, which takes its destination, so the tests never name the
+real Trash. The copy path itself has not run on a real second volume.
+
+### The listing cost, and the cost model
+
+Every file group whose members sit in two different folders proposes a candidate
+folder pair: the two nearest parents, and each ancestor pair while the names
+match. So two copies of one file in two directories always propose one pair,
+whatever else sits in those directories.
+
+Each candidate folder is now read in two steps, and only as far as a pair needs:
+
+* **The top level first.** The names and sizes of its files and links, and the
+  names of its subfolders that hold at least one file or link somewhere below.
+  An empty subfolder is only read as far as its first entry, and it is left
+  out, because empty directories are ignored. Two folders whose top levels
+  differ cannot be identical, so the pair is rejected here and neither folder
+  is listed below its top level.
+* **The whole tree, only for a pair whose top levels agree**, and each folder
+  once, however many pairs it is in.
+
+What this costs: one directory read per candidate folder, one `lstat` per
+top-level file, and a short look into each subfolder. What is still paid in full:
+two identical trees (they have to be compared), and a pair whose top levels agree
+but which differs further down. A streaming comparison that stopped at the first
+differing name would cut that second case. It is not built, because the top level
+settles the common case, and the maintainer's measurement on real trees decides
+whether it is needed.
+
+Measured on a scratch tree (`rust/evidence/m10-listing-cost.txt`): the folder
+pass added about 0.02 seconds over `main`, against about 0.07 seconds for the
+eager listing of the previous commit. The output was identical.
+
+Not measured: real home directories and `/Applications`. Those were left to the
+maintainer, and nothing outside the scratch trees was scanned for this entry.
+
+## 2026-10-10 — M10 phase 2, the browser
+
+The decisions the spec left to the builder, each with its reason.
+
+* **Folder group ids.** A folder group's browser id is `FOLDER_BASE + k`, with
+  `FOLDER_BASE` at 2^40. A file group keeps its id. The two id spaces never meet,
+  so marks, the cursor and the id index treat every row alike, and a mark tells a
+  file from a folder by its id alone.
+* **The folder age for bulk rules** is `Listing::age`, the newest entry inside
+  the folder, as in phase 1. The bulk rules reach it through `folders::keep_index`,
+  which `--auto` also calls. Nothing ranks a folder group in two places.
+* **Folder marks take the files inside them with them.** A file mark inside a
+  marked folder is removed, so the confirmation never counts a file twice. A file
+  inside a marked folder cannot be marked on its own.
+* **The bulk rules never remove a copy out of a kept folder.** A file group with
+  a copy inside a kept folder keeps that copy, as `--auto` does. Only the other
+  copies are marked. Every bulk result is checked against the survivor law before
+  the marks are replaced, and a result that would strand a group marks nothing.
+* **The survivor law is one function.** `folders::first_without_copy` takes, for
+  each group, whether each member would stay. The scan's `stranded` and the
+  browser's guard both build that pattern and call it, so they cannot disagree.
+* **Folder proof in the browser.** `run_selected` proves each marked folder group
+  with `folders::reprove`, listing and every file pair, and never reads the cache
+  to decide. `--auto` proves only its attested groups, before its plan, and lists
+  the rest at the move. Both reach the same `trash::move_folder`.
+* **Refused means refused whole, and comes back apart.** A folder group whose
+  proof fails loses none of its folders. The browser puts its folded file groups
+  back as visible groups. The flash names the folder.
+* **Live candidates are cheap to find and proved at apply.** Detection reads a
+  folder's top level first (names, file sizes, and the names of subfolders that
+  hold something). Only a pair that agrees there is listed whole. Then the first
+  and last 4 KiB of each file pair are compared. That is a probe, not a proof, and
+  the candidate is labelled `candidate` until an apply proves it.
+* **Live candidates are recomputed after every apply.** Folding depends on
+  membership, and membership changes with every move. A refused pair is kept in a
+  set for the session, so it is not offered again. Without that set a refused
+  folder would return as a candidate on the next pass.
+* **The finished browser sorts by reclaim.** `Browser::arrange` puts every row in
+  the same order the live list keeps. For two-copy groups this is the same order
+  as before. For groups of three or more it differs: they are now ranked by what
+  they would give back.
+* **Unfolding is for the session.** The browser remembers each unfolded folder
+  group by its first folder's path, so a rebuilt list does not fold it up again.
+* **The cursor follows the fold.** A cursor on a file group that a folder group
+  folds lands on the folder group when it arrives. An unfold puts the cursor on
+  the first file group it shows.
+
+### Fence and gates, as measured
+
+* Freeze vs `main` at defaults: 84 of 84 identical. The freeze corpora have no
+  folder candidate, as in phase 1.
+* `--no-folders` on the candidate corpus: 98 of 98 identical.
+* Conformance at defaults and under `--no-folders`: 33 of 33 each.
+* m8 live end-to-end: 5 of 5. m8 tty matrix: every row as the fence requires.
+* `m10_live.py` and `m10_folders.py`: all checks pass. Both use a scratch `HOME`,
+  so no real Trash entry was created or removed.
+
+## 2026-10-10 — M10 phase 2, the fix round after review
+
+* **The order in `run_selected` is prove, move, remove.** Each folder group is
+  proved against its kept twin before anything is removed. Folders move before
+  files, because a file removed from a kept folder changes that folder's twin, and
+  a folder proved after that change fails half-way through the request. Files go
+  last, and a file inside a folder that is going, or inside a folder of a refused
+  group, is kept.
+* **A refused folder group protects every file in its folders.** Nothing in its
+  folders is removed in that request, including a file that a selection also
+  marked in the kept folder. That is "nothing in that folder group is removed"
+  from §D, applied to the whole request.
+* **The record law is the one that counts.** The browser's guard asks by name and
+  the scan asks by record. The enumeration test shows the browser never allows a
+  selection the record law forbids. The browser is stricter in one corner: a
+  record's canonical name lies in a folder that is being moved, and a second name
+  survives outside it. A selection there is refused, and no file is lost. The
+  browser keeps the canonical name only, which is why it can be stricter and never
+  looser.
+* **Grammar in the browser.** `1 file` and `2 files`, `1 folder` and `2 folders`.
+  The plain `--auto` line is left as it was, because the freeze fence compares it
+  byte for byte.
+* **The m8 "quitting mid-scan" case is timing-sensitive on this machine.** It
+  fails on the previous commit as well as on this one, and the record is in
+  `evidence/m10-m8-quit-flake.txt`.
+

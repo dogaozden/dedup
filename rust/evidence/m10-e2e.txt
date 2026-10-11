@@ -1,0 +1,107 @@
+== scenario A: /private/tmp/claude-501/m10-scratch/e2e-a-ec44785f (cache /private/tmp/claude-501/m10-scratch/cache-a-ec44785f)
+  pass  nothing named Holiday ec44785f copy in the Trash yet
+  pass  nothing named near-big-ec44785f.jpg in the Trash yet
+  pass  nothing named third-ec44785f.jpg in the Trash yet
+-- cold --list
+
+  1 folder group(s) and 1 file group(s)
+
+    keep Holiday ec44785f/   (3 files, 10.0 MiB each copy)
+         Holiday ec44785f copy/
+
+    keep Holiday ec44785f/big-ec44785f.jpg
+         Loose ec44785f/third-ec44785f.jpg
+         Near ec44785f/near-big-ec44785f.jpg
+         Holiday ec44785f copy/big-ec44785f.jpg
+
+
+  pass  cold --list exits 0
+  pass  cold --list shows the folder group, its twin and the kept folder
+  pass  a cold scan's folder group is proven, not a candidate
+  pass  report-json has folders = [[kept, twin]] (got [['Holiday ec44785f', 'Holiday ec44785f copy']])
+  pass  the cold scan read bytes (44107172)
+-- warm --list (untouched tree)
+
+  1 folder group(s) and 1 file group(s)
+
+    keep Holiday ec44785f/   (3 files, 10.0 MiB each copy)  candidate
+         Holiday ec44785f copy/
+
+    keep Holiday ec44785f/big-ec44785f.jpg
+         Loose ec44785f/third-ec44785f.jpg
+         Near ec44785f/near-big-ec44785f.jpg
+         Holiday ec44785f copy/big-ec44785f.jpg
+
+
+  pass  warm --list exits 0
+  pass  the warm scan read 0 bytes (got 0)
+  pass  the warm scan still reports the folder group, labelled candidate
+  pass  the warm report keeps the folder group
+-- --auto shortest -y
+
+  Keeping the shortest copy in each of 1 folder group(s) and 1 file group(s).
+  Move to Trash: 1 folder (3 files) and 2 files · 31505010 bytes reclaimed
+
+      Holiday ec44785f copy/
+      Loose ec44785f/third-ec44785f.jpg
+      Near ec44785f/near-big-ec44785f.jpg
+
+
+  1 folder (3 files) and 2 files moved to Trash · 31505010 bytes reclaimed
+
+
+  pass  --auto exits 0 (exit 0)
+  pass  the twin folder left the tree
+  pass  the twin is in the Trash as one directory
+  pass  every file of the moved folder is byte-identical to before, its .DS_Store included
+  pass  the kept twin is intact, byte for byte
+  pass  the near-copy folder is still there
+  pass  the near-copy's differing small file is untouched
+  pass  the near-copy's small identical file is below the floor, so it stays
+  pass  the near-copy's big duplicate left as an ordinary file duplicate
+  pass  that big duplicate is in the Trash by name
+  pass  the loose third copy left the tree
+  pass  the loose third copy is in the Trash by name
+-- the second --auto
+
+  Nothing to remove.
+
+
+  pass  the second run finds nothing to remove
+== scenario B: /private/tmp/claude-501/m10-scratch/e2e-b-2314fe8e (cache /private/tmp/claude-501/m10-scratch/cache-b-2314fe8e)
+  pass  the warm scan before the forgery reads 0 bytes and labels the group candidate
+  pass  the forged file keeps its size
+  pass  the forged file keeps its mtime
+-- --auto shortest -y after the forgery
+
+  Keeping the shortest copy in each of 0 folder group(s) and 1 file group(s).
+  Move to Trash: 2 files · 21000000 bytes reclaimed
+
+      Loose 2314fe8e/third-2314fe8e.jpg
+      Near 2314fe8e/near-big-2314fe8e.jpg
+
+
+  0 folders (0 files) and 2 files moved to Trash · 21000000 bytes reclaimed
+
+
+
+  Refusing the folder group at Holiday 2314fe8e/: Holiday 2314fe8e copy/ its files no longer match the copy beside it, or could not be read in full, so nothing in it was moved. What the cache remembered about the group has been dropped.
+
+  pass  --auto exits 0 (exit 0)
+  pass  --auto says which folder it refused, and why
+  pass  both folders are still where they were
+  pass  the forged file is still in place
+  pass  every other file in the refused folder is untouched
+  pass  the kept folder is intact, byte for byte
+-- a --list after the refusal
+
+  1 duplicate group(s)
+
+    keep Holiday 2314fe8e/big-2314fe8e.jpg
+         Holiday 2314fe8e copy/big-2314fe8e.jpg
+
+
+  pass  the refused cache entries were dropped, so the next scan reads again (22048596)
+  pass  the forged copy no longer matches, so no folder group
+
+ALL CHECKS PASSED

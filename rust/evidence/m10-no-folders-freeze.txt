@@ -1,0 +1,85 @@
+captured 98 cases from /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs with no extra flags
+captured 98 cases from /Users/dogaozden/AI_Projects/dedup-m10/rust/target/release/dedup-rs with --no-folders
+
+=== the fence: main vs branch --no-folders ===
+
+98 cases compared, 0 differing
+FENCE HELD: every non-interactive output and every effort counter is byte-identical
+
+=== for the record: main vs branch at defaults (expected to differ) ===
+captured 98 cases from /Users/dogaozden/AI_Projects/dedup-m10/rust/target/release/dedup-rs with no extra flags
+DIFFERS: folders/auto-oldest
+    stdout: '\n  Keeping the oldest copy in each of 3 groups.\n  Move to Trash: 6 files · 31505018 bytes reclaimed\n\n      Photos/big.jpg\n      Loose/third.jpg\n      Pho… (323 chars) != '\n  Keeping the oldest copy in each of 1 folder group(s) and 3 file group(s).\n  Move to Trash: 1 folder (3 files) and 3 files · 31505018 bytes reclaimed\n\n  … (326 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/auto-shortest
+    stdout: '\n  Keeping the shortest copy in each of 3 groups.\n  Move to Trash: 6 files · 31505018 bytes reclaimed\n\n      Photos/big.jpg\n      Loose/third.jpg\n      P… (325 chars) != '\n  Keeping the shortest copy in each of 1 folder group(s) and 3 file group(s).\n  Move to Trash: 1 folder (3 files) and 3 files · 31505018 bytes reclaimed\n\n… (328 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/flash-list
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/list
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/list-min-size
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/no-cache-list
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/parallel-list
+    report.bytes_seen: 10510029 != 10510017
+    report.files_seen: 6 != 5
+DIFFERS: folders/parallel-spinning
+    report.bytes_seen: 10510029 != 10510017
+    report.files_seen: 6 != 5
+DIFFERS: folders/piped-default
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/report-only
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/spinning-list
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 42014123 != 42034123
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 20 != 24
+DIFFERS: folders/warm-cold
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)\n         Photos copy/\n\n    keep Near/big.jpg\n         Photos/… (314 chars)
+    report.bytes_read: 44111275 != 44131275
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 12 != 16
+    report.seeks: 132 != 136
+DIFFERS: folders/warm-warm
+    stdout: '\n  3 duplicate group(s)\n\n    keep Near/big.jpg\n         Photos/big.jpg\n         Loose/third.jpg\n         Photos copy/big.jpg\n\n    keep Photos/sub/tiny.… (289 chars) != '\n  1 folder group(s) and 2 file group(s)\n\n    keep Photos/   (3 files, 10.0 MiB each copy)  candidate\n         Photos copy/\n\n    keep Near/big.jpg\n     … (325 chars)
+    report.bytes_read: 14096 != 34096
+    report.folders: None != [['Photos', 'Photos copy']]
+    report.opens: 5 != 9
+    report.seeks: 5 != 9
+
+98 cases compared, 13 differing
+FENCE BROKEN

@@ -1,0 +1,8 @@
+pass  the browser opens before the scan ends  (1.7s)
+pass  groups stream in and say they are candidates  (1.7s)
+pass  mark-and-apply during a running scan  (3.2s)
+FAIL  quitting mid-scan restores the terminal  (10.0s)
+        the scan had already finished when the quit went in — this case did not test what it is named for
+pass  a failed proof deletes nothing  (1.6s)
+
+5 case(s), 1 failed
