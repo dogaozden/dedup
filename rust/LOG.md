@@ -3284,3 +3284,29 @@ The decisions the spec left to the builder, each with its reason.
 * `m10_live.py` and `m10_folders.py`: all checks pass. Both use a scratch `HOME`,
   so no real Trash entry was created or removed.
 
+## 2026-10-10 — M10 phase 2, the fix round after review
+
+* **The order in `run_selected` is prove, move, remove.** Each folder group is
+  proved against its kept twin before anything is removed. Folders move before
+  files, because a file removed from a kept folder changes that folder's twin, and
+  a folder proved after that change fails half-way through the request. Files go
+  last, and a file inside a folder that is going, or inside a folder of a refused
+  group, is kept.
+* **A refused folder group protects every file in its folders.** Nothing in its
+  folders is removed in that request, including a file that a selection also
+  marked in the kept folder. That is "nothing in that folder group is removed"
+  from §D, applied to the whole request.
+* **The record law is the one that counts.** The browser's guard asks by name and
+  the scan asks by record. The enumeration test shows the browser never allows a
+  selection the record law forbids. The browser is stricter in one corner: a
+  record's canonical name lies in a folder that is being moved, and a second name
+  survives outside it. A selection there is refused, and no file is lost. The
+  browser keeps the canonical name only, which is why it can be stricter and never
+  looser.
+* **Grammar in the browser.** `1 file` and `2 files`, `1 folder` and `2 folders`.
+  The plain `--auto` line is left as it was, because the freeze fence compares it
+  byte for byte.
+* **The m8 "quitting mid-scan" case is timing-sensitive on this machine.** It
+  fails on the previous commit as well as on this one, and the record is in
+  `evidence/m10-m8-quit-flake.txt`.
+

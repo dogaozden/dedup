@@ -4865,3 +4865,41 @@ folder-aware confirmation, unfolding, and a refusal that names its folder.
 - `run_selected` in a live apply reads each marked folder in full, as the proof
   requires. A large folder costs its full read at apply.
 
+### Fix round after review of phase 2
+
+The team lead drove the live browser and found a selection that half-applied:
+the copy folder, and a file inside the kept folder whose third copy sat outside
+both. The folder went through its proof after the file had already been removed
+from the kept folder, so the proof failed and the group was refused part-way.
+
+- **The order in `run_selected` is now: prove, then move, then remove.** Cache-
+  attested file groups are read again first, and nothing is removed. Every marked
+  folder group is proved. Folders then move, each proved against a kept twin that
+  nothing in the request has touched. Files go last. A file inside a folder that
+  is going, or inside a folder of a refused group, is kept.
+- **Tests.** `folder_selection` reproduces the reported selection through
+  `run_selected` on a scratch tree: the folder and the file go, the loose copy
+  stays. A second test checks that a refused group protects every file in its
+  folders. Both fail on the previous ordering. `m10_live.py` reproduces the same
+  selection through the pty. The previous binary refuses it and leaves the twin
+  in place. The new binary moves the folder and the file, and keeps the loose copy.
+- **The hardlink question.** A browser name guard and the record law can differ
+  for a record with several names. `the_browser_guard_never_allows_what_the_record_law_forbids`
+  enumerates the small shapes and every mark over them, 96 combinations in all,
+  and checks the direction that matters: the browser never allows a selection the
+  record law forbids. The browser is stricter in one corner, where a record's
+  canonical name lies in a folder being moved and a second name survives outside
+  it. That refuses a valid selection, and removes no file.
+- **Grammar.** The browser's confirmation, status lines and summaries say `1 file`
+  and `2 files`, `1 folder` and `2 folders`. The folder branch of `--auto` does
+  too. The plain `--auto` line keeps its old wording, because the freeze fence
+  compares it byte for byte.
+
+Gates on the fixed binary: `cargo test` 335 passed, clippy and fmt clean, freeze
+84 of 84 at defaults, the no-folders freeze 98 of 98, conformance 33 of 33 at
+defaults and under `--no-folders`, `m10_live.py` 4 of 4, `m10_folders.py` all
+checks passed. The m8 live script ran twice on the fixed binary: one run passed
+all five cases, one failed "quitting mid-scan". The same case fails on the
+previous commit too (`evidence/m10-m8-quit-flake.txt`), so it is a pre-existing
+timing sensitivity, not a regression from this round.
+
