@@ -6,14 +6,14 @@ $ git log --oneline -1 main
 
 $ rm -rf /tmp/m9-freeze-base-checkout && git archive main | tar -x -C /tmp/m9-freeze-base-checkout
 $ (cd /tmp/m9-freeze-base-checkout/rust && cargo build --release)
-    Finished `release` profile [optimized] target(s) in 40.07s
+    Finished `release` profile [optimized] target(s) in 30.55s
 
 $ cargo build --release   (the branch)
     Finished `release` profile [optimized] target(s) in 0.11s
 
 $ shasum -a 256 (both binaries, for the record)
 2b487d7844fdc3fe1721c7b1049b7530f79d5c97ba8005a0e2b2faeffe93598d  /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs
-62268ad0bb40626d55e0202a434c94160c35a95321651020757298ab3c8ba6d5  rust/target/release/dedup-rs
+2810e37d11bcbb0225edd039534b6b590ab6920c5d21b16130d16bb5bcb881e2  rust/target/release/dedup-rs
 
 $ m8_freeze.py capture /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs /tmp/m9-freeze-cap-base
 captured 84 cases from /tmp/m9-freeze-base-checkout/rust/target/release/dedup-rs

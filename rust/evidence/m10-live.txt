@@ -1,5 +1,6 @@
+pass  a folder and a file in the kept folder apply together, loose copy intact
 pass  a marked folder applies: one directory to the Trash, twin intact
 pass  a file added after the scan refuses the folder group whole
 pass  the finished-scan browser applies a folder the same way
 
-3 case(s), 0 failed
+4 case(s), 0 failed

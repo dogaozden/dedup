@@ -9,13 +9,13 @@ FENCE HELD: every non-interactive output and every effort counter is byte-identi
 === for the record: main vs branch at defaults (expected to differ) ===
 captured 98 cases from /Users/dogaozden/AI_Projects/dedup-m10/rust/target/release/dedup-rs with no extra flags
 DIFFERS: folders/auto-oldest
-    stdout: '\n  Keeping the oldest copy in each of 3 groups.\n  Move to Trash: 6 files · 31505018 bytes reclaimed\n\n      Photos/big.jpg\n      Loose/third.jpg\n      Pho… (323 chars) != '\n  Keeping the oldest copy in each of 1 folder group(s) and 3 file group(s).\n  Move to Trash: 1 folder(s) (3 files) and 3 file(s) · 31505018 bytes reclaimed\… (334 chars)
+    stdout: '\n  Keeping the oldest copy in each of 3 groups.\n  Move to Trash: 6 files · 31505018 bytes reclaimed\n\n      Photos/big.jpg\n      Loose/third.jpg\n      Pho… (323 chars) != '\n  Keeping the oldest copy in each of 1 folder group(s) and 3 file group(s).\n  Move to Trash: 1 folder (3 files) and 3 files · 31505018 bytes reclaimed\n\n  … (326 chars)
     report.bytes_read: 44111275 != 44131275
     report.folders: None != [['Photos', 'Photos copy']]
     report.opens: 12 != 16
     report.seeks: 132 != 136
 DIFFERS: folders/auto-shortest
-    stdout: '\n  Keeping the shortest copy in each of 3 groups.\n  Move to Trash: 6 files · 31505018 bytes reclaimed\n\n      Photos/big.jpg\n      Loose/third.jpg\n      P… (325 chars) != '\n  Keeping the shortest copy in each of 1 folder group(s) and 3 file group(s).\n  Move to Trash: 1 folder(s) (3 files) and 3 file(s) · 31505018 bytes reclaime… (336 chars)
+    stdout: '\n  Keeping the shortest copy in each of 3 groups.\n  Move to Trash: 6 files · 31505018 bytes reclaimed\n\n      Photos/big.jpg\n      Loose/third.jpg\n      P… (325 chars) != '\n  Keeping the shortest copy in each of 1 folder group(s) and 3 file group(s).\n  Move to Trash: 1 folder (3 files) and 3 files · 31505018 bytes reclaimed\n\n… (328 chars)
     report.bytes_read: 44111275 != 44131275
     report.folders: None != [['Photos', 'Photos copy']]
     report.opens: 12 != 16

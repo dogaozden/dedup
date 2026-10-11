@@ -1,0 +1,16 @@
+# m8 case "quitting mid-scan restores the terminal", run six times on each binary
+# (rust/evidence/scripts/m8_live_end_to_end.py, case_quit_mid_scan_restores_the_terminal).
+# new = this round's binary, old = the previous commit (45ac01e), same machine, same hour.
+# The case passes only when the quit lands while the scan is still running.
+
+new PASS 3.8 s
+old PASS 5.4 s
+new FAIL  the scan had already finished when the quit went in
+old FAIL  the scan had already finished when the quit went in
+new FAIL  the scan had already finished when the quit went in
+old FAIL  the scan had already finished when the quit went in
+
+# Earlier in this round: the full m8 script failed this case on the new binary
+# (runs 2 of 3), and the previous commit passed it three times in a row.
+# The same case failing on the previous commit now shows the case is timing-
+# sensitive on this machine, not caused by the folder changes.
