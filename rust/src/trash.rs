@@ -8,7 +8,7 @@
 //! §3.2: a group always keeps one copy, enforced here rather than by whatever
 //! is asking.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,9 +16,10 @@ use std::process::Command;
 use crate::cache::ScanCache;
 use crate::compare::{verify_attested, Compare};
 use crate::device::mount_point;
+use crate::folders::FolderGroup;
 use crate::folders::{self, Lost};
 use crate::pipeline::{DupGroup, ProvenGroups, Scan};
-use crate::tui::model::Mark;
+use crate::tui::model::{Mark, FOLDER_BASE};
 use crate::walk::{name_order, FileRec};
 
 /// What a non-interactive run was asked to do.
@@ -513,29 +514,22 @@ pub fn run_auto(
     let (mut done, mut freed) = (0_usize, 0_u64);
     let (mut folders_done, mut folder_files_done) = (0_usize, 0_usize);
     let mut failures = Vec::new();
+    let mut unreadable = Vec::new();
     for &(number, at) in &plan.folders {
         let group = &folders[number];
-        let folder = &group.folders[at];
-        let twin = &group.folders[folders::keep_folder(removal.rule, &group.folders)];
-        #[cfg(test)]
-        BEFORE_MOVE.with(|hook| {
-            if let Some(hook) = hook.borrow().as_ref() {
-                hook(&context.root.join(&folder.path));
-            }
-        });
-        let proof_holds = folders::unchanged(context.root, folder, removal.cloud)
-            .and_then(|()| folders::unchanged(context.root, twin, removal.cloud));
-        if let Err(why) = proof_holds {
-            failures.push(format!("{}/: {why}", folder.path));
-            continue;
-        }
-        match remove_path(&context.root.join(&folder.path), removal.hard) {
-            Ok(()) => {
+        let keeper = folders::keep_folder(removal.rule, &group.folders);
+        let how = Move {
+            hard: removal.hard,
+            cloud: removal.cloud,
+            prove: false,
+        };
+        match move_folder(context, group, at, keeper, how, &mut unreadable) {
+            Ok((files, bytes)) => {
                 folders_done += 1;
-                folder_files_done += folder.listing.files();
-                freed += folder.listing.freed();
+                folder_files_done += files;
+                freed += bytes;
             }
-            Err(error) => failures.push(format!("{}/: {error}", folder.path)),
+            Err(error) => failures.push(format!("{}/: {error}", group.folders[at].path)),
         }
     }
     for &index in &plan.files {
@@ -589,7 +583,55 @@ pub struct Removed {
     pub records: Vec<usize>,
     /// Groups whose copies no longer matched, left whole and untouched.
     pub refused: Vec<DupGroup>,
+    /// Folders moved, as browser marks: the folder group's id and the folder.
+    pub folders_moved: Vec<Mark>,
+    /// Folder groups whose proof failed, by browser id. None of their folders
+    /// moved, and the file groups they folded come back.
+    pub refused_folders: Vec<usize>,
     pub failures: Vec<String>,
+}
+
+/// How a folder is moved: permanently or to the Trash, whether it is proved
+/// again first, and whether cloud placeholders may be read in the proof.
+#[derive(Clone, Copy)]
+pub(crate) struct Move {
+    pub hard: bool,
+    pub cloud: bool,
+    pub prove: bool,
+}
+
+/// Move one folder of a folder group. The one code path a folder takes to the
+/// Trash, shared by `--auto` and the browser.
+///
+/// With `prove`, the folder and its kept twin are compared again, listing and
+/// every file pair, before anything moves, never trusting the cache. Without it,
+/// they are only listed again, which is what `--auto` does once its attested
+/// folders were proved before its plan. Either way the listings are read
+/// immediately before the move, and a folder that changed stays where it is.
+pub(crate) fn move_folder(
+    context: &Compare,
+    group: &FolderGroup,
+    folder: usize,
+    keeper: usize,
+    how: Move,
+    unreadable: &mut Vec<String>,
+) -> Result<(usize, u64), String> {
+    let moving = &group.folders[folder];
+    let kept = &group.folders[keeper];
+    #[cfg(test)]
+    BEFORE_MOVE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(&context.root.join(&moving.path));
+        }
+    });
+    if how.prove {
+        folders::reprove(context, moving, kept, how.cloud, unreadable)?;
+    } else {
+        folders::unchanged(context.root, moving, how.cloud)?;
+        folders::unchanged(context.root, kept, how.cloud)?;
+    }
+    remove_path(&context.root.join(&moving.path), how.hard)?;
+    Ok((moving.listing.files(), moving.listing.freed()))
 }
 
 /// Remove exactly the records the browser marked.
@@ -620,8 +662,24 @@ pub fn run_selected(
     mut cache: Option<&mut ScanCache>,
 ) -> Result<Removed, String> {
     let groups = proven.groups();
+    let folders = proven.folders();
     let mut wanted: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut picked: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     for &Mark { group, record } in marks {
+        if group >= FOLDER_BASE {
+            let number = group - FOLDER_BASE;
+            let folder_group = folders
+                .get(number)
+                .ok_or_else(|| format!("no such folder group: {number}"))?;
+            if record >= folder_group.folders.len() {
+                return Err(format!(
+                    "folder {record} is not in folder group {}",
+                    number + 1
+                ));
+            }
+            picked.entry(number).or_default().insert(record);
+            continue;
+        }
         let members = &groups
             .get(group)
             .ok_or_else(|| format!("no such group: {group}"))?
@@ -635,18 +693,22 @@ pub fn run_selected(
         chosen.sort_unstable();
         chosen.dedup();
     }
-    // The survivor law, checked over everything this selection touches. A
-    // browser selection names records only, so no folder is moved here.
+    // The survivor law, over the whole request: records and folders alike, file
+    // groups and folder groups alike. The browser's guard asks the same question
+    // of the names on screen, and `folders::first_without_copy` answers both.
     let removed: HashSet<usize> = wanted.values().flatten().copied().collect();
+    let moved: HashMap<&str, usize> = picked
+        .iter()
+        .flat_map(|(&number, positions)| {
+            positions
+                .iter()
+                .map(move |&at| (folders[number].folders[at].path.as_str(), number))
+        })
+        .collect();
     let on_disk = |name: &str| context.root.join(name).symlink_metadata().is_ok();
-    if let Some(lost) = folders::stranded(
-        &scan.records,
-        groups,
-        proven.folders(),
-        &removed,
-        &HashMap::new(),
-        &on_disk,
-    ) {
+    if let Some(lost) =
+        folders::stranded(&scan.records, groups, folders, &removed, &moved, &on_disk)
+    {
         return Err(match lost {
             Lost::File(group) => format!(
                 "refusing the whole selection: it would leave group {} with no copy at all",
@@ -689,6 +751,59 @@ pub fn run_selected(
                     outcome.records.push(index);
                 }
                 Err(error) => outcome.failures.push(error),
+            }
+        }
+    }
+
+    // Folder groups. Each marked folder is moved beside a kept twin, and the
+    // whole group is proved first: a proof that fails refuses the group, and not
+    // one of its folders moves.
+    for (&number, positions) in &picked {
+        let group = &folders[number];
+        let browser_id = FOLDER_BASE + number;
+        let Some(keeper) = (0..group.folders.len()).find(|at| !positions.contains(at)) else {
+            outcome.refused_folders.push(browser_id);
+            continue;
+        };
+        let mut unreadable = Vec::new();
+        let proof = positions.iter().find_map(|&at| {
+            folders::reprove(
+                context,
+                &group.folders[at],
+                &group.folders[keeper],
+                scan.cloud,
+                &mut unreadable,
+            )
+            .err()
+            .map(|why| (at, why))
+        });
+        if let Some((_at, _why)) = proof {
+            // Said by the caller, which owns the screen this may be shown on. A
+            // refusal printed here would land on the browser's alternate screen.
+            if let Some(cache) = cache.as_deref_mut() {
+                folders::forget(group, cache);
+            }
+            outcome.refused_folders.push(browser_id);
+            continue;
+        }
+        for &at in positions {
+            let how = Move {
+                hard,
+                cloud: scan.cloud,
+                prove: false,
+            };
+            match move_folder(context, group, at, keeper, how, &mut unreadable) {
+                Ok((files, freed)) => {
+                    outcome.folders_moved.push(Mark {
+                        group: browser_id,
+                        record: at,
+                    });
+                    outcome.files += files;
+                    outcome.bytes += freed;
+                }
+                Err(error) => outcome
+                    .failures
+                    .push(format!("{}/: {error}", group.folders[at].path)),
             }
         }
     }
@@ -1361,7 +1476,7 @@ mod selection {
                 Some(cache),
                 &mut unreadable,
             );
-            scan.attach_folders(found);
+            scan.attach_folders(found, false);
             scan
         }
 

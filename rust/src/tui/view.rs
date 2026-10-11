@@ -12,7 +12,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
+use std::collections::HashMap;
+
 use super::model::{elide_left, Browser, Mode, MIN_HEIGHT, MIN_WIDTH};
+use crate::folders;
 use crate::size::{human_count, human_size};
 
 const ACCENT: Color = Color::Cyan;
@@ -209,11 +212,21 @@ pub fn draw(frame: &mut Frame, browser: &Browser) {
                 )],
                 vec![
                     Span::styled(
-                        format!(
-                            "{} × {} copies",
-                            human_size(group.size),
-                            human_count(group.members.len() as u64)
-                        ),
+                        match &group.folder {
+                            // A folder group says what each copy holds, which is
+                            // what the user is deciding about.
+                            Some(row) => format!(
+                                "{} files, {} each copy · {} copies",
+                                human_count(row.files as u64),
+                                human_size(row.bytes),
+                                human_count(group.members.len() as u64)
+                            ),
+                            None => format!(
+                                "{} × {} copies",
+                                human_size(group.size),
+                                human_count(group.members.len() as u64)
+                            ),
+                        },
                         dim(),
                     ),
                     // Said plainly, because it is the difference between what
@@ -336,11 +349,27 @@ pub fn confirmation(browser: &Browser) -> Vec<String> {
     } else {
         "Move to Trash"
     };
-    let mut lines = vec![
+    // Folders are counted as folders, with the files they hold: 400 files in two
+    // folders is two folders, never four hundred separate removals.
+    let (folders, folder_files, files) = browser.marked_split();
+    let counts = if folders == 0 {
+        format!("{} files", human_count(browser.marked_count() as u64))
+    } else if files == 0 {
         format!(
-            "{verb}: {} files",
-            human_count(browser.marked_count() as u64)
-        ),
+            "{} folder(s) ({} files)",
+            human_count(folders as u64),
+            human_count(folder_files as u64)
+        )
+    } else {
+        format!(
+            "{} folder(s) ({} files) and {} files",
+            human_count(folders as u64),
+            human_count(folder_files as u64),
+            human_count(files as u64)
+        )
+    };
+    let mut lines = vec![
+        format!("{verb}: {counts}"),
         format!("Reclaims {}", human_size(browser.marked_bytes())),
     ];
     // What the user is agreeing to pay for. The proof reads every byte of
@@ -366,6 +395,14 @@ fn draw_members(frame: &mut Frame, area: Rect, browser: &Browser) {
     let group = &browser.groups[browser.group];
     let width = area.width as usize;
     let visible = area.height as usize;
+    // A file inside a marked folder is drawn as going with it. Asked once for the
+    // whole window, not once per row.
+    let going: HashMap<&str, ()> = browser
+        .folders_marked()
+        .into_iter()
+        .map(|path| (path, ()))
+        .collect();
+    let with_folder = group.folder.is_none();
 
     // Keep the cursor in the middle of the window where the list is long
     // enough for a middle to exist.
@@ -381,25 +418,29 @@ fn draw_members(frame: &mut Frame, area: Rect, browser: &Browser) {
         let is_cursor = position == browser.member;
         let is_marked = browser.is_marked(browser.group, position);
 
+        let inside_marked_folder = with_folder && folders::within(&member.name, &going).is_some();
         // A record pinned from outside the tree is shown, not hidden — the user
         // is entitled to know the copy is there and why it cannot go.
         let (glyph, colour) = if !member.deletable {
             ("⊘", DIM)
-        } else if is_marked {
+        } else if is_marked || inside_marked_folder {
             ("●", MARK)
         } else {
             ("○", KEEP)
         };
-        let badge = match member.extra_links {
+        let mut badge = match member.extra_links {
             0 => String::new(),
             1 => "  +1 link".into(),
             extra => format!("  +{extra} links"),
         };
+        if inside_marked_folder {
+            badge.push_str("  with its folder");
+        }
         let room = width.saturating_sub(9 + DATE_WIDTH + badge.chars().count());
         let path = elide_left(&member.path, room);
         let path_style = if is_cursor {
             Style::default().add_modifier(Modifier::REVERSED)
-        } else if is_marked {
+        } else if is_marked || inside_marked_folder {
             dim()
         } else {
             Style::default()
@@ -460,6 +501,10 @@ fn help_lines(hard: bool) -> Vec<(&'static str, String)> {
         ("space", "mark or unmark the highlighted file".into()),
         ("a", "mark every copy except the highlighted one".into()),
         ("u", "clear all marks in this group".into()),
+        (
+            "o",
+            "unfold this folder group into its files, for this session".into(),
+        ),
         ("g / G", "jump to first / last group".into()),
         ("b", "bulk actions across every group".into()),
         ("ENTER", apply.into()),
@@ -555,6 +600,8 @@ mod tests {
                         member(1, "backup/photos/beach.jpg", true, 2),
                         member(2, "old/beach copy.jpg", false, 0),
                     ],
+
+                    folder: None,
                 },
                 Group {
                     index: 1,
@@ -564,6 +611,8 @@ mod tests {
                         member(3, "notes.txt", true, 0),
                         member(4, "archive/notes.txt", true, 0),
                     ],
+
+                    folder: None,
                 },
             ],
             "/scratch/tree".into(),
@@ -754,6 +803,8 @@ mod tests {
                 size: 100,
                 proven: true,
                 members,
+
+                folder: None,
             }],
             "/scratch".into(),
             false,
@@ -788,6 +839,8 @@ mod tests {
                 size: 100,
                 proven: true,
                 members: vec![member(0, &long, true, 0), member(1, "b.bin", true, 0)],
+
+                folder: None,
             }],
             "/scratch".into(),
             false,
@@ -1049,6 +1102,118 @@ mod tests {
             screen[14].contains("hardlinked outside this tree"),
             "{:?}",
             screen[14]
+        );
+    }
+
+    /// A folder group over two folders, with the file group it folds beside
+    /// it in the list, as a finished scan would hold them.
+    fn folder_browser() -> Browser {
+        use crate::tui::model::{FolderRow, FOLDER_BASE};
+        let folder_member = |position: usize, path: &str| Member {
+            record: position,
+            name: path.into(),
+            path: format!("{path}/"),
+            date: "2026-08-23".into(),
+            extra_links: 0,
+            deletable: true,
+            mtime: 1.0,
+        };
+        let folded = vec![Group {
+            index: 7,
+            size: 4_194_304,
+            proven: true,
+            folder: None,
+            members: vec![
+                member(70, "Photos/beach.jpg", true, 0),
+                member(71, "Photos copy/beach.jpg", true, 0),
+            ],
+        }];
+        Browser::new(
+            vec![Group {
+                index: FOLDER_BASE,
+                size: 8_388_608,
+                proven: true,
+                folder: Some(FolderRow {
+                    files: 3,
+                    bytes: 10_485_760,
+                    ages: vec![2, 1],
+                    folded,
+                }),
+                members: vec![
+                    folder_member(0, "/scratch/tree/Photos"),
+                    folder_member(1, "/scratch/tree/Photos copy"),
+                ],
+            }],
+            "/scratch/tree".into(),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_folder_group_is_a_row_of_folders_with_what_each_copy_holds() {
+        let body = render(&folder_browser(), 90, 16).join("\n");
+        assert!(body.contains("Photos/"), "{body}");
+        assert!(body.contains("Photos copy/"), "{body}");
+        assert!(
+            body.contains("3 files, 10.0 MiB each copy · 2 copies"),
+            "the header does not say what each copy holds:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_folder_candidate_is_labelled_like_any_other_candidate() {
+        let mut browser = folder_browser();
+        if let Some(group) = browser.groups.first_mut() {
+            group.proven = false;
+        }
+        let body = render(&browser, 90, 16).join("\n");
+        assert!(body.contains("candidate"), "{body}");
+    }
+
+    #[test]
+    fn the_confirmation_counts_folders_as_folders_and_their_files() {
+        let mut browser = folder_browser();
+        browser.on_key(Key::Toggle);
+        browser.group = 0;
+        browser.member = 1;
+        browser.on_key(Key::Toggle);
+        browser.on_key(Key::Apply);
+        let lines = confirmation(&browser);
+        assert!(
+            lines[0].contains("1 folder(s) (3 files)"),
+            "the confirmation counted files, not folders: {lines:?}"
+        );
+        let body = render(&browser, 90, 20).join("\n");
+        assert!(body.contains("Move to Trash"), "{body}");
+        assert!(body.contains("1 folder(s) (3 files)"), "{body}");
+    }
+
+    #[test]
+    fn unfold_shows_the_file_groups_the_folder_group_stood_for() {
+        let mut browser = folder_browser();
+        browser.on_key(Key::Unfold);
+        let body = render(&browser, 90, 16).join("\n");
+        assert!(body.contains("Photos/beach.jpg"), "{body}");
+        assert!(
+            !body.contains("Photos copy/\n"),
+            "the folder row is still drawn:\n{body}"
+        );
+        assert!(body.contains("Group 1 of 1"), "{body}");
+    }
+
+    #[test]
+    fn a_refused_folder_group_says_which_folder_it_was() {
+        use crate::tui::model::{Outcome, FOLDER_BASE};
+        let mut browser = folder_browser();
+        browser.absorb(Outcome {
+            refused: 1,
+            refused_folders: vec![FOLDER_BASE],
+            ..Default::default()
+        });
+        let body = render(&browser, 110, 20).join("\n");
+        assert!(
+            body.contains("folder group at /scratch/tree/Photos/ refused"),
+            "{body}"
         );
     }
 }

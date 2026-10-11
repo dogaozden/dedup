@@ -24,6 +24,7 @@ use ratatui::Terminal;
 
 use crate::cache::ScanCache;
 use crate::compare::Compare;
+use crate::folders;
 use crate::pipeline::{DupGroup, ProvenGroups, Scan};
 use crate::sys;
 use crate::trash::{oracle_mtime, report_refusals, run_selected, Removed};
@@ -35,7 +36,8 @@ use crate::walk::FileRec;
 const WAIT_FOR_KEY: std::time::Duration = std::time::Duration::from_millis(250);
 
 use crate::size::{human_count, human_size};
-use model::{Browser, Group, Key, Mark, Member, Mode, Outcome, Step};
+use model::FolderRow;
+use model::{Browser, Group, Key, Mark, Member, Mode, Outcome, Step, FOLDER_BASE};
 
 /// Whether a browser can run at all. Non-interactive use is `--list`/`--auto`,
 /// and a program that deletes files should not be guessing at a pipe.
@@ -374,8 +376,10 @@ fn draw_and_read(
                             files: removed.files,
                             bytes: removed.bytes,
                             removed: std::mem::take(&mut removed.records),
-                            refused: removed.refused.len(),
+                            refused: removed.refused.len() + removed.refused_folders.len(),
                             failures: std::mem::take(&mut removed.failures),
+                            folders_moved: std::mem::take(&mut removed.folders_moved),
+                            refused_folders: std::mem::take(&mut removed.refused_folders),
                         };
                         refused.append(&mut removed.refused);
                         browser.absorb(summary)
@@ -466,6 +470,7 @@ fn key_for(mode: Mode, key: KeyEvent) -> Key {
             KeyCode::Char(' ') => Key::Toggle,
             KeyCode::Char('a') => Key::KeepOnlyThis,
             KeyCode::Char('u') => Key::ClearGroup,
+            KeyCode::Char('o') => Key::Unfold,
             KeyCode::Char('b') => Key::Bulk,
             KeyCode::Enter => Key::Apply,
             KeyCode::Char('?') => Key::Help,
@@ -510,6 +515,7 @@ impl Shown {
             index: id,
             size: records[members[0]].size,
             proven,
+            folder: None,
             members: members
                 .iter()
                 .map(|&index| {
@@ -529,29 +535,97 @@ impl Shown {
     }
 }
 
+impl Shown {
+    /// A folder group as the screen shows it: one row per folder, with the
+    /// folder's own path, and the files and bytes each copy holds.
+    ///
+    /// `size` is what moving one folder frees, which is what the reclaim figure
+    /// counts; a hardlink with a name outside the folder is not counted.
+    pub fn folder_group(
+        &self,
+        group: &folders::FolderGroup,
+        id: usize,
+        folded: Vec<Group>,
+        root: &Path,
+    ) -> Group {
+        let members = group
+            .folders
+            .iter()
+            .enumerate()
+            .map(|(position, folder)| {
+                let age = folder.listing.age();
+                Member {
+                    record: position,
+                    name: folder.path.clone(),
+                    path: format!("{}/", show_path(root, &folder.path, self.cwd.as_deref())),
+                    date: date_of(age, self.offset),
+                    extra_links: 0,
+                    deletable: true,
+                    mtime: age as f64 / 1e9,
+                }
+            })
+            .collect();
+        Group {
+            index: id,
+            size: group.folders[0].listing.freed(),
+            proven: !group.attested,
+            folder: Some(FolderRow {
+                files: group.files(),
+                bytes: group.bytes(),
+                ages: group
+                    .folders
+                    .iter()
+                    .map(|folder| folder.listing.age())
+                    .collect(),
+                folded,
+            }),
+            members,
+        }
+    }
+}
+
 /// Turn the scan into what the screen needs, once, so the loop never touches a
 /// `FileRec` again.
+///
+/// A file group a folder group folds is not listed on its own: the folder group
+/// stands for it, and carries it for unfolding. Folder groups take their place
+/// in the same order as file groups.
 pub fn build(scan: &Scan, groups: &[DupGroup], root: &Path, hard: bool) -> Browser {
     let shown = Shown::new();
-    let groups = groups
-        .iter()
-        .enumerate()
-        .map(|(index, group)| {
-            // A finished scan's groups have all been compared — that is what
-            // `Scan::proven` means — except the ones the cache attested,
-            // which `run_selected` re-reads before it removes anything.
-            shown.group(&scan.records, &group.members, root, index, !group.attested)
-        })
+    let file_row = |index: usize| {
+        // A finished scan's groups have all been compared — that is what
+        // `Scan::proven` means — except the ones the cache attested,
+        // which `run_selected` re-reads before it removes anything.
+        let group = &groups[index];
+        shown.group(&scan.records, &group.members, root, index, !group.attested)
+    };
+    let mut rows: Vec<Group> = (0..groups.len())
+        .filter(|&index| !scan.is_folded(index))
+        .map(file_row)
         .collect();
-    Browser::new(groups, root.to_string_lossy().into_owned(), hard)
+    for (number, folder_group) in scan.folder_groups().iter().enumerate() {
+        let folded: Vec<Group> = (0..groups.len())
+            .filter(|&index| scan.folded_into(index) == Some(number))
+            .map(file_row)
+            .collect();
+        rows.push(shown.folder_group(folder_group, FOLDER_BASE + number, folded, root));
+    }
+    let mut browser = Browser::new(rows, root.to_string_lossy().into_owned(), hard);
+    browser.arrange();
+    browser
 }
 
 /// The path as the oracle shows it: relative to where the user is standing when
 /// that is shorter and still points at the file, absolute otherwise.
 fn display_path(root: &Path, record: &FileRec, cwd: Option<&Path>) -> String {
-    let absolute = root.join(record.path());
+    show_path(root, record.path(), cwd)
+}
+
+/// `display_path` for a path the scan named by its relative name.
+fn show_path(root: &Path, relative: &str, cwd: Option<&Path>) -> String {
+    let absolute = root.join(relative);
     match cwd.and_then(|cwd| absolute.strip_prefix(cwd).ok()) {
-        Some(relative) => relative.to_string_lossy().into_owned(),
+        Some(shown) => shown.to_string_lossy().into_owned(),
         None => absolute.to_string_lossy().into_owned(),
     }
 }
@@ -669,6 +743,7 @@ mod tests {
             (KeyCode::Char(' '), Key::Toggle),
             (KeyCode::Char('a'), Key::KeepOnlyThis),
             (KeyCode::Char('u'), Key::ClearGroup),
+            (KeyCode::Char('o'), Key::Unfold),
             (KeyCode::Char('b'), Key::Bulk),
             (KeyCode::Enter, Key::Apply),
             (KeyCode::Char('?'), Key::Help),

@@ -633,13 +633,7 @@ pub fn find(
         if root_left == root_right {
             continue;
         }
-        tops[left].get_or_insert_with(|| top_of(context.root, paths[left], cloud));
-        tops[right].get_or_insert_with(|| top_of(context.root, paths[right], cloud));
-        let agree = matches!(
-            (&tops[left], &tops[right]),
-            (Some(Some(ours)), Some(Some(theirs))) if ours == theirs
-        );
-        if !agree {
+        if !tops_agree(context.root, cloud, &mut tops, &paths, left, right) {
             continue;
         }
         listings[left].get_or_insert_with(|| {
@@ -667,14 +661,23 @@ pub fn find(
         }
     }
 
-    // Only folders that were compared in full can have been merged, so every
-    // member of a group below has a listing.
+    assemble(&paths, &mut listings, &mut parent, &attested)
+}
+
+/// Turn settled pairs into groups: one per set of merged roots with more than
+/// one member, folders in name order, maximal ones only, biggest reclaim first.
+///
+/// Only folders that were listed in full can have been merged, so every member
+/// of a group has a listing.
+fn assemble(
+    paths: &[&str],
+    listings: &mut [Option<Option<Listing>>],
+    parent: &mut [usize],
+    attested: &[bool],
+) -> Vec<FolderGroup> {
     let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for at in 0..paths.len() {
-        components
-            .entry(root_of(&mut parent, at))
-            .or_default()
-            .push(at);
+        components.entry(root_of(parent, at)).or_default().push(at);
     }
     let mut found: Vec<FolderGroup> = components
         .into_iter()
@@ -704,6 +707,135 @@ pub fn find(
         })
     });
     found
+}
+
+/// How much of each file a live candidate compares: its first and last page.
+/// Enough to turn away most pairs that only look alike, and far short of a read
+/// in full, which is the proof's job and happens at apply.
+const PROBE: u64 = 4096;
+
+/// The first and last `PROBE` bytes of a file, or `None` if it cannot be read.
+fn probe(path: &Path, size: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let head = size.min(PROBE) as usize;
+    let mut bytes = vec![0_u8; head];
+    file.read_exact(&mut bytes).ok()?;
+    let tail = size.min(PROBE);
+    file.seek(SeekFrom::Start(size - tail)).ok()?;
+    let mut last = vec![0_u8; tail as usize];
+    file.read_exact(&mut last).ok()?;
+    bytes.extend_from_slice(&last);
+    Some(bytes)
+}
+
+/// Whether every file pair of two same-shaped folders shows the same first and
+/// last page. A probe only ever turns a candidate away; the proof is the byte
+/// comparison at apply.
+fn probes_agree(root: &Path, left: &Folder, right: &Folder) -> bool {
+    left.listing
+        .entries
+        .iter()
+        .zip(&right.listing.entries)
+        .all(|(ours, theirs)| {
+            let Kind::File { size, .. } = ours.kind else {
+                return true;
+            };
+            let here = root.join(&left.path).join(&ours.name);
+            let there = root.join(&right.path).join(&theirs.name);
+            match (probe(&here, size), probe(&there, size)) {
+                (Some(first), Some(second)) => first == second,
+                _ => false,
+            }
+        })
+}
+
+/// The folder candidates the live browser shows.
+///
+/// Built from the groups the scan has published so far, which may include
+/// candidates nothing has compared. Nothing is read in full here: a pair must
+/// first agree at the top level, then agree in every listed name and size, then
+/// agree in the first and last page of every file. What survives is a
+/// candidate, labelled as one, and it is proved at apply, before anything moves.
+///
+/// `refuted` holds the pairs an apply has already proved different this
+/// session, which must not come back as candidates.
+pub fn live_candidates(
+    records: &[FileRec],
+    groups: &[DupGroup],
+    root: &Path,
+    cloud: bool,
+    refuted: &HashSet<(String, String)>,
+) -> Vec<FolderGroup> {
+    let pairs: Vec<(String, String)> = seeds(records, groups)
+        .into_iter()
+        .filter(|pair| !refuted.contains(pair))
+        .collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut paths: Vec<&str> = pairs
+        .iter()
+        .flat_map(|(first, second)| [first.as_str(), second.as_str()])
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let index: HashMap<&str, usize> = paths
+        .iter()
+        .enumerate()
+        .map(|(at, &path)| (path, at))
+        .collect();
+    let mut tops: Vec<Option<Option<Vec<Top>>>> = vec![None; paths.len()];
+    let mut listings: Vec<Option<Option<Listing>>> = vec![None; paths.len()];
+    let mut parent: Vec<usize> = (0..paths.len()).collect();
+    // Every live candidate is a candidate until an apply proves it, which is
+    // what the browser calls attested.
+    let attested = vec![true; paths.len()];
+    for (first, second) in &pairs {
+        let (left, right) = (index[first.as_str()], index[second.as_str()]);
+        let (root_left, root_right) = (root_of(&mut parent, left), root_of(&mut parent, right));
+        if root_left == root_right {
+            continue;
+        }
+        if !tops_agree(root, cloud, &mut tops, &paths, left, right) {
+            continue;
+        }
+        listings[left].get_or_insert_with(|| list(root, paths[left], cloud));
+        listings[right].get_or_insert_with(|| list(root, paths[right], cloud));
+        let (Some(Some(ours)), Some(Some(theirs))) = (&listings[left], &listings[right]) else {
+            continue;
+        };
+        let here = Folder {
+            path: paths[left].to_string(),
+            listing: ours.clone(),
+        };
+        let there = Folder {
+            path: paths[right].to_string(),
+            listing: theirs.clone(),
+        };
+        if same_shape(&here.listing, &there.listing) && probes_agree(root, &here, &there) {
+            parent[root_right] = root_left;
+        }
+    }
+    assemble(&paths, &mut listings, &mut parent, &attested)
+}
+
+/// Whether two folders agree at the top level, reading each one's top level the
+/// first time it is needed and never again.
+fn tops_agree(
+    root: &Path,
+    cloud: bool,
+    tops: &mut [Option<Option<Vec<Top>>>],
+    paths: &[&str],
+    left: usize,
+    right: usize,
+) -> bool {
+    tops[left].get_or_insert_with(|| top_of(root, paths[left], cloud));
+    tops[right].get_or_insert_with(|| top_of(root, paths[right], cloud));
+    matches!(
+        (&tops[left], &tops[right]),
+        (Some(Some(ours)), Some(Some(theirs))) if ours == theirs
+    )
 }
 
 /// Drop every group that a bigger group already says. When `A` and `B` are
@@ -831,21 +963,24 @@ pub fn fold(
 /// A tie falls to the shortest path, then the lexicographically first, the same
 /// tie-break the file rules use.
 pub fn keep_folder(rule: Rule, folders: &[Folder]) -> usize {
+    let paths: Vec<&str> = folders.iter().map(|folder| folder.path.as_str()).collect();
+    let ages: Vec<i64> = folders.iter().map(|folder| folder.listing.age()).collect();
+    keep_index(rule, &paths, &ages)
+}
+
+/// The keeper of a folder group, given each folder's path and newest entry
+/// (nanoseconds). The one definition of the folder rules: `--auto` reaches it
+/// through `keep_folder`, and the browser's bulk rules reach it directly, so the
+/// two cannot rank a folder group differently.
+pub fn keep_index(rule: Rule, paths: &[&str], ages: &[i64]) -> usize {
     let picked = match rule {
-        Rule::Shortest => folders
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, folder)| name_order(&folder.path)),
-        Rule::Oldest => folders
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, folder)| (folder.listing.age(), name_order(&folder.path))),
-        Rule::Newest => folders
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, folder)| (Reverse(folder.listing.age()), name_order(&folder.path))),
+        Rule::Shortest => (0..paths.len()).min_by_key(|&at| name_order(paths[at])),
+        Rule::Oldest => (0..paths.len()).min_by_key(|&at| (ages[at], name_order(paths[at]))),
+        Rule::Newest => {
+            (0..paths.len()).min_by_key(|&at| (Reverse(ages[at]), name_order(paths[at])))
+        }
     };
-    picked.map_or(0, |(at, _)| at)
+    picked.unwrap_or(0)
 }
 
 /// Whether a folder still reads as it did when it was proven. Asked just
@@ -895,42 +1030,63 @@ pub fn stranded(
     moved: &HashMap<&str, usize>,
     on_disk: &dyn Fn(&str) -> bool,
 ) -> Option<Lost> {
-    for (number, group) in groups.iter().enumerate() {
-        let touched = group.members.iter().any(|&member| {
-            removed.contains(&member)
-                || records[member]
-                    .names
-                    .iter()
-                    .any(|name| within(name, moved).is_some())
-        });
-        if !touched {
-            continue;
-        }
-        let alive = group
-            .members
-            .iter()
-            .any(|&member| survives(&records[member], removed.contains(&member), moved, on_disk));
-        if !alive {
-            return Some(Lost::File(number));
-        }
+    // A group no removal touches keeps everything it had, so it is recorded as a
+    // single survivor and never looked at again.
+    let file_alive: Vec<Vec<bool>> = groups
+        .iter()
+        .map(|group| {
+            let touched = group.members.iter().any(|&member| {
+                removed.contains(&member)
+                    || records[member]
+                        .names
+                        .iter()
+                        .any(|name| within(name, moved).is_some())
+            });
+            if !touched {
+                return vec![true];
+            }
+            group
+                .members
+                .iter()
+                .map(|&member| {
+                    survives(&records[member], removed.contains(&member), moved, on_disk)
+                })
+                .collect()
+        })
+        .collect();
+    if let Some(number) = first_without_copy(&file_alive) {
+        return Some(Lost::File(number));
     }
-    for (number, group) in folders.iter().enumerate() {
-        let touched = group
-            .folders
-            .iter()
-            .any(|folder| within(&folder.path, moved).is_some());
-        if !touched {
-            continue;
-        }
-        let alive = group
-            .folders
-            .iter()
-            .any(|folder| within(&folder.path, moved).is_none() && on_disk(&folder.path));
-        if !alive {
-            return Some(Lost::Folder(number));
-        }
-    }
-    None
+    let folder_alive: Vec<Vec<bool>> = folders
+        .iter()
+        .map(|group| {
+            let touched = group
+                .folders
+                .iter()
+                .any(|folder| within(&folder.path, moved).is_some());
+            if !touched {
+                return vec![true];
+            }
+            group
+                .folders
+                .iter()
+                .map(|folder| within(&folder.path, moved).is_none() && on_disk(&folder.path))
+                .collect()
+        })
+        .collect();
+    first_without_copy(&folder_alive).map(Lost::Folder)
+}
+
+/// The survivor law itself, and the only definition of it in the program.
+///
+/// Given, for each group in order, whether each member would still be on disk,
+/// this is the first group with no survivor. `stranded` asks it of the scan's
+/// records, and the browser's guard asks it of the names on its screen, so the
+/// two cannot disagree about what a removal would strand.
+pub fn first_without_copy(alive: &[Vec<bool>]) -> Option<usize> {
+    alive
+        .iter()
+        .position(|members| !members.iter().any(|&kept| kept))
 }
 
 /// What `--auto` will do about folders, and the files it still removes one by

@@ -321,7 +321,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             &mut folder_unreadable,
         );
         scan.unreadable.extend(folder_unreadable);
-        scan.attach_folders(found);
+        scan.attach_folders(found, options.cloud);
     }
     scan.unreadable.sort();
     scan.unreadable.dedup();
@@ -447,7 +447,7 @@ fn live_scan(
     effort: &Arc<Effort>,
     cloud: &Arc<cloud::Cloud>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    let (live, watch) = live::channel(root);
+    let (live, watch) = live::channel(root, options.cloud);
     // Counters without a painter: in live mode the browser is the progress
     // display, so nothing may write to stderr behind the alternate screen.
     let (pulse, seen) = Pulse::live(effort, cloud);
@@ -484,6 +484,11 @@ fn live_scan(
                 cloud,
                 Some(&live),
             );
+            // Folder candidates are looked for once the file groups have settled,
+            // and they arrive as candidates: nothing here reads a file in full.
+            if !options.no_folders && !live.cancelled() {
+                live.publish_folders(&scan.records);
+            }
             // The list is complete; the progress display goes away. The thread
             // stays to answer, because a user who waited for the scan to
             // finish before marking anything is the ordinary case.
